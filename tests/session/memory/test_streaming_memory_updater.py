@@ -22,7 +22,11 @@ from openviking.session.memory.dataclass import (
     StoredLink,
 )
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
-from openviking.session.memory.memory_updater import ExtractContext, MemoryUpdateResult
+from openviking.session.memory.memory_updater import (
+    ExtractContext,
+    MemoryUpdateResult,
+    write_stored_links,
+)
 from openviking.session.memory.merge_op.base import FieldType, MergeOp, SearchReplaceBlock, StrPatch
 from openviking.session.memory.streaming_memory_updater import (
     MemoryMergeGroupKey,
@@ -85,6 +89,7 @@ class InMemoryVikingFS:
 class RecordingPathlockClient:
     def __init__(self, events: list[tuple]):
         self.events = events
+        self.active_leases: dict[str, set[str]] = {}
 
     async def pathlock_acquire_exact_batch(self, paths, timeout_secs=0.0):
         lease_number = len([event for event in self.events if event[0] == "acquire"]) + 1
@@ -92,10 +97,23 @@ class RecordingPathlockClient:
             "memory-batch-lease" if lease_number == 1 else f"memory-batch-lease-{lease_number}"
         )
         lease = {"lease_ref": lease_ref}
+        self.active_leases[lease_ref] = set(paths)
         self.events.append(("acquire", tuple(paths), timeout_secs))
         return lease
 
+    async def pathlock_acquire_exact(self, path, timeout_secs=0.0, owner_lease_ref=None):
+        del timeout_secs, owner_lease_ref
+        lease_number = len([event for event in self.events if event[0] == "acquire"]) + 1
+        lease_ref = (
+            "memory-batch-lease" if lease_number == 1 else f"memory-batch-lease-{lease_number}"
+        )
+        lease = {"lease_ref": lease_ref}
+        self.active_leases[lease_ref] = {path}
+        self.events.append(("acquire", (path,), 0.0))
+        return lease
+
     async def pathlock_release(self, lease):
+        self.active_leases.pop(lease["lease_ref"], None)
         self.events.append(("release", lease))
 
 
@@ -109,6 +127,13 @@ class PathlockedInMemoryVikingFS(InMemoryVikingFS):
         return "/" + _canonical_user_uri(uri, ctx).removeprefix("viking://")
 
     async def write_file(self, uri: str, content: str, ctx=None, lease_ref=None):
+        if lease_ref is not None:
+            ref = lease_ref["lease_ref"]
+            path = self._uri_to_path(uri, ctx=ctx)
+            if path not in self._async_agfs.active_leases[ref]:
+                raise RuntimeError(
+                    f"pathlock lease ref '{ref}' does not cover the requested operation"
+                )
         self.events.append(("write", uri, lease_ref))
         return await super().write_file(uri, content, ctx=ctx, lease_ref=lease_ref)
 
@@ -342,6 +367,151 @@ async def test_replacement_reacquires_persisted_relation_locks_before_writes(mon
     assert writes
     assert all(event[2] == {"lease_ref": "memory-batch-lease-2"} for event in writes)
     assert fs.events.index(acquires[1]) < min(fs.events.index(event) for event in writes)
+
+
+async def test_write_stored_links_reacquires_exact_lease_for_uncovered_endpoint():
+    from_uri = "viking://user/u/memories/notes/from.md"
+    to_uri = "viking://user/u/memories/notes/to.md"
+    files = {
+        from_uri: MemoryFileUtils.write(
+            MemoryFile(
+                uri=from_uri,
+                content="from",
+                memory_type="notes",
+                extra_fields={"note_name": "from"},
+            )
+        ),
+        to_uri: MemoryFileUtils.write(
+            MemoryFile(
+                uri=to_uri,
+                content="to",
+                memory_type="notes",
+                extra_fields={"note_name": "to"},
+            )
+        ),
+    }
+    fs = PathlockedInMemoryVikingFS(files)
+    ctx = _ctx()
+    outer_lease = await fs._async_agfs.pathlock_acquire_exact_batch(
+        [fs._uri_to_path(from_uri, ctx=ctx)]
+    )
+
+    updated = await write_stored_links(
+        [
+            StoredLink(
+                from_uri=from_uri,
+                to_uri=to_uri,
+                link_type="related_to",
+            )
+        ],
+        ctx,
+        fs,
+        lease_ref=outer_lease,
+    )
+
+    assert updated == [from_uri, to_uri]
+    assert MemoryFileUtils.read(fs.files[from_uri], uri=from_uri).links
+    assert MemoryFileUtils.read(fs.files[to_uri], uri=to_uri).backlinks
+    acquires = [event for event in fs.events if event[0] == "acquire"]
+    assert acquires[0][1] == (fs._uri_to_path(from_uri, ctx=ctx),)
+    assert acquires[1][1] == (fs._uri_to_path(to_uri, ctx=ctx),)
+    assert set(fs._async_agfs.active_leases) == {outer_lease["lease_ref"]}
+    await fs._async_agfs.pathlock_release(outer_lease)
+
+
+async def test_write_stored_links_propagates_unrecoverable_lease_error():
+    uri = "viking://user/u/memories/notes/only.md"
+    fs = PathlockedInMemoryVikingFS(
+        {
+            uri: MemoryFileUtils.write(
+                MemoryFile(
+                    uri=uri,
+                    content="only",
+                    memory_type="notes",
+                    extra_fields={"note_name": "only"},
+                )
+            )
+        }
+    )
+    outer_lease = await fs._async_agfs.pathlock_acquire_exact_batch(
+        [fs._uri_to_path(uri, ctx=_ctx())]
+    )
+
+    original_write_file = fs.write_file
+
+    async def always_invalid_write(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError(
+            "pathlock lease ref 'memory-batch-lease' does not cover the requested operation"
+        )
+
+    fs.write_file = always_invalid_write
+    try:
+        with pytest.raises(RuntimeError, match="does not cover the requested operation"):
+            await write_stored_links(
+                [
+                    StoredLink(
+                        from_uri=uri,
+                        to_uri=uri,
+                        link_type="related_to",
+                    )
+                ],
+                _ctx(),
+                fs,
+                lease_ref=outer_lease,
+            )
+        assert set(fs._async_agfs.active_leases) == {outer_lease["lease_ref"]}
+    finally:
+        fs.write_file = original_write_file
+        await fs._async_agfs.pathlock_release(outer_lease)
+
+
+async def test_write_stored_links_propagates_child_lease_write_error():
+    from_uri = "viking://user/u/memories/notes/from.md"
+    to_uri = "viking://user/u/memories/notes/to.md"
+    files = {
+        uri: MemoryFileUtils.write(
+            MemoryFile(
+                uri=uri,
+                content=uri.rsplit("/", 1)[-1],
+                memory_type="notes",
+                extra_fields={"note_name": uri.rsplit("/", 1)[-1]},
+            )
+        )
+        for uri in (from_uri, to_uri)
+    }
+    fs = PathlockedInMemoryVikingFS(files)
+    ctx = _ctx()
+    outer_lease = await fs._async_agfs.pathlock_acquire_exact_batch(
+        [fs._uri_to_path(from_uri, ctx=ctx)]
+    )
+    original_write_file = fs.write_file
+    outer_lease_ref = outer_lease["lease_ref"]
+
+    async def fail_child_write(uri, content, ctx=None, lease_ref=None):
+        if lease_ref is not None and lease_ref["lease_ref"] != outer_lease_ref:
+            raise OSError("backend write failed")
+        return await original_write_file(uri, content, ctx=ctx, lease_ref=lease_ref)
+
+    fs.write_file = fail_child_write
+    try:
+        with pytest.raises(OSError, match="backend write failed"):
+            await write_stored_links(
+                [
+                    StoredLink(
+                        from_uri=from_uri,
+                        to_uri=to_uri,
+                        link_type="related_to",
+                    )
+                ],
+                ctx,
+                fs,
+                lease_ref=outer_lease,
+            )
+        assert set(fs._async_agfs.active_leases) == {outer_lease_ref}
+    finally:
+        fs.write_file = original_write_file
+        await fs._async_agfs.pathlock_release(outer_lease)
 
 
 async def test_operation_to_patch_skips_failed_field_preview_update():
