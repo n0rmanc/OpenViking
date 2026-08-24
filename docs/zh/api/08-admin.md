@@ -246,14 +246,18 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-key>")
 client.initialize()
 
-result = client.admin_create_account("acme", "alice", seed="alice-seed")
+result = client.admin_create_account(
+    account_id="acme",
+    admin_user_id="alice",
+    seed="alice-seed",
+)
 print(f"Account created: {result['account_id']}")
 print(f"Admin user: {result['admin_user_id']}")
 print(f"User key: {result.get('user_key', '(not exposed in trusted mode)')}")
 
 result = client.admin_create_account(
-    "acme-private",
-    "alice",
+    account_id="acme-private",
+    admin_user_id="alice",
     user_config={
         "add_targets": {
             "resource_uri": "viking://~/resources",
@@ -451,7 +455,7 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-key>")
 client.initialize()
 
-result = client.admin_delete_account("acme")
+result = client.admin_delete_account(account_id="acme")
 print(f"Account deleted: {result['deleted']}")
 ```
 
@@ -558,13 +562,18 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-or-admin-key>")
 client.initialize()
 
-result = client.admin_register_user("acme", "bob", role="user", seed="bob-seed")
+result = client.admin_register_user(
+    account_id="acme",
+    user_id="bob",
+    role="user",
+    seed="bob-seed",
+)
 print(f"User registered: {result['user_id']}")
 print(f"User key: {result.get('user_key', '(not exposed in trusted mode)')}")
 
 result = client.admin_register_user(
-    "acme",
-    "bob-private",
+    account_id="acme",
+    user_id="bob-private",
     role="user",
     user_config={"add_targets": {"resource_uri": "viking://~/resources/project-a"}},
 )
@@ -628,11 +637,11 @@ ov admin register-user acme bob-private --role user \
 
 #### 1. API 实现介绍
 
-列出工作区中的所有用户。
+列出工作区中的活跃用户。正在删除中的用户不会返回。
 
 **处理流程：**
 1. 验证请求者具有 ROOT 权限，或为本账户的 ADMIN
-2. 调用 API Key Manager 获取用户列表
+2. 调用 API Key Manager 获取活跃用户列表
 3. 应用可选的过滤条件（name、role）和分页限制
 4. 返回用户列表（trusted 模式下不包含 user_key）
 
@@ -655,6 +664,7 @@ ov admin register-user acme bob-private --role user \
 **说明：**
 - ADMIN 只能列出自己所属的 account 中的用户
 - 在 `trusted` 模式下，响应中不会包含 `user_key` 字段
+- 用户删除开始后，不再出现在该列表中
 
 #### 3. 使用示例
 
@@ -682,7 +692,7 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-or-admin-key>")
 client.initialize()
 
-users = client.admin_list_users("acme")
+users = client.admin_list_users(account_id="acme")
 for user in users:
     print(f"User: {user['user_id']}, role: {user['role']}")
 ```
@@ -732,16 +742,17 @@ ov --sudo admin list-users acme
 
 #### 1. API 实现介绍
 
-从工作区中移除用户，同时删除其 API Key。
+从工作区中移除用户。用户 API Key 会立即失效，其拥有的数据清理异步执行。
 
 **处理流程：**
 1. 验证请求者具有 ROOT 权限，或为本账户的 ADMIN
-2. 调用 API Key Manager 删除用户及其 API Key
-3. 返回删除确认
+2. 写入删除 fence，并使用户 API Key 失效
+3. 提交一个持久化清理任务，删除该用户拥有的数据
+4. 返回删除任务 ID
 
 **代码入口：**
 - `openviking/server/routers/admin.py:remove_user` - HTTP 路由
-- `openviking/server/api_keys/new.py:APIKeyManager.remove_user` - 核心实现
+- `openviking/service/user_deletion.py:UserDeletionService.delete_user` - 核心实现
 - `openviking_cli/client/sync_http.py:SyncHTTPClient.admin_remove_user` - Python SDK
 
 #### 2. 接口和参数说明
@@ -756,6 +767,7 @@ ov --sudo admin list-users acme
 **说明：**
 - ADMIN 只能移除自己所属的 account 中的用户
 - 不能删除账户的最后一个 admin 用户
+- 删除开始后，用户 key 立即失效，list_users 不再返回该用户
 
 #### 3. 使用示例
 
@@ -779,7 +791,7 @@ client = ov.SyncHTTPClient(api_key="<root-or-admin-key>")
 client.initialize()
 
 result = client.admin_remove_user("acme", "bob")
-print(f"User deleted: {result['deleted']}")
+print(f"User deletion task: {result['task_id']}")
 ```
 
 **TypeScript SDK**
@@ -795,7 +807,7 @@ result, err := client.AdminRemoveUser(ctx, "acme", "bob")
 if err != nil {
     return err
 }
-fmt.Println(result["deleted"])
+fmt.Println(result["task_id"])
 ```
 
 **CLI**
@@ -814,7 +826,10 @@ ov --sudo admin remove-user acme bob
 {
   "status": "ok",
   "result": {
-    "deleted": true
+    "account_id": "acme",
+    "user_id": "bob",
+    "status": "deleting",
+    "task_id": "..."
   },
   "time": 0.1
 }
@@ -875,7 +890,7 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-key>")
 client.initialize()
 
-result = client.admin_set_role("acme", "bob", "admin")
+result = client.admin_set_role(account_id="acme", user_id="bob", role="admin")
 print(f"User: {result['user_id']}, new role: {result['role']}")
 ```
 
@@ -973,7 +988,11 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-or-admin-key>")
 client.initialize()
 
-result = client.admin_regenerate_key("acme", "bob", seed="bob-new-seed")
+result = client.admin_regenerate_key(
+    account_id="acme",
+    user_id="bob",
+    seed="bob-new-seed",
+)
 print(f"New user key: {result['user_key']}")
 ```
 

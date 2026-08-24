@@ -301,25 +301,25 @@ parent = VikingURI(uri).parent.uri  # viking://resources/docs
 ```python
 # 仅在资源中搜索
 results = client.find(
-    "认证",
-    target_uri="viking://resources/"
+    query="认证",
+    target_uri="viking://resources/",
 )
 
 # 仅在自己的资源中搜索
 results = client.find(
-    "私有项目笔记",
+    query="私有项目笔记",
     target_uri="viking://~/resources/"
 )
 
 # 仅在自己的记忆中搜索
 results = client.find(
-    "编码偏好",
+    query="编码偏好",
     target_uri="viking://~/memories/"
 )
 
 # 仅在自己的技能中搜索
 results = client.find(
-    "网络搜索",
+    query="网络搜索",
     target_uri="viking://~/skills/"
 )
 ```
@@ -328,16 +328,16 @@ results = client.find(
 
 ```python
 # 列出目录
-entries = await client.ls("viking://resources/")
+entries = await client.ls(uri="viking://resources/")
 
 # 读取文件
-content = await client.read("viking://resources/docs/api.md")
+content = await client.read(uri="viking://resources/docs/api.md")
 
 # 获取摘要
-abstract = await client.abstract("viking://resources/docs/")
+abstract = await client.abstract(uri="viking://resources/docs/")
 
 # 获取概览
-overview = await client.overview("viking://resources/docs/")
+overview = await client.overview(uri="viking://resources/docs/")
 ```
 
 ## 特殊文件

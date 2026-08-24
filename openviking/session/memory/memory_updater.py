@@ -22,8 +22,10 @@ from openviking.message.part import TextPart
 from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import (
     MemoryFile,
+    MemoryOperationSkipCode,
     ResolvedOperation,
     ResolvedOperations,
+    SkippedMemoryOperation,
     StoredLink,
 )
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
@@ -711,6 +713,7 @@ class MemoryUpdateResult:
         self.written_uris: List[str] = []
         self.edited_uris: List[str] = []
         self.deleted_uris: List[str] = []
+        self.skipped_operations: List[SkippedMemoryOperation] = []
         self.errors: List[Tuple[str, Exception]] = []
 
     def add_written(self, uri: str) -> None:
@@ -724,6 +727,9 @@ class MemoryUpdateResult:
 
     def add_error(self, uri: str, error: Exception) -> None:
         self.errors.append((uri, error))
+
+    def add_skipped(self, operation: SkippedMemoryOperation) -> None:
+        self.skipped_operations.append(operation)
 
     def summary(self) -> str:
         return (
@@ -879,6 +885,32 @@ class MemoryUpdater:
                 continue
             has_unresolved_upserts = True
             error_target = f"{resolved_op.memory_type}(page_id={resolved_op.page_id})"
+            resolution_skip = getattr(resolved_op, "resolution_skip", None)
+            if resolution_skip is not None:
+                # Reporting-only: the operation remains unresolved, preserving
+                # the legacy delete-suppression behavior for direct mixed batches.
+                skipped = SkippedMemoryOperation(
+                    memory_type=resolved_op.memory_type,
+                    page_id=resolved_op.page_id,
+                    reason_code=resolution_skip.reason_code,
+                    reason=resolution_skip.reason,
+                    source=resolved_op.source,
+                )
+                result.add_skipped(skipped)
+                message = (
+                    "Skipping memory operation by resolution policy: "
+                    f"memory_type={resolved_op.memory_type} "
+                    f"page_id={resolved_op.page_id} "
+                    f"reason_code={resolution_skip.reason_code.value}"
+                )
+                if resolution_skip.reason_code in {
+                    MemoryOperationSkipCode.INVALID_PEER_ID,
+                    MemoryOperationSkipCode.INVALID_RANGES,
+                }:
+                    logger.warning(message)
+                else:
+                    tracer.info(message)
+                continue
             resolution_error = ValueError("Missing resolved URI")
             result.add_error(error_target, resolution_error)
             tracer.error(

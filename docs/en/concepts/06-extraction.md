@@ -177,8 +177,8 @@ This routing applies to short and long code files alike.
 ```python
 # Add resource
 await client.add_resource(
-    "/path/to/doc.pdf",
-    reason="API documentation"
+    path="/path/to/doc.pdf",
+    options={"reason": "API documentation"},
 )
 
 # Flow: Parser → TreeBuilder(scope=resources) → SemanticQueue
@@ -188,10 +188,12 @@ await client.add_resource(
 
 ```python
 # Add skill
-await client.add_skill({
-    "name": "search-web",
-    "content": "# search-web\\n..."
-})
+await client.add_skill(
+    data={
+        "name": "search-web",
+        "content": "# search-web\\n...",
+    },
+)
 
 # Flow: Direct write to viking://~/skills/{name}/ → SemanticQueue
 ```

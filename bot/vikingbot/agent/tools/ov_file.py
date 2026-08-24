@@ -117,17 +117,12 @@ class OVFileTool(Tool, ABC):
             ]
         )
 
-    def _is_default_memory_uri(self, client: VikingClient, uri: str | None) -> bool:
+    def _is_default_memory_uri(self, uri: str | None) -> bool:
         normalized = self._normalize_uri(uri)
         # ``viking://user/memories`` is the legacy spelling of the current-user default
         # target; it is still accepted here because it survives in stored bot configs and
         # LLM output. New emissions always use the ``viking://~`` home alias.
-        if normalized in {"", "viking://user/memories", "viking://~/memories"}:
-            return True
-        try:
-            return normalized == self._normalize_uri(client._memory_target_uri(None))
-        except Exception:
-            return False
+        return normalized in {"", "viking://user/memories", "viking://~/memories"}
 
     def _is_default_root_uri(self, uri: str | None) -> bool:
         return self._normalize_uri(uri) in {"", "viking://", "viking://user", "viking://~"}
@@ -146,15 +141,6 @@ class OVFileTool(Tool, ABC):
             include_self=False,
         )
 
-    def _current_memory_uri(self, client: VikingClient) -> str:
-        return client._memory_target_uri(None)
-
-    def _current_skill_uri(self, client: VikingClient) -> str:
-        memory_uri = self._current_memory_uri(client).rstrip("/")
-        if memory_uri.endswith("/memories"):
-            return f"{memory_uri[: -len('/memories')]}/skills/"
-        return "viking://~/skills/"
-
     def _fs_retrieval_uris(
         self,
         client: VikingClient,
@@ -164,18 +150,19 @@ class OVFileTool(Tool, ABC):
         if getattr(client, "actor_peer_id", None):
             if self._is_default_root_uri(uri):
                 return [uri or "viking://"]
-            if self._is_default_memory_uri(client, uri):
-                return [uri or self._current_memory_uri(client)]
+            if self._is_default_memory_uri(uri):
+                return [uri or "viking://~/memories/"]
             return [uri or ""]
 
-        if not self._is_default_memory_uri(client, uri):
+        if not self._is_default_memory_uri(uri):
             if not self._is_default_root_uri(uri):
                 return [uri or ""]
 
             target_uris = [
                 "viking://resources/",
-                self._current_memory_uri(client),
-                self._current_skill_uri(client),
+                "viking://~/resources/",
+                "viking://~/memories/",
+                "viking://~/skills/",
                 *self._peer_memory_uris(client, tool_context),
             ]
             return self._dedupe_strings(target_uris)
@@ -458,13 +445,13 @@ class VikingSearchTool(OVFileTool):
                 user_ids = memory_owner_user_ids or legacy_memory_user_ids
                 search_targets: list[tuple[str, str | None]] = [("viking://resources/", None)]
                 for user_id in self._dedupe_strings(list(user_ids or [])):
-                    memory_uri = client._memory_target_uri(user_id)
-                    skill_uri = (
-                        f"{memory_uri.rstrip('/')[: -len('/memories')]}/skills/"
-                        if memory_uri.rstrip("/").endswith("/memories")
-                        else "viking://~/skills/"
+                    search_targets.extend(
+                        [
+                            ("viking://~/resources/", user_id),
+                            ("viking://~/memories/", user_id),
+                            ("viking://~/skills/", user_id),
+                        ]
                     )
-                    search_targets.extend([(memory_uri, user_id), (skill_uri, user_id)])
             else:
                 peer_ids = self._memory_peer_ids(tool_context)
                 if not target_uri:
@@ -475,15 +462,20 @@ class VikingSearchTool(OVFileTool):
                         target_uris = self._dedupe_strings(
                             [
                                 "viking://resources/",
-                                self._current_memory_uri(client),
-                                self._current_skill_uri(client),
-                                *self._peer_memory_uris(client, tool_context, peer_ids=peer_ids),
+                                "viking://~/resources/",
+                                "viking://~/memories/",
+                                "viking://~/skills/",
+                                *self._peer_memory_uris(
+                                    client,
+                                    tool_context,
+                                    peer_ids=peer_ids,
+                                ),
                             ]
                         )
                     else:
                         target_uris = [""]
                 elif (
-                    self._is_default_memory_uri(client, target_uri)
+                    self._is_default_memory_uri(target_uri)
                     and not getattr(client, "actor_peer_id", None)
                     and peer_ids
                 ):

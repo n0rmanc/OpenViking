@@ -176,8 +176,8 @@ L0/L1 是目录级 sidecar，不是 per-file sidecar。生成父目录摘要时�
 ```python
 # 添加资源
 await client.add_resource(
-    "/path/to/doc.pdf",
-    reason="API 文档"
+    path="/path/to/doc.pdf",
+    options={"reason": "API 文档"},
 )
 
 # 流程: Parser → TreeBuilder(scope=resources) → SemanticQueue
@@ -187,10 +187,12 @@ await client.add_resource(
 
 ```python
 # 添加技能
-await client.add_skill({
-    "name": "search-web",
-    "content": "# search-web\\n..."
-})
+await client.add_skill(
+    data={
+        "name": "search-web",
+        "content": "# search-web\\n...",
+    },
+)
 
 # 流程: 直接写入 viking://~/skills/{name}/ → SemanticQueue
 ```

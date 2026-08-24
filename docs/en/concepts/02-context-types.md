@@ -31,14 +31,14 @@ Resources are external knowledge that Agents can reference.
 ```python
 # Add resource
 client.add_resource(
-    "https://docs.example.com/api.pdf",
-    reason="API documentation"
+    path="https://docs.example.com/api.pdf",
+    options={"reason": "API documentation"},
 )
 
 # Search resources
 results = client.find(
-    "authentication methods",
-    target_uri="viking://resources/"
+    query="authentication methods",
+    target_uri="viking://resources/",
 )
 ```
 
@@ -73,15 +73,21 @@ The schema-defined `memories/tools/` and `memories/skills/` types are disabled. 
 ### Usage
 
 ```python
+from openviking_sdk import TextPart
+
 # Memories are auto-extracted from sessions
-session = client.session()
-await session.add_message("user", [{"type": "text", "text": "I prefer dark mode"}])
+session_info = await client.create_session()
+session = client.session(session_id=session_info["session_id"])
+await session.add_message(
+    role="user",
+    parts=[TextPart(text="I prefer dark mode")],
+)
 commit = await session.commit()  # Starts background memory extraction
-task = await client.get_task(commit["task_id"])  # Poll until task["status"] == "completed"
+task = await client.get_task(task_id=commit["task_id"])  # Poll until task["status"] == "completed"
 
 # Search memories
 results = await client.find(
-    "UI preferences",
+    query="UI preferences",
     target_uri="viking://~/memories/"
 )
 ```
@@ -127,25 +133,27 @@ AgentDefinedContextType includes the following subtypes, all stored under the `v
 
 ```python
 # Add skill (defaults to viking://~/skills/)
-await client.add_skill({
-    "name": "search-web",
-    "description": "Search the web for information",
-    "content": "# search-web\n..."
-})
+await client.add_skill(
+    data={
+        "name": "search-web",
+        "description": "Search the web for information",
+        "content": "# search-web\n...",
+    },
+)
 
 # Write to global agent skills root (public/shared) via -p override
 ov skills add search-web -p viking://agent/skills
 
 # Search user skills
 results = await client.find(
-    "web search",
+    query="web search",
     target_uri="viking://~/skills/"
 )
 
 # Search global agent skills
 results = await client.find(
-    "web search",
-    target_uri="viking://agent/skills/"
+    query="web search",
+    target_uri="viking://agent/skills/",
 )
 ```
 
@@ -155,14 +163,14 @@ Based on Agent's needs, supports unified search across all three context types, 
 
 ```python
 # Search across all context types
-results = await client.find("user authentication")
+results = await client.find(query="user authentication")
 
-for ctx in results.memories:
-    print(f"Memory: {ctx.uri}")
-for ctx in results.resources:
-    print(f"Resource: {ctx.uri}")
-for ctx in results.skills:
-    print(f"Skill: {ctx.uri}")
+for context in results.get("memories", []):
+    print(f"Memory: {context['uri']}")
+for context in results.get("resources", []):
+    print(f"Resource: {context['uri']}")
+for context in results.get("skills", []):
+    print(f"Skill: {context['uri']}")
 ```
 
 ## Related Documents

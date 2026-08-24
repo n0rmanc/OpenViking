@@ -187,6 +187,7 @@ def _message_peer_ids(messages: List[Message]) -> set[str]:
 @dataclass(frozen=True)
 class _MemoryExtractionScope:
     allow_self_memory: bool
+    peer_memory_enabled: bool
     allowed_peer_ids: set[str]
     include_session_skills: bool
     memory_types: Optional[set[str]]
@@ -204,6 +205,7 @@ def _resolve_memory_extraction_scope(
 
     return _MemoryExtractionScope(
         allow_self_memory=allow_self_memory,
+        peer_memory_enabled=policy.peer_enabled,
         allowed_peer_ids=allowed_peer_ids,
         include_session_skills=config_session_skill_extraction_enabled and allow_self_memory,
         memory_types=policy.memory_types,
@@ -2379,6 +2381,7 @@ class Session:
         memories_extracted: Dict[str, int] = {}
         usage_events_extracted = 0
         extracted_skill_results: list[dict] = []
+        skipped_memory_operations: list[dict[str, Any]] = []
         active_count_updated = 0
         memory_diff_uri: Optional[str] = None
         completed_memory_steps: Dict[str, set[str]] = {}
@@ -2563,6 +2566,7 @@ class Session:
                         ),
                     )
                     self_memory_enabled = extraction_scope.allow_self_memory
+                    peer_memory_enabled = extraction_scope.peer_memory_enabled
                     allowed_peer_ids = extraction_scope.allowed_peer_ids
                     long_term_memory_types = extraction_scope.memory_types
 
@@ -2610,6 +2614,7 @@ class Session:
                                     allowed_memory_types=long_term_memory_types,
                                     agent_evolution_enabled=agent_evolution_enabled,
                                     allow_self_memory=self_memory_enabled,
+                                    peer_memory_enabled=peer_memory_enabled,
                                     allowed_peer_ids=allowed_peer_ids,
                                     event_search_tags=event_search_tags,
                                 )
@@ -2646,14 +2651,6 @@ class Session:
 
                         if extraction_error is not None:
                             raise extraction_error
-
-                        if long_term_has_work and self._viking_fs:
-                            candidate_memory_diff_uri = f"{archive_uri}/memory_diff.json"
-                            if await self._viking_fs.exists(
-                                candidate_memory_diff_uri,
-                                ctx=self.ctx,
-                            ):
-                                memory_diff_uri = candidate_memory_diff_uri
 
                         total_extracted = 0
                         for label, result in zip(extraction_labels, _results, strict=True):
@@ -2697,6 +2694,35 @@ class Session:
                             )
                         else:
                             await _run_archive_summary()
+
+                    # A recovered Phase 2 run may have already completed the
+                    # long-term step before a sibling step failed. Reuse its
+                    # persisted diff instead of reporting an empty task result.
+                    if completed_memory_steps.get("long_term") and self._viking_fs:
+                        candidate_memory_diff_uri = f"{archive_uri}/memory_diff.json"
+                        if await self._viking_fs.exists(
+                            candidate_memory_diff_uri,
+                            ctx=self.ctx,
+                        ):
+                            memory_diff_uri = candidate_memory_diff_uri
+                            try:
+                                raw_memory_diff = await self._viking_fs.read_file(
+                                    candidate_memory_diff_uri,
+                                    ctx=self.ctx,
+                                )
+                                memory_diff = json.loads(raw_memory_diff or "{}")
+                                if isinstance(memory_diff, dict):
+                                    skipped_memory_operations.extend(
+                                        item
+                                        for item in memory_diff.get("skipped_operations", [])
+                                        if isinstance(item, dict)
+                                    )
+                            except Exception as exc:
+                                logger.warning(
+                                    "Failed to read skipped memory operations from %s: %s",
+                                    candidate_memory_diff_uri,
+                                    exc,
+                                )
 
                     # Update active_count (using snapshot, not self._usage_records)
                     if self._vikingdb_manager:
@@ -2766,6 +2792,10 @@ class Session:
                     for item in extracted_skill_results
                     if isinstance(item, dict) and (item.get("uri") or item.get("root_uri"))
                 ],
+                "memory_extraction": {
+                    "skipped": len(skipped_memory_operations),
+                    "skipped_operations": skipped_memory_operations,
+                },
                 "usage_events_extracted": usage_events_extracted,
                 "active_count_updated": active_count_updated,
                 "effective_memory_types": sorted(
