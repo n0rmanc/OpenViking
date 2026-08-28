@@ -133,12 +133,41 @@ class _AsyncVectorAdapter:
     ) -> None:
         def _update() -> None:
             collection = self._adapter.get_collection()
-            collection.update(fields=fields)
+            if self._adapter.mode == "qdrant":
+                current_schema = collection.get_meta_data()
+                schema_scalar_index = list(
+                    dict.fromkeys(
+                        [*(current_schema.get("ScalarIndex") or []), *scalar_index]
+                    )
+                )
+                current_index = collection.get_index_meta_data(index_name)
+                index_scalar_index = list(
+                    dict.fromkeys(
+                        [*(current_index.get("ScalarIndex") or []), *scalar_index]
+                    )
+                )
+                collection.update(
+                    fields={"Fields": fields, "ScalarIndex": schema_scalar_index}
+                )
+            else:
+                collection.update(fields=fields)
             if self._adapter.mode in {"local", "cuvs"}:
                 index_meta = collection.get_index_meta_data(index_name)
                 index_meta["ScalarIndex"] = scalar_index
                 collection.drop_index(index_name)
                 collection.create_index(index_name, index_meta)
+            elif self._adapter.mode == "qdrant":
+                if collection.has_index(index_name):
+                    collection.update_index(index_name, scalar_index=index_scalar_index)
+                else:
+                    index_meta = self._adapter._build_default_index_meta(
+                        index_name=index_name,
+                        distance=self._adapter._distance_metric,
+                        use_sparse=self._adapter._sparse_weight > 0.0,
+                        sparse_weight=self._adapter._sparse_weight,
+                        scalar_index_fields=schema_scalar_index,
+                    )
+                    collection.create_index(index_name, index_meta)
             else:
                 collection.update_index(index_name, scalar_index=scalar_index)
 
