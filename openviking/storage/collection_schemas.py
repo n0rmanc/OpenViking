@@ -332,10 +332,14 @@ async def init_context_collection(storage) -> bool:
     missing_scalar_indexes = sorted(expected_scalar_indexes - existing_scalar_indexes)
 
     async def _update_local_schema() -> None:
-        if vectordb_cfg.backend not in {"local", "cuvs"} or "Fields" not in existing_meta:
-            return
         if not missing_fields and not missing_scalar_indexes:
             return
+        if vectordb_cfg.backend not in {"local", "cuvs", "qdrant"}:
+            raise EmbeddingConfigurationError(
+                "Context collection is missing required schema: "
+                f"fields={missing_fields}, scalar_indexes={missing_scalar_indexes}. "
+                "Add them to the remote collection before starting OpenViking."
+            )
         if not hasattr(storage, "update_collection_schema"):
             raise EmbeddingConfigurationError(
                 "Local context collection does not support automatic schema updates"
