@@ -69,6 +69,27 @@ type AdminRegisterUserOptions struct {
 	Seed       *string
 }
 
+// AdminListAccountsOptions controls AdminListAccountsWithOptions.
+// Name uses wildcard (* and ?) matching against account IDs. Pagination is
+// opt-in: set Limit to page the (lexicographically ordered) result; Page is
+// 1-based and only applies when Limit is set.
+type AdminListAccountsOptions struct {
+	Name  string
+	Limit *int
+	Page  *int
+}
+
+// AdminListUsersOptions controls AdminListUsersWithOptions.
+// Name uses wildcard (* and ?) matching against user IDs. Pagination is
+// opt-in: set Limit to page the (lexicographically ordered) result; Page is
+// 1-based and only applies when Limit is set.
+type AdminListUsersOptions struct {
+	Limit *int
+	Name  string
+	Role  string
+	Page  *int
+}
+
 // AdminRegenerateKeyOptions controls AdminRegenerateKeyWithOptions.
 type AdminRegenerateKeyOptions struct {
 	Seed *string
@@ -186,18 +207,12 @@ type WriteOptions struct {
 	Extra          map[string]any
 }
 
-// BatchWritePrecondition protects one batch write operation.
-type BatchWritePrecondition struct {
-	Kind     string  `json:"kind"`
-	BaseHash *string `json:"base_hash,omitempty"`
-}
-
-// BatchWriteOperation is one preconditioned file write.
+// BatchWriteOperation is one file write in a batch.
 type BatchWriteOperation struct {
-	URI           string                 `json:"uri"`
-	Content       *string                `json:"content,omitempty"`
-	ContentBase64 *string                `json:"content_base64,omitempty"`
-	Precondition  BatchWritePrecondition `json:"precondition"`
+	URI           string  `json:"uri"`
+	Content       *string `json:"content,omitempty"`
+	ContentBase64 *string `json:"content_base64,omitempty"`
+	Mode          string  `json:"mode,omitempty"`
 }
 
 // BatchWriteOptions controls BatchWrite.
@@ -239,6 +254,7 @@ type FindOptions struct {
 	Filter            map[string]any
 	ContextType       any
 	IncludeProvenance *bool
+	ReadContent       *bool
 	Telemetry         any
 	Since             string
 	Until             string
@@ -259,6 +275,7 @@ type SearchOptions struct {
 	Filter            map[string]any
 	ContextType       any
 	IncludeProvenance *bool
+	ReadContent       *bool
 	Telemetry         any
 	Since             string
 	Until             string
@@ -474,6 +491,7 @@ type MatchedContext struct {
 	ContextType string   `json:"context_type,omitempty"`
 	Level       int      `json:"level,omitempty"`
 	Abstract    string   `json:"abstract,omitempty"`
+	Content     string   `json:"content,omitempty"`
 	Overview    string   `json:"overview,omitempty"`
 	Category    string   `json:"category,omitempty"`
 	Score       float64  `json:"score,omitempty"`

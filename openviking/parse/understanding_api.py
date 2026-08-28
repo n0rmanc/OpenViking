@@ -37,11 +37,13 @@ from openviking.parse.parsers.media.constants import (
 )
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.utils.zip_safe import normalize_zip_filenames, safe_extract_zip
+from openviking_cli.exceptions import InvalidArgumentError
 from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 PREPARED_RESPONSE_ID_ARG = "understanding_response_id"
+PREPARED_FILE_ID_ARG = "understanding_file_id"
 
 
 class UnderstandingAPI(BaseParser):
@@ -96,13 +98,22 @@ class UnderstandingAPI(BaseParser):
             if not isinstance(prepared_response_id, str) or not prepared_response_id.strip():
                 raise ValueError(f"{PREPARED_RESPONSE_ID_ARG} must be a non-empty string")
             prepared_response_id = prepared_response_id.strip()
+        prepared_file_id = kwargs.get(PREPARED_FILE_ID_ARG)
+        if prepared_file_id is not None:
+            if not isinstance(prepared_file_id, str) or not prepared_file_id.strip():
+                raise ValueError(f"{PREPARED_FILE_ID_ARG} must be a non-empty string")
+            prepared_file_id = prepared_file_id.strip()
+        if prepared_response_id and prepared_file_id:
+            raise ValueError(
+                f"{PREPARED_RESPONSE_ID_ARG} and {PREPARED_FILE_ID_ARG} are mutually exclusive"
+            )
 
         # Only a directly routed Feishu URL uses the Lark protocol. Accessor
         # output is an existing local Markdown file and must stay local.
         is_feishu_url = self._is_feishu_url(source_str)
         lark_file = (
             await self._resolve_lark_file(kwargs)
-            if is_feishu_url and not prepared_response_id
+            if is_feishu_url and not prepared_response_id and not prepared_file_id
             else None
         )
 
@@ -117,6 +128,8 @@ class UnderstandingAPI(BaseParser):
             ("http://", "https://")
         ):
             url = original_source
+        elif prepared_file_id:
+            local_path = None
         else:
             local_path = source_path
 
@@ -131,13 +144,15 @@ class UnderstandingAPI(BaseParser):
                     "base": "bitable",
                 }.get(path_parts[0], path_parts[0])
         else:
-            inferred_name = local_path.name if local_path is not None else ""
-            if local_path is None or not local_path.is_file():
+            inferred_name = local_path.name if local_path is not None else Path(source_str).name
+            if not prepared_file_id and (local_path is None or not local_path.is_file()):
                 raise ValueError(
                     "UnderstandingAPI supports http(s) URLs or local files. "
                     "Got an invalid local file path."
                 )
-            doc_type = resolved_extension or local_path.suffix.lower().lstrip(".")
+            doc_type = resolved_extension or (
+                local_path.suffix.lower().lstrip(".") if local_path is not None else ""
+            )
 
         effective_name = str(display_name or inferred_name or "resource")
         doc_name = Path(effective_name).stem or "resource"
@@ -147,6 +162,9 @@ class UnderstandingAPI(BaseParser):
 
         if prepared_response_id:
             response_id = prepared_response_id
+        elif prepared_file_id:
+            task_meta["file_id"] = prepared_file_id
+            response_obj = await self._create_response_for_file(file_id=prepared_file_id)
         elif url is None and local_path is not None:
             file_obj = await self._create_file(local_path=local_path)
             file_id = file_obj.get("id")
@@ -236,17 +254,21 @@ class UnderstandingAPI(BaseParser):
         logger.info("[UnderstandingAPI] done")
         return result
 
-    async def submit_file(self, source: Union[str, Path]) -> str:
-        """Upload a local file and submit it without retaining the local artifact."""
+    async def upload_file(self, source: Union[str, Path]) -> str:
+        """Upload a local file and return a durable Files API file_id."""
         local_path = Path(source)
         if not local_path.is_file():
-            raise ValueError("UnderstandingAPI file submission requires an existing local file")
+            raise ValueError("UnderstandingAPI file upload requires an existing local file")
 
         file_obj = await self._create_file(local_path=local_path)
         file_id = file_obj.get("id")
         if not file_id:
             raise RuntimeError(f"files api missing file_id: {self._safe_error_summary(file_obj)}")
+        return str(file_id)
 
+    async def submit_file(self, source: Union[str, Path]) -> str:
+        """Upload a local file and submit it without retaining the local artifact."""
+        file_id = await self.upload_file(source)
         response_obj = await self._create_response_for_file(file_id=str(file_id))
         response_id = response_obj.get("id")
         if not response_id:
@@ -333,6 +355,8 @@ class UnderstandingAPI(BaseParser):
 
     async def _create_file(self, *, local_path: Path) -> Dict[str, Any]:
         file_size = local_path.stat().st_size
+        if file_size == 0:
+            raise InvalidArgumentError("Understanding parser does not support empty files.")
         if file_size > self._upload_simple_max_bytes:
             if not self._enable_resumable_upload:
                 raise ValueError(

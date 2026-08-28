@@ -46,9 +46,9 @@ each caller.
   `Invalid scope ... Must be one of:` error message never mentions it.
 - Responses always echo the expanded canonical URI, never `viking://~`, and persisted
   data (vector records, watch keys) stays canonical as well.
-- Requires an authenticated user identity. Expansion happens at the request boundary for
-  user and admin callers; root-role and unauthenticated contexts, along with places that
-  demand an already-canonical URI (internal storage paths, background tasks), reject the
+- Requires an authenticated request identity. Expansion uses that identity's effective
+  `user_id` for every request role, including root. Places that demand an already-canonical
+  URI (internal storage paths and background tasks without a request context) reject the
   alias instead of guessing a user.
 - Replaces the removed uid-less shorthand: `viking://user/<segment>/...` for `memories`,
   `resources`, `skills`, `peers`, `privacy`, and `sessions` is rejected at USER/ADMIN
@@ -113,6 +113,8 @@ viking://~/resources/                         # Your private resources
 viking://~/resources/docs/                    # Your private resource directory
 viking://user/{user_id}/memories/             # Explicit user path (your own id; other ids need admin/root)
 ```
+
+`viking://resources/...` is the shared scope for the current account and supports per-directory or per-file [ACLs](./15-acl.md). `viking://user/{user}/resources/...` is private; move a resource into the shared scope to share it.
 
 ### User Skills and Peer Content
 

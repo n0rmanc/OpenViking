@@ -39,8 +39,8 @@ viking://{scope}/{path}
 - 接受但不宣传：`~` 不属于公开作用域列表，`Invalid scope ... Must be one of:` 错误信息中不会出现它。
 - 响应始终回显展开后的 canonical URI，不会返回 `viking://~`；持久化数据（向量记录、watch key）
   同样保持 canonical 形式。
-- 需要认证用户身份。展开发生在 user / admin 调用方的请求入口；root 角色与未认证上下文，
-  以及要求 URI 已是 canonical 形式的场景（内部存储路径、后台任务），会直接拒绝该别名，
+- 需要认证请求身份。所有请求角色（包括 root）都使用该身份的有效 `user_id` 展开；要求 URI
+  已是 canonical 形式的场景（内部存储路径、没有请求上下文的后台任务）仍会直接拒绝该别名，
   而不会猜测用户。
 - 取代已移除的无 uid 短写：`memories`、`resources`、`skills`、`peers`、`privacy`、`sessions`
   的 `viking://user/<segment>/...` 写法会在 USER / ADMIN 请求入口被拒绝，错误信息中会给出
@@ -105,6 +105,8 @@ viking://~/resources/                         # 自己的私有资源
 viking://~/resources/docs/                    # 自己的私有资源目录
 viking://user/{user_id}/memories/             # 显式用户路径（可写自己的 id；访问他人需 admin/root）
 ```
+
+`viking://resources/...` 是当前 account 的共享区，可通过 [资源访问控制（ACL）](./15-acl.md) 细化目录或文件权限。`viking://user/{user}/resources/...` 是个人私有区；分享资源需要将其移动到共享区。
 
 ### 用户技能和 peer 内容
 

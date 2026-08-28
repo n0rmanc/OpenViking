@@ -37,6 +37,7 @@ from openviking.storage.abstract_overview import (
     plan_abstract_overview_refresh,
     prepare_abstract_overview_write,
 )
+from openviking.storage.acl import AclAction, CreatorAclGrant
 from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
 from openviking.storage.queuefs import SemanticMsg, get_queue_manager
 from openviking.storage.queuefs.semantic_msg import build_semantic_coalesce_key
@@ -129,7 +130,7 @@ class ContentWriteCoordinator:
         processing_mode = normalize_processing_mode(processing_mode)
         normalized_uri = self._validate_uri_path(uri, field_name="uri")
         self._ensure_content_write_policy(normalized_uri)
-        self._viking_fs._ensure_mutable_access(normalized_uri, ctx)
+        await self._viking_fs._ensure_access(normalized_uri, ctx, action=AclAction.WRITE)
 
         if mode == "create":
             return await self._create_and_write(
@@ -141,7 +142,20 @@ class ContentWriteCoordinator:
                 processing_mode=processing_mode,
             )
 
-        stat = await self._safe_stat(normalized_uri, ctx=ctx)
+        stat = await self._safe_stat(normalized_uri, ctx=ctx, allow_not_found=True)
+        if stat.get("not_found"):
+            # replace and append are idempotent writes: a missing target starts
+            # from an empty file while retaining the caller's requested mode.
+            return await self._create_and_write(
+                uri=normalized_uri,
+                content=content,
+                ctx=ctx,
+                wait=wait,
+                timeout=timeout,
+                processing_mode=processing_mode,
+                result_mode=mode,
+                validate_extension=False,
+            )
         if stat.get("isDir"):
             raise InvalidArgumentError(
                 f"write only supports existing files, got directory: {normalized_uri}"
@@ -200,7 +214,7 @@ class ContentWriteCoordinator:
         """
         normalized_root = self._validate_uri_path(root_uri, field_name="root_uri")
         await self._validate_batch_root(normalized_root, ctx=ctx)
-        normalized_operations = self._normalize_batch_operations(
+        normalized_operations = await self._normalize_batch_operations(
             normalized_root, operations, ctx=ctx
         )
 
@@ -386,14 +400,14 @@ class ContentWriteCoordinator:
             and len(parts) <= classification.content_index + 1
         ):
             raise InvalidArgumentError("batch-write root must be inside a resource directory")
-        self._viking_fs._ensure_mutable_access(root_uri, ctx)
+        await self._viking_fs._ensure_access(root_uri, ctx, action=AclAction.WRITE)
         stat = await self._safe_stat(root_uri, ctx=ctx)
         if not stat.get("isDir"):
             raise InvalidArgumentError(
                 f"batch-write root must be an existing directory: {root_uri}"
             )
 
-    def _normalize_batch_operations(
+    async def _normalize_batch_operations(
         self,
         root_uri: str,
         operations: list[dict[str, Any]],
@@ -425,7 +439,7 @@ class ContentWriteCoordinator:
                     f"batch-write target has a different context type: {uri}"
                 )
             self._ensure_content_write_policy(uri)
-            self._viking_fs._ensure_mutable_access(uri, ctx)
+            await self._viking_fs._ensure_access(uri, ctx, action=AclAction.WRITE)
 
             has_content = "content" in raw
             has_content_base64 = "content_base64" in raw
@@ -588,6 +602,7 @@ class ContentWriteCoordinator:
             recursive=recursive,
             account_id=ctx.account_id,
             user_id=ctx.user.user_id,
+            group_ids=ctx.group_ids,
             role=str(ctx.role),
             skip_vectorization=False,
             telemetry_id=telemetry.telemetry_id,
@@ -642,18 +657,20 @@ class ContentWriteCoordinator:
         ctx: RequestContext,
     ) -> Dict[str, Any]:
         self._validate_tag_mode(mode)
+        normalized_uri = self._validate_uri_path(uri, field_name="uri")
         normalized_tags = normalize_search_tags(tags, discard_invalid=True)
-        stat = await self._safe_stat(uri, ctx=ctx)
+        await self._viking_fs._ensure_access(normalized_uri, ctx, action=AclAction.WRITE)
+        stat = await self._safe_stat(normalized_uri, ctx=ctx)
         if stat.get("isDir"):
             return await self._set_directory_tags(
-                uri=uri,
+                uri=normalized_uri,
                 tags=normalized_tags,
                 mode=mode,
                 recursive=recursive,
                 ctx=ctx,
             )
         return await self._set_single_uri_tags(
-            uri=uri,
+            uri=normalized_uri,
             tags=normalized_tags,
             mode=mode,
             recursive=recursive,
@@ -750,6 +767,7 @@ class ContentWriteCoordinator:
         root_uri: str,
         content: str,
         mode: str,
+        response_mode: Optional[str] = None,
         context_type: str,
         wait: bool,
         timeout: Optional[float],
@@ -799,6 +817,7 @@ class ContentWriteCoordinator:
                     uri=uri,
                     context_type=context_type,
                     ctx=ctx,
+                    creator_acl_grant=(CreatorAclGrant.DIRECT if mode == "create" else None),
                 )
                 post_process_started = True
             else:
@@ -906,6 +925,7 @@ class ContentWriteCoordinator:
         uri: str,
         context_type: str,
         ctx: RequestContext,
+        creator_acl_grant: CreatorAclGrant | None = None,
     ) -> bool:
         parent = VikingURI(uri).parent
         if parent is None:
@@ -917,6 +937,7 @@ class ContentWriteCoordinator:
             parent_uri=parent.uri,
             context_type=context_type,
             ctx=ctx,
+            creator_acl_grant=creator_acl_grant,
         )
 
     async def _vectorize_abstract_overview(self, *, uri: str, ctx: RequestContext) -> bool:
@@ -1014,10 +1035,13 @@ class ContentWriteCoordinator:
         wait: bool,
         timeout: Optional[float],
         processing_mode: ProcessingMode,
+        result_mode: str = "create",
+        validate_extension: bool = True,
     ) -> Dict[str, Any]:
         if is_abstract_overview_uri(uri):
             raise InvalidArgumentError(f"cannot create generated abstract overview directly: {uri}")
-        self._validate_create_extension(uri)
+        if validate_extension:
+            self._validate_create_extension(uri)
 
         stat = await self._safe_stat(uri, ctx=ctx, allow_not_found=True)
         if not stat.get("not_found"):
@@ -1036,6 +1060,7 @@ class ContentWriteCoordinator:
                 root_uri=root_uri,
                 content=content,
                 mode="create",
+                response_mode=result_mode,
                 wait=wait,
                 timeout=timeout,
                 ctx=ctx,
@@ -1049,6 +1074,7 @@ class ContentWriteCoordinator:
             root_uri=root_uri,
             content=content,
             mode="create",
+            response_mode=result_mode,
             context_type=context_type,
             wait=wait,
             timeout=timeout,
@@ -1176,6 +1202,7 @@ class ContentWriteCoordinator:
         root_uri: str,
         content: str,
         mode: str,
+        response_mode: Optional[str] = None,
         wait: bool,
         timeout: Optional[float],
         ctx: RequestContext,
@@ -1231,7 +1258,7 @@ class ContentWriteCoordinator:
                 uri=uri,
                 root_uri=root_uri,
                 context_type="memory",
-                mode=mode,
+                mode=response_mode or mode,
                 written_bytes=written_bytes,
                 wait=wait,
                 queue_status=queue_status,
@@ -1334,6 +1361,12 @@ class ContentWriteCoordinator:
 
         if not updated_targets:
             raise NotFoundError(uri, "semantic file")
+
+        await self._viking_fs._ensure_access_many(
+            [str(target["uri"]) for target in updated_targets],
+            ctx,
+            action=AclAction.WRITE,
+        )
 
         applied_uris: list[str] = []
         skipped_count = 0

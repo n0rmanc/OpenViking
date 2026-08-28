@@ -10,6 +10,8 @@ import asyncio
 import contextlib
 import inspect
 import json
+import os
+import signal
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -24,8 +26,11 @@ from openviking.parse.mode import ParseMode, normalize_parse_mode
 from openviking.parse.parsers.constants import MPEG_TS_EXTENSION_ALIAS
 from openviking.resource.feishu_watch_auth import (
     FEISHU_ACCESS_TOKEN_ARG,
+    FEISHU_APP_ID_ARG,
+    FEISHU_APP_SECRET_ARG,
     FEISHU_AUTH_PROVIDER,
     FEISHU_REFRESH_TOKEN_ARG,
+    FeishuAppCredentials,
     create_feishu_auth_state,
     is_feishu_auth_state,
     load_feishu_app_credentials,
@@ -49,6 +54,7 @@ from openviking.server.user_config import (
     effective_resource_add_target,
     effective_skill_add_target,
 )
+from openviking.storage.acl import AclAction
 from openviking.storage.queuefs import QueueManager, get_queue_manager
 from openviking.storage.queuefs.add_resource_msg import AddResourcePhase
 from openviking.storage.viking_fs import VikingFS
@@ -122,14 +128,17 @@ _ADD_RESOURCE_ARGS_RESERVED_FIELDS = frozenset(
         "telemetry",
         "request_validator",
         "understanding_response_id",
+        "understanding_file_id",
         "parser_backend",
         "resolved_extension",
         "defer_post_processing",
         "prepared_resource",
         "tags",
         "tag_mode",
+        "internal_task",
     }
 )
+_ADD_RESOURCE_TRANSIENT_ARGS = frozenset({"tos_signature", "tos_access"})
 _ADD_RESOURCE_TAG_MODES = frozenset({"replace", "append"})
 
 _INTERNAL_INGESTION_FIELDS = frozenset(
@@ -143,6 +152,7 @@ _INTERNAL_INGESTION_FIELDS = frozenset(
         "to_is_directory",
         "watch_auth_state",
         "understanding_response_id",
+        "understanding_file_id",
         "parser_backend",
         "resolved_extension",
         "prepared_resource",
@@ -172,6 +182,7 @@ class _SourcePlan:
     task_auth: Dict[str, Any] = field(repr=False)
     staged_source: Optional["StagedSource"] = None
     understanding_response_id: Optional[str] = None
+    understanding_file_id: Optional[str] = None
     defer_unnamed_target: bool = False
 
 
@@ -228,6 +239,7 @@ class ResourceService:
                 "parser_backend",
                 "resolved_extension",
                 "understanding_response_id",
+                "understanding_file_id",
                 "temp_file_id",
             }:
                 continue
@@ -249,6 +261,20 @@ class ResourceService:
             watch_kwargs["tags"] = tags
             watch_kwargs["tag_mode"] = tag_mode
         return watch_kwargs
+
+    @staticmethod
+    def _infer_watch_source_type(path: str) -> Optional[str]:
+        if not path:
+            return None
+        from openviking.parse.accessors.feishu_accessor import FeishuAccessor
+
+        if FeishuAccessor._is_feishu_url(path):
+            return "feishu"
+        if is_git_repo_url(path):
+            return "git"
+        if is_remote_resource_source(path):
+            return "url"
+        return "local"
 
     def _validate_add_resource_tag_policy(
         self,
@@ -297,6 +323,7 @@ class ResourceService:
         processor_kwargs: Dict[str, Any],
         watch_auth_state: Optional[Dict[str, Any]],
         ctx: RequestContext,
+        source_type: Optional[str] = None,
     ) -> None:
         if not watch_manager or not manage_watch:
             return
@@ -338,6 +365,7 @@ class ResourceService:
                         processing_mode=processing_mode,
                         processor_kwargs=sanitized,
                         auth_state=watch_auth_state,
+                        source_type=source_type or self._infer_watch_source_type(path),
                         ctx=ctx,
                     )
                 except ConflictError:
@@ -385,6 +413,9 @@ class ResourceService:
             raise InvalidArgumentError(str(exc).replace("parse_mode", "args.parse_mode")) from exc
         token = normalized.get(FEISHU_ACCESS_TOKEN_ARG)
         refresh_token = normalized.pop(FEISHU_REFRESH_TOKEN_ARG, None)
+        app_id = normalized.pop(FEISHU_APP_ID_ARG, None)
+        app_secret = normalized.pop(FEISHU_APP_SECRET_ARG, None)
+        has_app_credentials = app_id is not None or app_secret is not None
         watch_auth_state = None
         if token is not None:
             if not isinstance(token, str) or not token.strip():
@@ -397,28 +428,61 @@ class ResourceService:
                         "args.feishu_refresh_token must be a non-empty string when "
                         "args.feishu_access_token is used with watch_interval > 0."
                     )
-                self._ensure_feishu_credentials_for_watch()
-                watch_auth_state = create_feishu_auth_state(token, refresh_token.strip())
+                app_credentials = self._load_feishu_credentials_for_watch(app_id, app_secret)
+                watch_auth_state = create_feishu_auth_state(
+                    token,
+                    refresh_token.strip(),
+                    app_credentials,
+                )
             elif refresh_token is not None:
                 raise InvalidArgumentError(
                     "args.feishu_refresh_token is only supported with "
+                    "args.feishu_access_token and watch_interval > 0."
+                )
+            elif has_app_credentials:
+                raise InvalidArgumentError(
+                    "args.feishu_app_id and args.feishu_app_secret are only supported with "
                     "args.feishu_access_token and watch_interval > 0."
                 )
         elif refresh_token is not None:
             raise InvalidArgumentError(
                 "args.feishu_refresh_token requires args.feishu_access_token."
             )
+        elif has_app_credentials:
+            raise InvalidArgumentError(
+                "args.feishu_app_id and args.feishu_app_secret require "
+                "args.feishu_access_token and watch_interval > 0."
+            )
 
         return _NormalizedAddResourceArgs(normalized, watch_auth_state, parse_mode)
 
-    def _ensure_feishu_credentials_for_watch(self) -> None:
+    def _load_feishu_credentials_for_watch(
+        self,
+        app_id: Any,
+        app_secret: Any,
+    ) -> Optional[FeishuAppCredentials]:
+        supplied = app_id is not None or app_secret is not None
+        if supplied and (
+            not isinstance(app_id, str)
+            or not app_id.strip()
+            or not isinstance(app_secret, str)
+            or not app_secret.strip()
+        ):
+            raise InvalidArgumentError(
+                "args.feishu_app_id and args.feishu_app_secret must be non-empty strings "
+                "and provided together."
+            )
         try:
-            load_feishu_app_credentials()
+            credentials = load_feishu_app_credentials(
+                app_id=app_id.strip() if supplied else None,
+                app_secret=app_secret.strip() if supplied else None,
+            )
         except Exception as exc:
             raise InvalidArgumentError(
                 "Feishu user-token watch requires FEISHU_APP_ID and "
                 "FEISHU_APP_SECRET, or feishu.app_id and feishu.app_secret in ov.conf."
             ) from exc
+        return credentials if supplied else None
 
     def _ensure_initialized(self) -> None:
         """Ensure all dependencies are initialized."""
@@ -503,7 +567,10 @@ class ResourceService:
                 account_id=msg.account_id,
                 user_id=msg.user_id,
                 task_id=msg.task_id,
-                meta={"source_path": msg.source_path},
+                meta={
+                    "source_path": msg.source_path,
+                    **({"internal": True} if msg.internal_task else {}),
+                },
                 auth=task_auth,
             )
             await get_queue_manager().enqueue(queue_name, msg.to_dict())
@@ -552,7 +619,7 @@ class ResourceService:
             legacy_backend = normalize_parser_backend(queued_args.pop("parser_backend", None))
             parser_backend = legacy_backend or (
                 ParserBackend.UNDERSTANDING
-                if msg.understanding_response_id is not None
+                if msg.understanding_response_id is not None or msg.understanding_file_id is not None
                 else ParserBackend.INTERNAL
             )
             internal_kwargs: Dict[str, Any] = {"parser_backend": parser_backend}
@@ -600,6 +667,10 @@ class ResourceService:
                 from openviking.parse.understanding_api import PREPARED_RESPONSE_ID_ARG
 
                 internal_kwargs[PREPARED_RESPONSE_ID_ARG] = msg.understanding_response_id
+            if msg.understanding_file_id is not None:
+                from openviking.parse.understanding_api import PREPARED_FILE_ID_ARG
+
+                internal_kwargs[PREPARED_FILE_ID_ARG] = msg.understanding_file_id
             result = await self._execute_resource_ingestion(
                 path=msg.path,
                 ctx=ctx,
@@ -624,6 +695,7 @@ class ResourceService:
                 stage_callback=stage_callback,
                 watch_auth_state=watch_auth_state,
                 prepared_resource=prepared_resource,
+                internal_task=msg.internal_task,
                 **internal_kwargs,
             )
             if msg.staged_source is not None:
@@ -676,7 +748,7 @@ class ResourceService:
                 watch_auth_state = None
             auth_kwargs = (
                 {FEISHU_ACCESS_TOKEN_ARG: token.strip()}
-                if msg.understanding_response_id is None
+                if msg.understanding_response_id is None and msg.understanding_file_id is None
                 else {}
             )
             return auth_kwargs, watch_auth_state
@@ -725,12 +797,13 @@ class ResourceService:
         queued_args = {
             key: value
             for key, value in processor_kwargs.items()
-            if key not in _ADD_RESOURCE_ARGS_RESERVED_FIELDS
+            if key not in _ADD_RESOURCE_ARGS_RESERVED_FIELDS | _ADD_RESOURCE_TRANSIENT_ARGS
         }
         queued_args = self._sanitize_watch_processor_kwargs(queued_args)
         task_auth: Dict[str, Any] = {}
         staged_source = None
         understanding_response_id = None
+        understanding_file_id = None
         defer_unnamed_target = False
 
         if git_source:
@@ -785,7 +858,8 @@ class ResourceService:
             prepared = await self._resource_processor.prepare_durable_source(
                 path,
                 ctx,
-                snapshot_required=local_source,
+                snapshot_required=local_source
+                or bool(processor_kwargs.get("tos_signature") or processor_kwargs.get("tos_access")),
                 parse_mode=mode,
                 allow_local_path_resolution=allow_local_path_resolution,
                 **processor_kwargs,
@@ -812,12 +886,17 @@ class ResourceService:
                         mode is ParseMode.DEFAULT
                         and self._resource_processor.should_use_understanding_api(prepared)
                     ):
-                        understanding_response_id = (
-                            await self._resource_processor.submit_understanding(
-                                prepared,
-                                **processor_kwargs,
+                        if processor_kwargs.get("temp_file_id"):
+                            understanding_file_id = (
+                                await self._resource_processor.upload_understanding_file(prepared)
                             )
-                        )
+                        else:
+                            understanding_response_id = (
+                                await self._resource_processor.submit_understanding(
+                                    prepared,
+                                    **processor_kwargs,
+                                )
+                            )
                     else:
                         staged_source = await stage_source(
                             prepared,
@@ -834,6 +913,7 @@ class ResourceService:
             task_auth=task_auth,
             staged_source=staged_source,
             understanding_response_id=understanding_response_id,
+            understanding_file_id=understanding_file_id,
             defer_unnamed_target=defer_unnamed_target,
         )
 
@@ -895,6 +975,7 @@ class ResourceService:
         allow_local_path_resolution: bool,
         enforce_public_remote_targets: bool,
         processor_kwargs: Dict[str, Any],
+        internal_task: bool,
     ) -> Dict[str, Any]:
         from openviking.storage.queuefs.add_resource_msg import AddResourceMsg
 
@@ -925,10 +1006,17 @@ class ResourceService:
                 defer_candidate_resolution=defer_candidate_resolution,
             )
             lock_handoff = await self._lock_to_handoff_payload(resource_lock)
+            message_path = plan.path
+            if processor_kwargs.get("temp_file_id") and plan.understanding_file_id is not None:
+                message_path = (
+                    plan.source_identity.source_name
+                    or plan.source_identity.source_path
+                    or "uploaded-file"
+                )
             msg = AddResourceMsg(
                 task_id=str(uuid4()),
                 job_phase=AddResourcePhase.SOURCE,
-                path=plan.path,
+                path=message_path,
                 source_path=(plan.source_identity.source_name or "")
                 if processor_kwargs.get("temp_file_id")
                 else plan.source_identity.source_path or plan.path,
@@ -939,8 +1027,10 @@ class ResourceService:
                 telemetry_id=get_current_telemetry().telemetry_id or None,
                 account_id=ctx.account_id,
                 user_id=ctx.user.user_id,
+                group_ids=list(ctx.group_ids),
                 role=str(ctx.role),
                 actor_peer_id=ctx.actor_peer_id,
+                bypass_acl=ctx.bypass_acl,
                 lock_handoff=lock_handoff,
                 reason=reason,
                 instruction=instruction,
@@ -971,6 +1061,8 @@ class ResourceService:
                 args=plan.processor_args,
                 defer_target_resolution=defer_target_resolution,
                 understanding_response_id=plan.understanding_response_id,
+                understanding_file_id=plan.understanding_file_id,
+                internal_task=internal_task,
             )
 
             def transfer_staged_source() -> None:
@@ -980,6 +1072,7 @@ class ResourceService:
             queue_name = (
                 QueueManager.EXTERNAL_PARSE
                 if plan.understanding_response_id is not None
+                or plan.understanding_file_id is not None
                 else QueueManager.ADD_RESOURCE
             )
             enqueue_lock = resource_lock
@@ -1030,6 +1123,10 @@ class ResourceService:
             create_parent=create_parent,
         )
         if candidate_uri and defer_candidate_resolution:
+            await self._resource_processor.ensure_candidate_parent_write_access(
+                candidate_uri=candidate_uri,
+                ctx=ctx,
+            )
             return root_uri, None, True
         if candidate_uri:
             root_uri, resource_lock = await self._resource_processor.reserve_unique_candidate(
@@ -1038,11 +1135,17 @@ class ResourceService:
             )
             return root_uri, resource_lock, False
 
+        await self._viking_fs._ensure_access(root_uri, ctx, action=AclAction.WRITE)
         dst_path = self._viking_fs._uri_to_path(root_uri, ctx=ctx)
         resource_lock = await self._viking_fs._async_agfs.pathlock_acquire_tree(
             dst_path,
             timeout_secs=0.0,
         )
+        try:
+            await self._viking_fs._ensure_access(root_uri, ctx, action=AclAction.WRITE)
+        except BaseException:
+            await self._release_lock_ref(resource_lock)
+            raise
         return root_uri, resource_lock, False
 
     @staticmethod
@@ -1075,18 +1178,27 @@ class ResourceService:
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=os.name == "posix",
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-        except TimeoutError as exc:
+        except BaseException as exc:
             if proc is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    if os.name == "posix":
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    else:
+                        proc.kill()
                 with contextlib.suppress(Exception):
-                    proc.kill()
-                    await proc.communicate()
-            raise InvalidArgumentError(
-                "Cannot access Git repository; the preflight timed out after 10s."
-            ) from exc
-        except Exception as exc:
-            raise InvalidArgumentError("Cannot access Git repository during preflight.") from exc
+                    await asyncio.wait_for(
+                        asyncio.shield(proc.communicate()), timeout=1.0
+                    )
+            if isinstance(exc, asyncio.TimeoutError):
+                raise InvalidArgumentError(
+                    "Cannot access Git repository; the preflight timed out after 10s."
+                ) from exc
+            if isinstance(exc, Exception):
+                raise InvalidArgumentError("Cannot access Git repository during preflight.") from exc
+            raise
 
         if proc.returncode != 0:
             raise InvalidArgumentError("Cannot access Git repository; git ls-remote failed.")
@@ -1116,6 +1228,7 @@ class ResourceService:
         allow_local_path_resolution: bool = True,
         enforce_public_remote_targets: bool = False,
         add_type: Optional[str] = None,
+        internal_task: bool = False,
         args: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
@@ -1147,6 +1260,7 @@ class ResourceService:
             tag_mode=tag_mode,
             allow_local_path_resolution=allow_local_path_resolution,
             enforce_public_remote_targets=enforce_public_remote_targets,
+            internal_task=internal_task,
             args=args,
             **kwargs,
         )
@@ -1216,6 +1330,7 @@ class ResourceService:
         parse_mode: ParseMode | str | None = None,
         allow_local_path_resolution: bool = True,
         enforce_public_remote_targets: bool = False,
+        internal_task: bool = False,
         args: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
@@ -1293,6 +1408,20 @@ class ResourceService:
                 "field and in args."
             )
         kwargs.update(normalized_args.processor_kwargs)
+        tos_signature = kwargs.get("tos_signature")
+        tos_access = kwargs.get("tos_access")
+        if tos_signature is not None or tos_access is not None:
+            if not path.startswith(("http://", "https://")):
+                raise InvalidArgumentError(
+                    "tos_signature and tos_access are only supported for HTTP(S) resource URLs."
+                )
+            if tos_signature is not None and tos_access is not None:
+                raise InvalidArgumentError("tos_signature and tos_access cannot both be provided.")
+            for field, value in (("tos_signature", tos_signature), ("tos_access", tos_access)):
+                if value is not None:
+                    if not isinstance(value, str) or not value.strip():
+                        raise InvalidArgumentError(f"args.{field} must be a non-empty string.")
+                    kwargs[field] = value.strip()
         git_repo_source = is_git_repo_url(path)
         if git_repo_source:
             reject_git_http_userinfo(path)
@@ -1394,6 +1523,7 @@ class ResourceService:
                         processor_kwargs=connector_watch_processor_kwargs,
                         watch_auth_state=watch_auth_state,
                         ctx=ctx,
+                        source_type=resolved[0],
                     )
 
                 on_success = create_watch_after_success
@@ -1428,6 +1558,7 @@ class ResourceService:
                     processor_kwargs=connector_watch_processor_kwargs,
                     watch_auth_state=watch_auth_state,
                     ctx=ctx,
+                    source_type=resolved[0],
                 )
             return result
 
@@ -1465,6 +1596,7 @@ class ResourceService:
                 allow_local_path_resolution=allow_local_path_resolution,
                 enforce_public_remote_targets=enforce_public_remote_targets,
                 processor_kwargs=kwargs,
+                internal_task=internal_task,
             )
         else:
             result = await self._execute_resource_ingestion(
@@ -1488,6 +1620,7 @@ class ResourceService:
                 allow_local_path_resolution=allow_local_path_resolution,
                 enforce_public_remote_targets=enforce_public_remote_targets,
                 watch_auth_state=normalized_args.watch_auth_state,
+                internal_task=internal_task,
                 **kwargs,
             )
         get_current_telemetry().set("resource.flags.wait", wait)
@@ -1544,6 +1677,7 @@ class ResourceService:
         resource_lock: Optional[Dict[str, Any]] = None,
         stage_callback: Optional[Callable[[str], Any]] = None,
         prepared_resource: Optional["LocalResource"] = None,
+        internal_task: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
         """Execute an already-routed resource ingestion."""
@@ -1650,8 +1784,10 @@ class ResourceService:
                     telemetry_id=telemetry_id or None,
                     account_id=ctx.account_id,
                     user_id=ctx.user.user_id,
+                    group_ids=list(ctx.group_ids),
                     role=str(ctx.role),
                     actor_peer_id=ctx.actor_peer_id,
+                    bypass_acl=ctx.bypass_acl,
                     lock_handoff=lock_handoff,
                     reason=reason,
                     instruction=instruction,
@@ -1672,6 +1808,7 @@ class ResourceService:
                     skip_watch_management=True,
                     tags=tags,
                     tag_mode=tag_mode,
+                    internal_task=internal_task,
                 )
                 enqueue_lock = deferred_lock
                 deferred_lock = None
@@ -1833,6 +1970,7 @@ class ResourceService:
         processing_mode: ProcessingMode,
         processor_kwargs: Dict[str, Any],
         auth_state: Optional[Dict[str, Any]],
+        source_type: Optional[str],
         ctx: RequestContext,
     ) -> None:
         """Handle creation or update of watch task.
@@ -1868,6 +2006,7 @@ class ResourceService:
                 user_id=ctx.user.user_id,
                 role=str(ctx.role),
                 path=path,
+                source_type=source_type,
                 to_uri=to_uri,
                 to_is_directory=to_is_directory,
                 parent_uri=parent_uri,
@@ -1891,6 +2030,7 @@ class ResourceService:
                 account_id=ctx.account_id,
                 user_id=ctx.user.user_id,
                 original_role=str(ctx.role),
+                source_type=source_type,
                 to_uri=to_uri,
                 to_is_directory=to_is_directory,
                 parent_uri=parent_uri,

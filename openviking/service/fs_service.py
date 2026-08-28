@@ -10,7 +10,7 @@ import asyncio
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from openviking.core.context import ContextLevel
-from openviking.core.namespace import classify_uri, context_type_for_uri
+from openviking.core.namespace import classify_uri, context_type_for_uri, uri_leaf_name
 from openviking.privacy import (
     UserPrivacyConfigService,
     get_skill_name_from_uri,
@@ -25,6 +25,7 @@ from openviking.storage.abstract_overview import (
     plan_abstract_overview_refresh,
     render_abstract_overview,
 )
+from openviking.storage.acl import CreatorAclGrant
 from openviking.storage.content_write import ContentWriteCoordinator
 from openviking.storage.queuefs import SemanticMsg, get_queue_manager
 from openviking.storage.queuefs.semantic_msg import build_semantic_coalesce_key
@@ -193,12 +194,16 @@ class FSService:
     ) -> None:
         """Create directory."""
         viking_fs = self._ensure_initialized()
+        directory_uri, abstract_uri = self._resolve_directory_uris(uri)
+        directory_preexisting = await viking_fs.exists(directory_uri, ctx=ctx)
         await viking_fs.mkdir(uri, ctx=ctx)
+
         abstract = self._normalize_directory_description(description)
         if not abstract:
-            return
+            if await viking_fs.exists(abstract_uri, ctx=ctx):
+                return
+            abstract = f"# {uri_leaf_name(directory_uri)}"
 
-        directory_uri, abstract_uri = self._resolve_directory_uris(uri)
         await viking_fs.write_file(
             abstract_uri,
             render_abstract_overview(
@@ -226,6 +231,9 @@ class FSService:
             overview="",
             context_type=context_type_for_uri(directory_uri),
             ctx=ctx,
+            creator_acl_grant=(
+                CreatorAclGrant.DIRECT if not directory_preexisting else None
+            ),
             include_overview=False,
         )
 
@@ -414,6 +422,7 @@ class FSService:
             recursive=False,
             account_id=ctx.account_id,
             user_id=ctx.user.user_id,
+            group_ids=ctx.group_ids,
             peer_id=ctx.user.user_id,
             role=str(ctx.role),
             skip_vectorization=False,
@@ -730,6 +739,27 @@ class FSService:
             recursive=recursive,
             ctx=ctx,
         )
+
+    async def get_acl(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:
+        return await self._ensure_initialized().get_acl(uri, ctx=ctx)
+
+    async def set_acl(
+        self, uri: str, entries: List[Dict[str, str]], ctx: RequestContext
+    ) -> Dict[str, Any]:
+        return await self._ensure_initialized().set_acl(uri, entries, ctx=ctx)
+
+    async def grant_acl(
+        self, uri: str, principal: str, level: str, ctx: RequestContext
+    ) -> Dict[str, Any]:
+        return await self._ensure_initialized().grant_acl(uri, principal, level, ctx=ctx)
+
+    async def revoke_acl(
+        self, uri: str, principal: str, ctx: RequestContext
+    ) -> Dict[str, Any]:
+        return await self._ensure_initialized().revoke_acl(uri, principal, ctx=ctx)
+
+    async def delete_acl(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:
+        return await self._ensure_initialized().delete_acl(uri, ctx=ctx)
 
     async def commit(
         self,

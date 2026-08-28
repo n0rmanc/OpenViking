@@ -158,6 +158,9 @@ class UnifiedResourceProcessor:
     async def submit_understanding(self, source: str | Path | LocalResource, **kwargs) -> str:
         return await self._get_parser_router().submit(source, **kwargs)
 
+    async def upload_understanding_file(self, source: str | Path | LocalResource) -> str:
+        return await self._get_parser_router().upload_file(source)
+
     @staticmethod
     def _set_resolved_identity(resource: LocalResource, source_name: Optional[str]) -> None:
         meta = resource.meta
@@ -240,6 +243,8 @@ class UnifiedResourceProcessor:
             and self._has_prepared_understanding_response(kwargs)
         ):
             parse_kwargs = dict(kwargs)
+            parse_kwargs.pop("tos_signature", None)
+            parse_kwargs.pop("tos_access", None)
             parse_kwargs["instruction"] = instruction
             parse_kwargs["vlm_processor"] = self._get_vlm_processor()
             parse_kwargs["storage"] = self.storage
@@ -262,6 +267,8 @@ class UnifiedResourceProcessor:
             and self.should_use_understanding_directly(source, **kwargs)
         ):
             parse_kwargs = dict(kwargs)
+            parse_kwargs.pop("tos_signature", None)
+            parse_kwargs.pop("tos_access", None)
             parse_kwargs["instruction"] = instruction
             parse_kwargs["vlm_processor"] = self._get_vlm_processor()
             parse_kwargs["storage"] = self.storage
@@ -291,6 +298,8 @@ class UnifiedResourceProcessor:
             # Source credentials are consumed by the accessor. Never forward
             # them into parser kwargs, parse results, or later queue payloads.
             parse_kwargs.pop("auth_config", None)
+            parse_kwargs.pop("tos_signature", None)
+            parse_kwargs.pop("tos_access", None)
             parse_kwargs["instruction"] = instruction
             parse_kwargs["_source_meta"] = local_resource.meta
             parse_kwargs["resolved_extension"] = kwargs.get(
@@ -355,7 +364,12 @@ class UnifiedResourceProcessor:
 
     @staticmethod
     def _has_prepared_understanding_response(kwargs: dict) -> bool:
-        from openviking.parse.understanding_api import PREPARED_RESPONSE_ID_ARG
+        from openviking.parse.understanding_api import (
+            PREPARED_FILE_ID_ARG,
+            PREPARED_RESPONSE_ID_ARG,
+        )
 
-        value = kwargs.get(PREPARED_RESPONSE_ID_ARG)
-        return isinstance(value, str) and bool(value.strip())
+        return any(
+            isinstance(kwargs.get(key), str) and bool(kwargs[key].strip())
+            for key in (PREPARED_RESPONSE_ID_ARG, PREPARED_FILE_ID_ARG)
+        )

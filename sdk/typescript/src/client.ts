@@ -388,6 +388,7 @@ export class OpenVikingClient {
       level: options.level,
       tags: options.tags,
       include_provenance: options.includeProvenance,
+      read_content: options.readContent,
     });
     return this.request("POST", `/api/v1/search/${kind}`, {
       body: mergeExtra(body, options.extra),
@@ -582,7 +583,7 @@ export class OpenVikingClient {
       body: mergeExtra(body, options.extra),
     });
   }
-  /** Apply preconditioned file writes in one request. */
+  /** Apply file writes in one request and refresh their indexes once. */
   batchWrite(
     rootUri: string,
     operations: BatchWriteOperation[],
@@ -595,10 +596,7 @@ export class OpenVikingClient {
           uri: normalizeURI(operation.uri),
           content: operation.content,
           content_base64: operation.contentBase64,
-          precondition: compact({
-            kind: operation.precondition.kind,
-            base_hash: operation.precondition.baseHash,
-          }),
+          mode: operation.mode,
         }),
       ),
       wait: options.wait,
@@ -1093,9 +1091,17 @@ export class OpenVikingClient {
       }),
     });
   }
-  /** List tenant accounts. */
-  adminListAccounts(): Promise<unknown[]> {
-    return this.request("GET", "/api/v1/admin/accounts");
+  /** List tenant accounts, ordered by account ID. `name` supports wildcard (* and ?) matching. */
+  adminListAccounts(
+    options: { name?: string; limit?: number; page?: number } = {},
+  ): Promise<unknown[]> {
+    return this.request("GET", "/api/v1/admin/accounts", {
+      query: {
+        name: options.name,
+        limit: options.limit,
+        page: options.limit !== undefined ? (options.page ?? 1) : undefined,
+      },
+    });
   }
   /** Delete a tenant account. */
   adminDeleteAccount(accountId: string): Promise<JsonObject> {
@@ -1124,11 +1130,22 @@ export class OpenVikingClient {
       },
     );
   }
-  /** List users in an account. */
-  adminListUsers(accountId: string): Promise<unknown[]> {
+  /** List users in an account, ordered by user ID. `name` supports wildcard (* and ?) matching. */
+  adminListUsers(
+    accountId: string,
+    options: { limit?: number; name?: string; role?: string; page?: number } = {},
+  ): Promise<unknown[]> {
     return this.request(
       "GET",
       `/api/v1/admin/accounts/${pathPart(accountId)}/users`,
+      {
+        query: {
+          limit: options.limit,
+          name: options.name,
+          role: options.role,
+          page: options.limit !== undefined ? (options.page ?? 1) : undefined,
+        },
+      },
     );
   }
   /** Remove a user from an account. */

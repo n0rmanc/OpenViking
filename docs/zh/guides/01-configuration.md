@@ -445,7 +445,8 @@ openviking-server doctor
       "provider": "dashscope",
       "api_key": "${DASHSCOPE_API_KEY}",
       "model": "text-embedding-v4",
-      "dimension": 1024
+      "dimension": 1024,
+      "input": "text"
     }
   }
 }
@@ -462,11 +463,11 @@ openviking-server doctor
 | `qwen3-vl-embedding` | 2560 | multimodal | 文本 + 图像 + 视频 |
 | `qwen2.5-vl-embedding` | 1024 | multimodal | 文本 + 图像 + 视频 |
 
-**多模态参数**（仅文本+图像/视频模型支持）:
+**输入和多模态参数**:
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `input_type` | str | `"multimodal"` 或 `"text"` | 嵌入模式（默认: `"multimodal"`） |
+| `input` | str | `"multimodal"` | 嵌入模式：`"text"` 或 `"multimodal"` |
 | `enable_fusion` | bool | `false` | 为 `tongyi-embedding-vision-*` 模型启用融合向量 |
 | `res_level` | int | `2` | 图像分辨率级别（1=高，2=中，3=低） |
 | `max_video_frames` | int | `16` | 视频最大嵌入帧数 |
@@ -478,7 +479,11 @@ openviking-server doctor
 | 中国 | `https://dashscope.aliyuncs.com`（默认） | 推荐中国大陆用户使用 |
 | 国际 | `https://dashscope-intl.aliyuncs.com` | 推荐中国境外用户使用 |
 
-也支持设置完整 URL 来自定义端点地址。
+如果使用自定义网关，`api_base` 应填写网关根地址。OpenViking 会根据
+输入模式自动追加 endpoint 路径，因此不要在 `api_base` 中包含
+`/compatible-mode/v1`（文本模式）或
+`/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding`
+（多模态模式）。
 
 获取 API Key: https://dashscope.console.aliyun.com/api-key
 
@@ -1511,6 +1516,21 @@ Redis Sentinel 分别配置数据节点和 Sentinel 的 ACL：
 ```
 </details>
 
+##### ACL schema
+
+ACL 只维护在 context collection。除 `acl_enabled: bool` 外，需要以下 `list<string>` 标量索引字段：
+
+```text
+acl_direct_grants
+acl_inherited_grants
+```
+
+每个元素使用 `{mask}:{principal}` 格式，其中 `1` 表示 `read`、`3` 表示 `write`、`7` 表示 `manage`。
+
+本地 backend 会在启动时为存量 collection 增加字段并重建标量索引。旧记录不做全量回填；缺失 ACL 字段按 `acl_enabled=false` 和空列表读取。
+
+火山向量库等远端 backend 的存量 collection 需要由部署方预先添加这些字段和 scalar index，OpenViking 只校验 schema。`volcengine` API key 数据面模式还要求 context collection 和配置的 index 已存在。权限模型详见 [资源访问控制（ACL）](../concepts/15-acl.md)。
+
 <details>
 <summary><b>Qdrant REST</b></summary>
 
@@ -1551,6 +1571,39 @@ term dictionary。没有 marker 的既有 Qdrant collection 会 fail closed，�
 QDRANT_URL=http://127.0.0.1:6333 \
   pytest --confcutdir=tests/storage -q tests/storage/test_qdrant_integration.py
 ```
+</details>
+
+<details>
+<summary><b>openGauss</b></summary>
+
+需要 openGauss 服务端支持原生 `vector` 类型，并使用允许远程连接的数据库用户。
+可通过 `pip install "openviking[opengauss]"` 安装可选驱动。
+官方容器中的初始 `omm` 用户可能限制远程登录，必要时请为 OpenViking 创建普通数据库用户。
+
+```json
+{
+  "storage": {
+    "vectordb": {
+      "name": "context",
+      "backend": "opengauss",
+      "project": "default",
+      "distance_metric": "cosine",
+      "dimension": 1024,
+      "opengauss": {
+        "host": "127.0.0.1",
+        "port": 5432,
+        "user": "openviking",
+        "password": "your-password",
+        "db_name": "postgres",
+        "schema": "public",
+        "mode": "standalone"
+      }
+    }
+  }
+}
+```
+
+分布式 openGauss 部署可将 `mode` 设为 `"distributed"`；OpenViking 会尝试把元数据表标记为 reference table，并按 `id` 分布集合表。
 </details>
 
 ## 配置文件

@@ -40,6 +40,26 @@ List directory contents.
 }
 ```
 
+If the caller can read the parent directory but cannot read one of its direct
+children, `ls` still returns a name placeholder without size, modification
+time, abstract, or storage metadata:
+
+```python
+{
+    "name": "restricted",
+    "isDir": True,
+    "uri": "viking://resources/restricted",
+    "access": "denied"
+}
+```
+
+Content operations such as `stat` and `read` return HTTP 403 `PermissionDenied` for
+that URI. Recursive listing retains the inaccessible directory itself but does
+not descend into it, and search results omit unreadable content. This
+discoverable-name behavior applies only to the shared
+`viking://resources` namespace; private user and peer namespaces retain their
+existing hiding rules.
+
 
 **Python HTTP SDK**
 
@@ -429,7 +449,7 @@ Create a directory.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | uri | str | Yes | - | Viking URI for the new directory |
-| description | str | No | `null` | Initial directory description. When provided, it is written to `.abstract.md` and queued for L0 vectorization. |
+| description | str | No | `null` | Initial directory description. When omitted, the directory name is used as the default L0; when provided, this description is used. Both forms write `.abstract.md` and queue L0 vectorization. |
 
 
 **Python HTTP SDK**
