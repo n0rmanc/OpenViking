@@ -1441,9 +1441,9 @@ acl_inherited_grants
 
 Each element uses `{mask}:{principal}`: `1` means `read`, `3` means `write`, and `7` means `manage`.
 
-Local backends add the fields to an existing collection and rebuild the scalar index during startup. Existing records are not rewritten; missing ACL fields read as `acl_enabled=false` and empty lists.
+Local, cuVS, and Qdrant backends add the fields to an existing collection and rebuild/update the scalar index during startup. Existing records are not rewritten; missing ACL fields read as `acl_enabled=false` and empty lists.
 
-For existing remote collections, including Volcengine VikingDB, provision these fields and scalar indexes before startup; OpenViking validates but does not alter the remote schema. Volcengine API-key data-plane mode also requires the context collection and configured index to exist. See [Resource Access Control (ACL)](../concepts/15-acl.md) for permission semantics.
+For other existing remote collections, including Volcengine VikingDB, provision these fields and scalar indexes before startup; OpenViking validates but does not alter the remote schema. Volcengine API-key data-plane mode also requires the context collection and configured index to exist. See [Resource Access Control (ACL)](../concepts/15-acl.md) for permission semantics.
 
 <details>
 <summary><b>Qdrant REST</b></summary>

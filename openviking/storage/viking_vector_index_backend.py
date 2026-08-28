@@ -133,7 +133,10 @@ class _AsyncVectorAdapter:
     ) -> None:
         def _update() -> None:
             collection = self._adapter.get_collection()
-            collection.update(fields=fields)
+            if self._adapter.mode == "qdrant":
+                collection.update(fields={"Fields": fields, "ScalarIndex": scalar_index})
+            else:
+                collection.update(fields=fields)
             if self._adapter.mode in {"local", "cuvs"}:
                 index_meta = collection.get_index_meta_data(index_name)
                 index_meta["ScalarIndex"] = scalar_index

@@ -22,6 +22,7 @@ from openviking.storage.vectordb.qdrant_utils import (
 )
 from openviking.storage.vectordb_adapters.factory import create_collection_adapter
 from openviking.storage.vectordb_adapters.qdrant_adapter import QdrantCollectionAdapter
+from openviking.storage.viking_vector_index_backend import _AsyncVectorAdapter
 from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
 
 
@@ -315,6 +316,82 @@ def test_numeric_scalar_field_types_map_to_qdrant_numeric_schemas() -> None:
 
     assert collection._field_schema("score") == "float"
     assert collection._field_schema("counts") == "integer"
+
+
+@pytest.mark.asyncio
+async def test_update_collection_schema_accepts_openviking_field_list() -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="docs",
+        metadata_collection_name="docs__meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+    )
+    collection._schema = {
+        "CollectionName": "docs",
+        "Fields": [{"FieldName": "legacy", "FieldType": "string"}],
+    }
+    collection._indexes = {"default": {"ScalarIndex": ["account_id"]}}
+    marker_writes: list[dict[str, object]] = []
+    collection._write_metadata_marker = lambda: marker_writes.append(  # type: ignore[method-assign]
+        dict(collection._schema)
+    )
+    collection._ensure_remote_indexes = lambda _meta: None  # type: ignore[method-assign]
+
+    adapter = type(
+        "_Adapter",
+        (),
+        {"mode": "qdrant", "get_collection": lambda self: collection},
+    )()
+
+    await _AsyncVectorAdapter(adapter).update_collection_schema(
+        [
+            {"FieldName": "acl_enabled", "FieldType": "bool"},
+        ],
+        ["account_id", "acl_enabled"],
+        "default",
+    )
+
+    assert collection.get_meta_data()["Fields"] == [
+        {"FieldName": "legacy", "FieldType": "string"},
+        {"FieldName": "acl_enabled", "FieldType": "bool"},
+    ]
+    assert collection.get_meta_data()["ScalarIndex"] == [
+        "account_id",
+        "acl_enabled",
+    ]
+    assert collection.get_index_meta_data("default")["ScalarIndex"] == [
+        "account_id",
+        "acl_enabled",
+    ]
+    assert marker_writes == [
+        {
+            "CollectionName": "docs",
+            "ScalarIndex": [
+                "account_id",
+                "acl_enabled",
+            ],
+            "Fields": [
+                {"FieldName": "legacy", "FieldType": "string"},
+                {"FieldName": "acl_enabled", "FieldType": "bool"},
+            ],
+        },
+        {
+            "CollectionName": "docs",
+            "ScalarIndex": [
+                "account_id",
+                "acl_enabled",
+            ],
+            "Fields": [
+                {"FieldName": "legacy", "FieldType": "string"},
+                {"FieldName": "acl_enabled", "FieldType": "bool"},
+            ],
+        },
+    ]
 
 
 def test_drop_index_removes_remote_payload_indexes_and_metadata() -> None:

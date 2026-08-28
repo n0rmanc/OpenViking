@@ -215,10 +215,37 @@ class QdrantCollection(ICollection):
         self._ensure_loaded()
         return dict(self._schema)
 
-    def update(self, fields: dict[str, Any] | None = None, description: str | None = None):
+    def update(
+        self,
+        fields: dict[str, Any] | list[dict[str, Any]] | None = None,
+        description: str | None = None,
+    ):
         self._ensure_loaded()
         if fields:
-            self._schema.update(fields)
+            if isinstance(fields, list):
+                field_updates = fields
+                schema_updates = {}
+            else:
+                schema_updates = dict(fields)
+                field_updates = schema_updates.pop("Fields", None)
+
+            if isinstance(field_updates, list):
+                existing_fields = {
+                    field.get("FieldName"): field
+                    for field in self._schema.get("Fields", [])
+                    if isinstance(field, dict) and field.get("FieldName")
+                }
+                existing_fields.update(
+                    {
+                        field.get("FieldName"): field
+                        for field in field_updates
+                        if isinstance(field, dict) and field.get("FieldName")
+                    }
+                )
+                self._schema["Fields"] = list(existing_fields.values())
+                self._schema.update(schema_updates)
+            else:
+                self._schema.update(fields)
         if description is not None:
             self._schema["Description"] = description
         self._write_metadata_marker()

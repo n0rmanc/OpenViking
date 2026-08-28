@@ -326,7 +326,7 @@ async def init_context_collection(storage) -> bool:
     async def _migrate_acl_schema() -> None:
         if not missing_acl_fields and not missing_acl_indexes:
             return
-        if vectordb_cfg.backend not in {"local", "cuvs"}:
+        if vectordb_cfg.backend not in {"local", "cuvs", "qdrant"}:
             raise EmbeddingConfigurationError(
                 "Context collection is missing ACL schema: "
                 f"fields={missing_acl_fields}, scalar_indexes={missing_acl_indexes}. "
