@@ -235,13 +235,9 @@ class QdrantCollection(ICollection):
                     for field in self._schema.get("Fields", [])
                     if isinstance(field, dict) and field.get("FieldName")
                 }
-                existing_fields.update(
-                    {
-                        field.get("FieldName"): field
-                        for field in field_updates
-                        if isinstance(field, dict) and field.get("FieldName")
-                    }
-                )
+                for field in field_updates:
+                    if isinstance(field, dict) and field.get("FieldName"):
+                        existing_fields.setdefault(field["FieldName"], field)
                 self._schema["Fields"] = list(existing_fields.values())
                 self._schema.update(schema_updates)
             else:

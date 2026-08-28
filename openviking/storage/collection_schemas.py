@@ -324,7 +324,11 @@ async def init_context_collection(storage) -> bool:
     missing_acl_indexes = sorted(ACL_CONTEXT_FIELDS - existing_scalar_indexes)
 
     async def _migrate_acl_schema() -> None:
-        if not missing_acl_fields and not missing_acl_indexes:
+        if (
+            not missing_acl_fields
+            and not missing_acl_indexes
+            and vectordb_cfg.backend != "qdrant"
+        ):
             return
         if vectordb_cfg.backend not in {"local", "cuvs", "qdrant"}:
             raise EmbeddingConfigurationError(

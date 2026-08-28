@@ -291,6 +291,48 @@ async def test_init_context_collection_migrates_qdrant_legacy_schema(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_init_context_collection_rechecks_qdrant_schema_when_acl_metadata_is_complete(
+    monkeypatch,
+):
+    schema_updates = []
+    attempts = 0
+
+    class _FakeStorage:
+        async def create_collection(self, name, schema):
+            del name, schema
+            return False
+
+        async def get_collection_meta(self):
+            return CollectionSchemas.context_collection("context", 2)
+
+        async def count(self):
+            return 0
+
+        async def update_collection_description(self, description):
+            del description
+
+        async def update_collection_schema(self, fields, scalar_index):
+            nonlocal attempts
+            attempts += 1
+            schema_updates.append((fields, scalar_index))
+            if attempts == 1:
+                raise RuntimeError("transient index failure")
+
+    config = _DummyConfig(_DummyEmbedder(), backend="qdrant")
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: config,
+    )
+
+    with pytest.raises(RuntimeError, match="transient index failure"):
+        await init_context_collection(_FakeStorage())
+    created = await init_context_collection(_FakeStorage())
+
+    assert created is False
+    assert len(schema_updates) == 2
+
+
+@pytest.mark.asyncio
 async def test_init_context_collection_rejects_mismatched_nonempty_collection(monkeypatch):
     """When embedding dimension mismatches for a non-empty collection, vectors are
     incompatible and the function requires a rebuild.
