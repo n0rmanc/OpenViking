@@ -490,6 +490,7 @@ impl FileSystem for S3FileSystem {
 
         // Check if already exists
         if self.client.directory_exists(&normalized).await? {
+            self.stat_cache.invalidate(&normalized).await;
             return Err(Error::already_exists(&normalized));
         }
 
