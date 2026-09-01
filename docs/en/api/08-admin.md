@@ -131,7 +131,7 @@ Content-Type: application/json
 
 ROOT can manage any account and ADMIN can manage only its own account. The
 generic settings endpoint accepts only explicitly allowlisted fields. It currently
-allows `agent_evolution.enabled` and `resource_acl.auto_protect_new_content`.
+allows `agent_evolution.enabled` and `acl.enabled`.
 
 ```http
 GET /api/v1/admin/accounts/{account_id}/settings
@@ -140,18 +140,18 @@ Content-Type: application/json
 
 {
   "agent_evolution": {"enabled": true},
-  "resource_acl": {"auto_protect_new_content": true}
+  "acl": {"enabled": true}
 }
 ```
 
-`resource_acl.auto_protect_new_content` defaults to `false`. When enabled, newly
-created shared files, directories, and `add-resource` roots grant their creator
-direct `manage` while inheriting the parent ACL. Existing content is not migrated
-or modified. Disabling it again affects only later creations; existing ACLs remain
-effective.
+`acl.enabled` defaults to `false`. While disabled, shared resources use the
+original public behavior and ACL authorization is skipped. When enabled, newly
+created shared resources receive ACL fields and ACL-protected shared resources
+are authorized against them. Existing content without an ACL is not migrated or
+modified. Disabling the setting also stops enforcing existing ACLs.
 
 ```bash
-ov --sudo admin set-account-settings acme --auto-protect-new-content true
+ov --sudo admin set-account-settings acme --acl-enabled true
 ```
 
 Before an existing setting is replaced, it is backed up to
@@ -377,7 +377,7 @@ List all workspaces (ROOT only).
 
 **Processing Flow:**
 1. Verify requester has ROOT privileges
-2. Call API Key Manager to get all accounts (ordered lexicographically by account ID)
+2. Call API Key Manager to get all accounts (in creation order)
 3. Apply optional `name` filter
 4. Apply optional `limit`/`page` pagination
 5. Return list with account ID, creation time, and user count
@@ -395,7 +395,7 @@ List all workspaces (ROOT only).
 | limit | int | No | null | Page size (≥1). Omit to return all matches |
 | page | int | No | 1 | 1-based page number; only applies when `limit` is set |
 
-Results are always returned in lexicographic order of account ID.
+Results are returned in creation order.
 
 #### 3. Usage Examples
 
@@ -712,7 +712,7 @@ List active users in a workspace. Users with deletion in progress are omitted.
 
 **Processing Flow:**
 1. Verify requester has ROOT privileges or is an ADMIN of the account
-2. Call API Key Manager to get active users list (ordered lexicographically by user ID)
+2. Call API Key Manager to get active users list (in creation order)
 3. Apply optional filters (name, role)
 4. Apply optional `limit`/`page` pagination
 5. Return users list (trusted mode omits user_key)
@@ -735,7 +735,7 @@ List active users in a workspace. Users with deletion in progress are omitted.
 | page | int | No | 1 | 1-based page number; only applies when `limit` is set |
 
 **Notes:**
-- Results are always returned in lexicographic order of user ID
+- Results are returned in creation order
 - ADMIN can only list users in their own account
 - In `trusted` mode, `user_key` is omitted from the response
 - Users whose deletion has started are no longer returned

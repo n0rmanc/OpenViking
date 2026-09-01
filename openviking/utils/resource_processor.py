@@ -104,6 +104,42 @@ class ResourceProcessor:
             )
         return self._media_processor
 
+    @staticmethod
+    def _empty_directory_error(meta: Dict[str, Any]) -> str:
+        """Build a bounded error message for a directory with no successful files."""
+        failed_files = meta.get("failed_files")
+        failures = failed_files if isinstance(failed_files, list) else []
+        try:
+            total_processable = int(meta.get("total_processable", 0) or 0)
+        except (TypeError, ValueError):
+            total_processable = 0
+
+        if total_processable > 0:
+            message = (
+                "Directory import produced no content: "
+                f"all {total_processable} processable file(s) failed"
+            )
+        else:
+            message = "Directory import produced no content: no processable files were selected"
+
+        details: List[str] = []
+        for item in failures[:5]:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "<unknown>")
+            reason = str(item.get("error") or item.get("reason") or "failed")
+            remote_ids = [
+                f"{key}={item[key]}" for key in ("file_id", "response_id") if item.get(key)
+            ]
+            if remote_ids:
+                path = f"{path} ({', '.join(remote_ids)})"
+            details.append(f"{path}: {reason[:120]}")
+        if details:
+            message += "; failed files: " + "; ".join(details)
+            if len(failures) > len(details):
+                message += f"; ... {len(failures) - len(details)} more"
+        return message
+
     async def prepare_durable_source(
         self,
         path: str,
@@ -115,9 +151,8 @@ class ResourceProcessor:
     ) -> Optional["LocalResource"]:
         """Freeze a source when durable routing cannot safely defer access."""
         media_processor = self._get_media_processor()
-        if (
-            not snapshot_required
-            and not media_processor.durable_route_requires_preparation(path, **kwargs)
+        if not snapshot_required and not media_processor.durable_route_requires_preparation(
+            path, **kwargs
         ):
             return None
         with get_viking_fs().bind_request_context(ctx):
@@ -249,6 +284,30 @@ class ResourceProcessor:
                     stage_status = "error"
                     return result
 
+                parse_meta = parse_result.meta if isinstance(parse_result.meta, dict) else {}
+                is_directory_aggregate = all(
+                    key in parse_meta
+                    for key in (
+                        "file_count",
+                        "total_processable",
+                        "processed_files",
+                        "failed_files",
+                    )
+                )
+                if is_directory_aggregate and parse_meta.get("file_count") == 0:
+                    result["status"] = "error"
+                    result["errors"].append(self._empty_directory_error(parse_meta))
+                    try:
+                        await viking_fs.delete_temp(parse_result.temp_dir_path, ctx=ctx)
+                    except Exception as exc:
+                        logger.warning(
+                            "[ResourceProcessor] Failed to clean empty directory temp %s: %s",
+                            parse_result.temp_dir_path,
+                            exc,
+                        )
+                    stage_status = "error"
+                    return result
+
                 if parse_result.warnings and kwargs.get("strict", False):
                     result.setdefault("warnings", []).extend(parse_result.warnings)
 
@@ -263,7 +322,11 @@ class ResourceProcessor:
                 raise
             except Exception as e:
                 result["status"] = "error"
-                result["errors"].append(f"Parse error: {e}")
+                error_message = f"Parse error: {e}"
+                error_meta = getattr(e, "meta", {})
+                if isinstance(error_meta, dict) and error_meta.get("response_id"):
+                    error_message += f" (response_id={error_meta['response_id']})"
+                result["errors"].append(error_message)
                 logger.error(f"[ResourceProcessor] Parse error: {e}")
                 telemetry.set_error("resource_processor.parse", "PROCESSING_ERROR", str(e))
                 import traceback
@@ -596,7 +659,9 @@ class ResourceProcessor:
                 elif build_index:
                     if root_is_file:
                         await self._vectorize_resource_file(
-                            root_uri, ctx=ctx, ingest_options=ingest_options,
+                            root_uri,
+                            ctx=ctx,
+                            ingest_options=ingest_options,
                             creator_acl_grant=(
                                 CreatorAclGrant.DIRECT if not target_preexisting else None
                             ),
@@ -620,10 +685,10 @@ class ResourceProcessor:
                 return result
             if root_is_file:
                 await self._vectorize_resource_file(
-                    root_uri, ctx=ctx, ingest_options=ingest_options,
-                    creator_acl_grant=(
-                        CreatorAclGrant.DIRECT if not target_preexisting else None
-                    ),
+                    root_uri,
+                    ctx=ctx,
+                    ingest_options=ingest_options,
+                    creator_acl_grant=(CreatorAclGrant.DIRECT if not target_preexisting else None),
                 )
             else:
                 await self._vectorize_resource_files(

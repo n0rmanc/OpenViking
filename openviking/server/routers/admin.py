@@ -12,7 +12,7 @@ from openviking.server.account_settings import (
     AccountAgentEvolutionSettings,
     AccountSettings,
     AccountSettingsPatch,
-    effective_auto_protect_new_content,
+    effective_acl_enabled,
     read_account_settings,
     update_account_settings,
 )
@@ -187,8 +187,8 @@ async def _account_settings_result(
             "agent_evolution": {
                 "enabled": enabled,
             },
-            "resource_acl": {
-                "auto_protect_new_content": effective_auto_protect_new_content(settings),
+            "acl": {
+                "enabled": effective_acl_enabled(settings),
             },
         },
         "overrides": settings.model_dump(exclude_none=True),
@@ -330,7 +330,7 @@ async def list_accounts(
     page: int = Query(1, ge=1, description="1-based page number (requires limit)"),
     ctx: RequestContext = Depends(get_request_context),
 ):
-    """List accounts in lexicographic order. `name` supports wildcard (* and ?) matching."""
+    """List accounts in creation order. `name` supports wildcard (* and ?) matching."""
     manager = _get_api_key_manager(request)
     accounts = manager.get_accounts(name_filter=name, limit=limit, page=page)
     return Response(status="ok", result=accounts)
@@ -509,7 +509,7 @@ async def list_users(
     page: int = Query(1, ge=1, description="1-based page number (requires limit)"),
     ctx: RequestContext = Depends(get_request_context),
 ):
-    """List users in an account, ordered lexicographically by user ID."""
+    """List users in an account, in creation order. `name` supports wildcard (* and ?) matching."""
     _check_account_access(ctx, account_id)
     manager = _get_api_key_manager(request)
     expose_key = _should_expose_user_key(request)

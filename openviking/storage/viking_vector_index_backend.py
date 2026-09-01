@@ -20,6 +20,7 @@ from openviking.storage.acl import (
     acl_principals,
 )
 from openviking.storage.expr import And, Eq, FilterExpr, In, Or, PathScope, RawDSL
+from openviking.storage.vector_ids import vector_record_id
 from openviking.storage.vectordb.collection.collection import Collection
 from openviking.storage.vectordb.collection.result import UpdateResult
 from openviking.storage.vectordb.utils.logging_init import init_cpp_logging
@@ -1502,8 +1503,6 @@ class VikingVectorIndexBackend:
         new_uri: str,
         levels: Optional[List[int]] = None,
     ) -> bool:
-        import hashlib
-
         conds: List[FilterExpr] = [Eq("uri", uri), Eq("account_id", ctx.account_id)]
         if levels:
             conds.append(In("level", levels))
@@ -1536,13 +1535,6 @@ class VikingVectorIndexBackend:
             )
             return False
 
-        def _seed_uri_for_id(uri: str, level: int) -> str:
-            if level == 0:
-                return uri if uri.endswith("/.abstract.md") else f"{uri}/.abstract.md"
-            if level == 1:
-                return uri if uri.endswith("/.overview.md") else f"{uri}/.overview.md"
-            return uri
-
         updated_records: List[Dict[str, Any]] = []
         ids_to_delete: List[str] = []
         for record in full_records:
@@ -1554,16 +1546,14 @@ class VikingVectorIndexBackend:
             except (TypeError, ValueError):
                 level = 2
 
-            seed_uri = _seed_uri_for_id(new_uri, level)
-            id_seed = f"{ctx.account_id}:{seed_uri}"
-            new_id = hashlib.md5(id_seed.encode("utf-8")).hexdigest()
+            new_id = vector_record_id(ctx.account_id, new_uri, level)
 
             updated = {
                 **record,
                 "id": new_id,
                 "uri": new_uri,
             }
-            if self.acl_manager:
+            if self._acl_enabled(ctx):
                 updated.update(
                     await self.acl_manager.materialize_moved_record(record, new_uri, ctx)
                 )
@@ -1633,7 +1623,7 @@ class VikingVectorIndexBackend:
         tenant_filter = self._tenant_filter(ctx)
         if (
             tenant_filter
-            and not self.acl_manager
+            and not self._acl_enabled(ctx)
             and self._targets_within_visible_roots(ctx, targets)
         ):
             # The target scopes are already narrower than the tenant-visible
@@ -1680,7 +1670,7 @@ class VikingVectorIndexBackend:
             return None
 
         account_filter = Eq("account_id", ctx.account_id)
-        if not self.acl_manager:
+        if not self._acl_enabled(ctx):
             return And(
                 [
                     account_filter,
@@ -1714,6 +1704,9 @@ class VikingVectorIndexBackend:
         if ctx.role == Role.ADMIN:
             access_filters.append(PathScope("uri", "viking://resources", depth=-1))
         return And([account_filter, Or(access_filters)])
+
+    def _acl_enabled(self, ctx: RequestContext) -> bool:
+        return self.acl_manager is not None and self.acl_manager.is_enabled(ctx.account_id)
 
     @staticmethod
     def _merge_filters(*filters: Optional[FilterExpr]) -> Optional[FilterExpr]:

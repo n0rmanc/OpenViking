@@ -468,7 +468,9 @@ class TestAddResourceArgs:
         )
         disable_task_tracker(monkeypatch)
         to_uri = "viking://resources/feishu_user_watch"
-        resource_service._plan_source_job_target = AsyncMock(return_value=(to_uri, None, False))
+        resource_service._plan_source_job_target = AsyncMock(
+            return_value=(to_uri, None, False, False)
+        )
 
         async def preflight(_self, _source, *, feishu_access_token=None):
             assert feishu_access_token == "u-test"
@@ -569,7 +571,9 @@ class TestAddResourceArgs:
                 source_format="repository",
             )
         )
-        resource_service._plan_source_job_target = AsyncMock(return_value=(to_uri, None, False))
+        resource_service._plan_source_job_target = AsyncMock(
+            return_value=(to_uri, None, False, False)
+        )
 
         await resource_service.add_resource(
             path=repo_url,

@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import json
 import zipfile
 from pathlib import Path
@@ -25,6 +26,66 @@ from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.media_processor import UnifiedResourceProcessor
 from openviking_cli.exceptions import InvalidArgumentError
 from openviking_cli.session.user_id import UserIdentifier
+
+
+@pytest.mark.asyncio
+async def test_add_resource_processor_cancelled_context_preserves_group_ids(monkeypatch):
+    lock = {"lease_ref": "lock-1"}
+    cleanup = AsyncMock(return_value=True)
+    service = SimpleNamespace(_cleanup_reserved_target_if_empty=cleanup)
+    viking_fs = SimpleNamespace(
+        _async_agfs=SimpleNamespace(
+            pathlock_adopt=AsyncMock(return_value=lock),
+            pathlock_release=AsyncMock(),
+        ),
+        delete_temp=AsyncMock(),
+    )
+    processor = AddResourceProcessor(
+        service,
+        asyncio.get_running_loop(),
+        QueueManager.ADD_RESOURCE,
+        viking_fs,
+    )
+    msg = AddResourceMsg(
+        task_id="task-cancelled",
+        path="report.zip",
+        root_uri="viking://resources/report",
+        account_id="account-1",
+        user_id="user-1",
+        group_ids=["writers", "reviewers"],
+        role="user",
+        lock_handoff={"handle_id": "lock-1"},
+        cleanup_empty_target_on_failure=True,
+    )
+
+    def run_on_current_loop(coro, _loop):
+        task = asyncio.create_task(coro)
+        future: concurrent.futures.Future[None] = concurrent.futures.Future()
+
+        def complete(completed: asyncio.Task) -> None:
+            if completed.cancelled():
+                future.cancel()
+                return
+            error = completed.exception()
+            if error is not None:
+                future.set_exception(error)
+            else:
+                future.set_result(completed.result())
+
+        task.add_done_callback(complete)
+        return future
+
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.add_resource_processor.asyncio.run_coroutine_threadsafe",
+        run_on_current_loop,
+    )
+
+    await processor.on_cancelled({"data": json.dumps(msg.to_dict())})
+
+    cleanup.assert_awaited_once()
+    cleanup_ctx = cleanup.await_args.kwargs["ctx"]
+    assert cleanup_ctx.group_ids == ("writers", "reviewers")
+    viking_fs._async_agfs.pathlock_release.assert_awaited_once_with(lock)
 
 
 @pytest.mark.asyncio
@@ -387,6 +448,7 @@ def test_add_resource_message_round_trips_internal_fields():
         role="user",
         bypass_acl=True,
         defer_target_resolution=True,
+        cleanup_empty_target_on_failure=True,
         understanding_response_id="response-1",
         internal_task=True,
     )
@@ -397,6 +459,7 @@ def test_add_resource_message_round_trips_internal_fields():
     assert "feishu_access_token" not in json.dumps(restored.to_dict())
     assert restored.bypass_acl is True
     assert restored.defer_target_resolution is True
+    assert restored.cleanup_empty_target_on_failure is True
     assert restored.understanding_response_id == "response-1"
     assert restored.job_phase is AddResourcePhase.SOURCE
     assert restored.internal_task is True
@@ -482,7 +545,7 @@ async def test_uat_producer_payload_reaches_worker_without_persisting_token(
         return SimpleNamespace(source_name=preflight_name, source_format="file")
 
     async def plan_source_job_target(*, source_info, **_kwargs):
-        return root_uri, None, source_info.source_name is None
+        return root_uri, None, source_info.source_name is None, False
 
     monkeypatch.setattr(
         "openviking.parse.accessors.feishu_accessor.FeishuAccessor.preflight_source",
@@ -570,7 +633,7 @@ async def test_local_source_job_stages_snapshot_before_enqueue(monkeypatch, tmp_
         skill_processor=SimpleNamespace(),
     )
     service._enqueue_add_resource_job = AsyncMock(return_value=SimpleNamespace(task_id="task-1"))
-    service._plan_source_job_target = AsyncMock(return_value=(root_uri, None, False))
+    service._plan_source_job_target = AsyncMock(return_value=(root_uri, None, False, False))
     monkeypatch.setattr(
         service,
         "_connector_delegate",
@@ -688,9 +751,12 @@ async def test_uat_producer_cancellation_respects_queue_ownership(
 
     service = ResourceService(
         viking_fs=SimpleNamespace(
+            exists=AsyncMock(return_value=False),
+            stat=AsyncMock(return_value={"isDir": True}),
+            ls=AsyncMock(return_value=[]),
+            rm=AsyncMock(),
             _uri_to_path=lambda _uri, ctx: "/resources/fixed",
             _async_agfs=agfs,
-            exists=AsyncMock(return_value=False),
             _ensure_access=AsyncMock(),
         ),
         resource_processor=resource_processor,

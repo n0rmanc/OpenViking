@@ -84,7 +84,7 @@ def service(monkeypatch: pytest.MonkeyPatch) -> ResourceService:
     monkeypatch.setattr(
         instance,
         "_plan_source_job_target",
-        AsyncMock(return_value=("viking://resources/test", None, False)),
+        AsyncMock(return_value=("viking://resources/test", None, False, False)),
     )
     return instance
 
@@ -95,7 +95,7 @@ async def test_no_split_is_forwarded_and_persisted_for_watch_replay(
     ctx: RequestContext,
 ):
     watch_manager = SimpleNamespace(
-        get_task_by_uri=AsyncMock(return_value=None),
+        get_upsertable_task_by_uri=AsyncMock(return_value=None),
         create_task=AsyncMock(return_value=SimpleNamespace(task_id="watch-1")),
     )
     scheduler = SimpleNamespace(watch_manager=watch_manager)
@@ -131,6 +131,7 @@ async def test_no_split_watch_replay_preserves_auto_bound_file_target(
             "viking://resources/test",
             None,
             kwargs["defer_candidate_resolution"],
+            False,
         )
     )
 
@@ -179,6 +180,7 @@ async def test_no_split_defers_initial_root_when_parent_targeted(
             "viking://resources/test",
             None,
             kwargs["defer_candidate_resolution"],
+            False,
         )
     )
 
@@ -265,7 +267,9 @@ async def test_tos_auth_args_require_http_resource_url(
     service: ResourceService,
     ctx: RequestContext,
 ):
-    with pytest.raises(InvalidArgumentError, match=r"tos_signature and tos_access are only supported"):
+    with pytest.raises(
+        InvalidArgumentError, match=r"tos_signature and tos_access are only supported"
+    ):
         await service.add_resource(
             path="/test/path",
             ctx=ctx,
@@ -402,7 +406,7 @@ async def test_native_git_enqueue_persists_internal_no_split_mode(
         )
     )
     service._plan_source_job_target = AsyncMock(
-        return_value=("viking://resources/repo", None, False)
+        return_value=("viking://resources/repo", None, False, False)
     )
     service._enqueue_add_resource_job = AsyncMock(return_value=SimpleNamespace(task_id="task-git"))
 

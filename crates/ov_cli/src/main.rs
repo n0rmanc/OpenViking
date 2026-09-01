@@ -530,6 +530,12 @@ enum Commands {
             help_heading = "Common options"
         )]
         node_limit: i32,
+        /// Comma-separated fields to display (name,uri,path,type,size,mode,mtime,locked,id,count,tags,abstract)
+        #[arg(short = 'f', long = "fields", value_delimiter = ',', value_name = "FIELDS", help_heading = "Output options")]
+        fields: Option<Vec<String>>,
+        /// Comma-separated k=v retrieval tags; all tags must match
+        #[arg(long = "tags", value_delimiter = ',', value_name = "k=v", help_heading = "Common options")]
+        tags: Vec<String>,
     },
     /// [Data] Get directory tree
     Tree {
@@ -568,6 +574,15 @@ enum Commands {
             help_heading = "Common options"
         )]
         level_limit: i32,
+        /// Simple path output (just paths, no tree formatting)
+        #[arg(short, long, help_heading = "Common options")]
+        simple: bool,
+        /// Comma-separated fields to display (name,uri,path,type,size,mode,mtime,locked,id,count,tags)
+        #[arg(short = 'f', long = "fields", value_delimiter = ',', value_name = "FIELDS", help_heading = "Output options")]
+        fields: Option<Vec<String>>,
+        /// Comma-separated k=v retrieval tags; all tags must match
+        #[arg(long = "tags", value_delimiter = ',', value_name = "k=v", help_heading = "Common options")]
+        tags: Vec<String>,
     },
     /// [Data] Create directory
     Mkdir {
@@ -694,6 +709,12 @@ enum Commands {
             help_heading = "Common options"
         )]
         timeout: Option<f64>,
+        /// Comma-separated k=v retrieval tags to write with the content
+        #[arg(long = "tags", value_delimiter = ',')]
+        tags: Vec<String>,
+        /// Tag update mode when --tags is provided
+        #[arg(long = "tag-mode", default_value = "replace", value_parser = ["replace", "append"])]
+        tag_mode: String,
     },
     /// [Data] Update explicit retrieval tags metadata for a file or directory
     #[command(hide = true)]
@@ -905,6 +926,12 @@ enum Commands {
             help_heading = "Advanced options"
         )]
         level_limit: i32,
+        /// Comma-separated k=v retrieval tags; all tags must match
+        #[arg(long = "tags", value_delimiter = ',', value_name = "k=v", help_heading = "Common options")]
+        tags: Vec<String>,
+        /// Fields to include in output (currently: tags)
+        #[arg(short = 'f', long = "fields", value_delimiter = ',', value_name = "FIELDS", help_heading = "Output options")]
+        fields: Option<Vec<String>>,
     },
     /// [Data] Run file glob pattern search
     Glob {
@@ -931,6 +958,15 @@ enum Commands {
             help_heading = "Common options"
         )]
         node_limit: i32,
+        /// Simple output (one entry per line)
+        #[arg(short, long, help_heading = "Common options")]
+        simple: bool,
+        /// Comma-separated k=v retrieval tags; all tags must match
+        #[arg(long = "tags", value_delimiter = ',', value_name = "k=v", help_heading = "Common options")]
+        tags: Vec<String>,
+        /// Comma-separated fields to display (name,uri,path,type,size,mode,mtime,locked,id,tags)
+        #[arg(short = 'f', long = "fields", value_delimiter = ',', value_name = "FIELDS", help_heading = "Output options")]
+        fields: Option<Vec<String>>,
     },
     /// [Data] Session management commands
     Session {
@@ -2005,14 +2041,14 @@ enum AdminCommands {
         /// Account ID
         #[arg(value_name = "account-id")]
         account_id: String,
-        /// Automatically protect newly created shared content
+        /// Enable ACL authorization for shared resources
         #[arg(
             long,
             required = true,
             action = ArgAction::Set,
             value_name = "true|false"
         )]
-        auto_protect_new_content: bool,
+        acl_enabled: bool,
     },
 }
 
@@ -3150,6 +3186,8 @@ async fn main() {
             instruction,
             wait,
             timeout,
+            tags,
+            tag_mode,
             strict_mode,
             ignore_dirs,
             include,
@@ -3158,8 +3196,6 @@ async fn main() {
             watch_interval,
             processing_mode,
             resource_args,
-            tags,
-            tag_mode,
             upload_options,
         } => {
             let ctx =
@@ -3470,14 +3506,19 @@ async fn main() {
             abs_limit,
             all,
             node_limit,
-        } => handlers::handle_ls(uri, simple, recursive, abs_limit, all, node_limit, ctx).await,
+            fields,
+            tags,
+        } => handlers::handle_ls(uri, simple, recursive, abs_limit, all, node_limit, fields, tags, ctx).await,
         Commands::Tree {
             uri,
             abs_limit,
             all,
             node_limit,
             level_limit,
-        } => handlers::handle_tree(uri, abs_limit, all, node_limit, level_limit, ctx).await,
+            simple,
+            fields,
+            tags,
+        } => handlers::handle_tree(uri, abs_limit, all, node_limit, level_limit, simple, fields, tags, ctx).await,
         Commands::Mkdir { uri, description } => handlers::handle_mkdir(uri, description, ctx).await,
         Commands::Rm {
             uri,
@@ -3594,6 +3635,8 @@ async fn main() {
             wait,
             processing_mode,
             timeout,
+            tags,
+            tag_mode,
         } => {
             let effective_mode = if let Some(m) = mode {
                 m
@@ -3610,6 +3653,8 @@ async fn main() {
                 wait,
                 timeout,
                 processing_mode,
+                tags,
+                tag_mode,
                 ctx,
             )
             .await
@@ -3699,6 +3744,8 @@ async fn main() {
             ignore_case,
             node_limit,
             level_limit,
+            tags,
+            fields,
         } => {
             handlers::handle_grep(
                 uri,
@@ -3707,6 +3754,8 @@ async fn main() {
                 ignore_case,
                 node_limit,
                 level_limit,
+                tags,
+                fields,
                 ctx,
             )
             .await
@@ -3716,7 +3765,10 @@ async fn main() {
             pattern,
             uri,
             node_limit,
-        } => handlers::handle_glob(pattern, uri, node_limit, ctx).await,
+            simple,
+            fields,
+            tags,
+        } => handlers::handle_glob(pattern, uri, node_limit, simple, fields, tags, ctx).await,
     };
 
     if let Err(e) = result {

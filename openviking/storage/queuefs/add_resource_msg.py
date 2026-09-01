@@ -52,6 +52,7 @@ class AddResourceMsg:
     watch_interval: float = 0
     skip_watch_management: bool = True
     defer_target_resolution: bool = False
+    cleanup_empty_target_on_failure: bool = False
     understanding_response_id: Optional[str] = None
     understanding_file_id: Optional[str] = None
     processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE
@@ -185,6 +186,9 @@ class AddResourceMsg:
             watch_interval=float(data.get("watch_interval", 0) or 0),
             skip_watch_management=bool(data.get("skip_watch_management", True)),
             defer_target_resolution=bool(data.get("defer_target_resolution", False)),
+            cleanup_empty_target_on_failure=bool(
+                data.get("cleanup_empty_target_on_failure", False)
+            ),
             understanding_response_id=(
                 data.get("understanding_response_id")
                 if isinstance(data.get("understanding_response_id"), str)

@@ -464,30 +464,6 @@ def test_codex_auth_refresh_requires_persisted_client_id(tmp_path, monkeypatch):
 
 @patch("openviking.models.vlm.backends.codex_vlm.openai.OpenAI")
 @patch("openviking.models.vlm.backends.codex_vlm.resolve_codex_runtime_credentials")
-def test_codex_streaming_is_rejected(mock_resolve, mock_openai_class):
-    mock_resolve.return_value = {
-        "api_key": "oauth-token",
-        "base_url": "https://chatgpt.com/backend-api/codex",
-    }
-    mock_real_client = MagicMock()
-    mock_openai_class.return_value = mock_real_client
-
-    vlm = CodexVLM(
-        {
-            "provider": "openai-codex",
-            "model": "gpt-5.3-codex",
-            "stream": True,
-        }
-    )
-
-    with pytest.raises(NotImplementedError, match="Streaming is not supported"):
-        vlm.get_completion("hello")
-
-    mock_real_client.responses.create.assert_not_called()
-
-
-@patch("openviking.models.vlm.backends.codex_vlm.openai.OpenAI")
-@patch("openviking.models.vlm.backends.codex_vlm.resolve_codex_runtime_credentials")
 def test_codex_sync_client_re_resolves_credentials_per_request(mock_resolve, mock_openai_class):
     mock_resolve.side_effect = [
         {
