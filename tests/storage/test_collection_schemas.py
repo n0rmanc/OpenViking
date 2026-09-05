@@ -289,6 +289,59 @@ async def test_init_context_collection_migrates_qdrant_legacy_schema(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_init_context_collection_warns_qdrant_acl_migration_does_not_backfill(
+    monkeypatch
+):
+    schema_updates = []
+    warnings = []
+
+    class _FakeStorage:
+        async def create_collection(self, name, schema):
+            del name, schema
+            return False
+
+        async def get_collection_meta(self):
+            schema = CollectionSchemas.context_collection("context", 2)
+            return {
+                "Description": "Unified context collection",
+                "Fields": [
+                    field
+                    for field in schema["Fields"]
+                    if field["FieldName"] not in ACL_CONTEXT_FIELDS
+                ],
+                "ScalarIndex": [
+                    field
+                    for field in schema["ScalarIndex"]
+                    if field not in ACL_CONTEXT_FIELDS
+                ],
+            }
+
+        async def count(self):
+            return 3
+
+        async def update_collection_schema(self, fields, scalar_index):
+            schema_updates.append((fields, scalar_index))
+
+    config = _DummyConfig(_DummyEmbedder(), backend="qdrant")
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: config,
+    )
+    monkeypatch.setattr(
+        "openviking.storage.collection_schemas.logger.warning",
+        lambda message, *args: warnings.append(message % args if args else message),
+    )
+
+    created = await init_context_collection(_FakeStorage())
+
+    assert created is False
+    assert len(schema_updates) == 1
+    log_output = "\n".join(warnings)
+    assert "without backfilling records" in log_output
+    assert "legacy URI-namespace visibility" in log_output
+
+
+@pytest.mark.asyncio
 async def test_init_context_collection_rechecks_qdrant_schema_when_acl_metadata_is_complete(
     monkeypatch,
 ):
