@@ -354,7 +354,16 @@ async def init_context_collection(storage) -> bool:
             )
         await storage.update_collection_schema(schema["Fields"], schema["ScalarIndex"])
         if missing_acl_fields:
-            count = await _existing_count()
+            try:
+                count = await _existing_count()
+            except Exception as exc:
+                logger.warning(
+                    "Qdrant ACL schema migration added %s but could not inspect "
+                    "existing records (%s); ACL fields were not backfilled.",
+                    ", ".join(missing_acl_fields),
+                    exc,
+                )
+                return
             if count:
                 logger.warning(
                     "Qdrant ACL schema migration added %s to a non-empty collection "
