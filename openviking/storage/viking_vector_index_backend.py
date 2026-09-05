@@ -1462,6 +1462,10 @@ class VikingVectorIndexBackend:
             backend = self._get_default_backend()
         return await backend.count(filter=filter)
 
+    async def count_unscoped(self) -> int:
+        """Count all collection records for internal startup maintenance."""
+        return await self._get_root_backend().count()
+
     async def search_by_keywords(
         self,
         keywords: Optional[List[str]] = None,
