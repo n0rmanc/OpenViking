@@ -319,6 +319,24 @@ async def init_context_collection(storage) -> bool:
             "Existing collection metadata is unavailable; cannot validate embedding compatibility"
         )
 
+    expected_fields = {field.get("FieldName") for field in schema["Fields"]}
+    existing_fields = {field.get("FieldName") for field in existing_meta.get("Fields", [])}
+    missing_fields = sorted(expected_fields - existing_fields)
+    expected_scalar_indexes = set(schema["ScalarIndex"])
+    existing_scalar_indexes = set(existing_meta.get("ScalarIndex", []))
+    missing_scalar_indexes = sorted(expected_scalar_indexes - existing_scalar_indexes)
+
+    async def _update_local_schema() -> None:
+        if vectordb_cfg.backend not in {"local", "cuvs"} or "Fields" not in existing_meta:
+            return
+        if not missing_fields and not missing_scalar_indexes:
+            return
+        if not hasattr(storage, "update_collection_schema"):
+            raise EmbeddingConfigurationError(
+                "Local context collection does not support automatic schema updates"
+            )
+        await storage.update_collection_schema(schema["Fields"], schema["ScalarIndex"])
+
     async def _migrate_acl_schema() -> None:
         if vectordb_cfg.backend != "qdrant":
             return
@@ -347,6 +365,7 @@ async def init_context_collection(storage) -> bool:
 
     if _embedding_metadata_compatible(existing_embedding_meta, embedding_meta):
         await _migrate_acl_schema()
+        await _update_local_schema()
         return False
 
     existing_count = await storage.count() if hasattr(storage, "count") else 0
@@ -359,6 +378,7 @@ async def init_context_collection(storage) -> bool:
                     embedding_meta,
                 )
             )
+            await _update_local_schema()
             return False
 
     if existing_embedding_meta is None:
@@ -375,6 +395,7 @@ async def init_context_collection(storage) -> bool:
                     embedding_meta,
                 )
             )
+        await _update_local_schema()
         return False
 
     if existing_count == 0 and hasattr(storage, "update_collection_description"):
@@ -385,6 +406,7 @@ async def init_context_collection(storage) -> bool:
                 embedding_meta,
             )
         )
+        await _update_local_schema()
         return False
 
     # Embedding metadata differs from current config and the collection is
@@ -421,6 +443,7 @@ async def init_context_collection(storage) -> bool:
                 embedding_meta,
             )
         )
+        await _update_local_schema()
         return False
 
     if dimension_changed:

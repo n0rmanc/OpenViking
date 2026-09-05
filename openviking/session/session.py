@@ -806,7 +806,7 @@ class Session:
     async def exists(self) -> bool:
         """Check whether this session already exists in storage."""
         try:
-            await self._viking_fs.stat(self._session_uri, ctx=self.ctx)
+            await self._viking_fs.stat(self._session_uri, ctx=self.ctx, skip_count=True)
             return True
         except Exception as exc:
             if not _is_storage_not_found(exc):
@@ -2107,42 +2107,50 @@ class Session:
             )
             phase1_stage = "phase1_persist"
             try:
-                await self._write_phase1_marker(
-                    archive_uri,
-                    queue_message=queue_msg.to_dict(),
-                    original_messages=original_messages,
-                    archived_messages=messages_to_archive,
-                    retained_messages=retained_messages,
-                    keep_recent_count=keep_recent_count,
-                    retention_mode=retention_mode,
-                    keep_recent_turn_count=effective_keep_turns if turn_mode else 0,
-                    retained_message_token_budget=effective_token_budget if turn_mode else 0,
-                    min_raw_tail_steps=effective_min_tail,
-                    agent_evolution_enabled=agent_evolution_enabled,
-                    agent_memory_skip_reason=agent_memory_skip_reason,
-                )
-
-                # Archive raw remains durable and recoverable before any live
-                # conversation history is removed from the root JSONL.
+                archive_persist_tasks = [
+                    self._write_phase1_marker(
+                        archive_uri,
+                        queue_message=queue_msg.to_dict(),
+                        original_messages=original_messages,
+                        archived_messages=messages_to_archive,
+                        retained_messages=retained_messages,
+                        keep_recent_count=keep_recent_count,
+                        retention_mode=retention_mode,
+                        keep_recent_turn_count=effective_keep_turns if turn_mode else 0,
+                        retained_message_token_budget=effective_token_budget if turn_mode else 0,
+                        min_raw_tail_steps=effective_min_tail,
+                        agent_evolution_enabled=agent_evolution_enabled,
+                        agent_memory_skip_reason=agent_memory_skip_reason,
+                    )
+                ]
                 if self._viking_fs:
                     lines = [m.to_jsonl() for m in messages_to_archive]
-                    await self._viking_fs.write_file(
-                        uri=f"{archive_uri}/messages.jsonl",
-                        content="\n".join(lines) + "\n",
-                        ctx=self.ctx,
-                    )
-                    if retention_plan is not None:
-                        await self._merge_archive_meta(
-                            archive_uri,
-                            {
-                                "retention_plan": self._retention_plan_meta(
-                                    retention_plan,
-                                    keep_recent_turn_count=effective_keep_turns,
-                                    retained_message_token_budget=effective_token_budget,
-                                    min_raw_tail_steps=effective_min_tail,
-                                )
-                            },
+                    archive_persist_tasks.append(
+                        self._viking_fs.write_file(
+                            uri=f"{archive_uri}/messages.jsonl",
+                            content="\n".join(lines) + "\n",
+                            ctx=self.ctx,
                         )
+                    )
+                archive_persist_results = await asyncio.gather(
+                    *archive_persist_tasks,
+                    return_exceptions=True,
+                )
+                for result in archive_persist_results:
+                    if isinstance(result, BaseException):
+                        raise result
+                if retention_plan is not None:
+                    await self._merge_archive_meta(
+                        archive_uri,
+                        {
+                            "retention_plan": self._retention_plan_meta(
+                                retention_plan,
+                                keep_recent_turn_count=effective_keep_turns,
+                                retained_message_token_budget=effective_token_budget,
+                                min_raw_tail_steps=effective_min_tail,
+                            )
+                        },
+                    )
 
                 phase1_stage = "queue_enqueue"
                 await get_queue_manager().enqueue(
@@ -5294,45 +5302,53 @@ class Session:
 
         lines = [m.to_jsonl() for m in messages]
         content = "\n".join(lines) + "\n" if lines else ""
+        abstract_content = render_abstract_overview(
+            ContextLevel.ABSTRACT,
+            self._session_uri,
+            abstract,
+            {
+                "generated_by": {
+                    "component": "Session",
+                    "trigger": "session_update",
+                }
+            },
+        )
+        overview_content = render_abstract_overview(
+            ContextLevel.OVERVIEW,
+            self._session_uri,
+            overview,
+            {
+                "generated_by": {
+                    "component": "Session",
+                    "trigger": "session_update",
+                }
+            },
+        )
 
-        await viking_fs.write_file(
-            uri=f"{self._session_uri}/messages.jsonl",
-            content=content,
-            ctx=self.ctx,
-            lease_ref=lease_ref,
-        )
-        await viking_fs.write_file(
-            uri=f"{self._session_uri}/.abstract.md",
-            content=render_abstract_overview(
-                ContextLevel.ABSTRACT,
-                self._session_uri,
-                abstract,
-                {
-                    "generated_by": {
-                        "component": "Session",
-                        "trigger": "session_update",
-                    }
-                },
+        root_write_results = await asyncio.gather(
+            viking_fs.write_file(
+                uri=f"{self._session_uri}/messages.jsonl",
+                content=content,
+                ctx=self.ctx,
+                lease_ref=lease_ref,
             ),
-            ctx=self.ctx,
-            lease_ref=lease_ref,
-        )
-        await viking_fs.write_file(
-            uri=f"{self._session_uri}/.overview.md",
-            content=render_abstract_overview(
-                ContextLevel.OVERVIEW,
-                self._session_uri,
-                overview,
-                {
-                    "generated_by": {
-                        "component": "Session",
-                        "trigger": "session_update",
-                    }
-                },
+            viking_fs.write_file(
+                uri=f"{self._session_uri}/.abstract.md",
+                content=abstract_content,
+                ctx=self.ctx,
+                lease_ref=lease_ref,
             ),
-            ctx=self.ctx,
-            lease_ref=lease_ref,
+            viking_fs.write_file(
+                uri=f"{self._session_uri}/.overview.md",
+                content=overview_content,
+                ctx=self.ctx,
+                lease_ref=lease_ref,
+            ),
+            return_exceptions=True,
         )
+        for result in root_write_results:
+            if isinstance(result, BaseException):
+                raise result
 
     def _generate_abstract(self) -> str:
         """Generate one-sentence summary for session."""
