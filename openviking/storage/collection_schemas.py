@@ -331,7 +331,10 @@ async def init_context_collection(storage) -> bool:
     async def _existing_count() -> int:
         nonlocal existing_count
         if existing_count is None:
-            existing_count = await storage.count() if hasattr(storage, "count") else 0
+            count = getattr(storage, "count", None)
+            if vectordb_cfg.backend == "qdrant":
+                count = getattr(storage, "count_unscoped", None) or count
+            existing_count = await count() if count else 0
         return existing_count
 
     async def _update_local_schema() -> None:

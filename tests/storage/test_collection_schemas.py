@@ -212,6 +212,9 @@ async def test_init_context_collection_backfills_metadata_for_empty_legacy_colle
         async def count(self):
             return 0
 
+        async def count_unscoped(self):
+            raise AssertionError("unscoped count is only for qdrant")
+
         async def update_collection_description(self, description):
             updates.append(description)
             return True
@@ -238,62 +241,22 @@ async def test_init_context_collection_backfills_metadata_for_empty_legacy_colle
 
 
 @pytest.mark.asyncio
-async def test_init_context_collection_migrates_qdrant_legacy_schema(monkeypatch):
-    schema_updates = []
-
-    class _FakeStorage:
-        async def create_collection(self, name, schema):
-            del name, schema
-            return False
-
-        async def get_collection_meta(self):
-            schema = CollectionSchemas.context_collection("context", 2)
-            return {
-                "Description": "Unified context collection",
-                "Fields": [
-                    field
-                    for field in schema["Fields"]
-                    if field["FieldName"] not in ACL_CONTEXT_FIELDS
-                ],
-                "ScalarIndex": [
-                    field
-                    for field in schema["ScalarIndex"]
-                    if field not in ACL_CONTEXT_FIELDS
-                ],
-            }
-
-        async def count(self):
-            return 0
-
-        async def update_collection_description(self, description):
-            del description
-
-        async def update_collection_schema(self, fields, scalar_index):
-            schema_updates.append((fields, scalar_index))
-
-    config = _DummyConfig(_DummyEmbedder(), backend="qdrant")
-    monkeypatch.setattr(
-        "openviking_cli.utils.config.get_openviking_config",
-        lambda: config,
-    )
-
-    created = await init_context_collection(_FakeStorage())
-
-    assert created is False
-    assert len(schema_updates) == 1
-    fields, scalar_index = schema_updates[0]
-    fields_by_name = {field["FieldName"]: field for field in fields}
-    assert fields_by_name["acl_enabled"]["FieldType"] == "bool"
-    assert all(fields_by_name[field]["FieldType"] == "list<string>" for field in ACL_GRANT_FIELDS)
-    assert ACL_CONTEXT_FIELDS <= set(scalar_index)
-
-
-@pytest.mark.asyncio
-async def test_init_context_collection_warns_qdrant_acl_migration_does_not_backfill(
-    monkeypatch
+@pytest.mark.parametrize(
+    ("has_embedding_metadata", "unscoped_count", "warning_fragments"),
+    [
+        (True, 3, ("without backfilling records",)),
+        (True, None, ("count backend exploded",)),
+        (False, 0, ()),
+        (False, 3, ("without backfilling records", "3 vector(s)")),
+    ],
+)
+async def test_init_context_collection_migrates_qdrant_legacy_schema_and_warns(
+    monkeypatch, has_embedding_metadata, unscoped_count, warning_fragments
 ):
     schema_updates = []
     warnings = []
+    description_updates = []
+    config = _DummyConfig(_DummyEmbedder(), backend="qdrant")
 
     class _FakeStorage:
         async def create_collection(self, name, schema):
@@ -302,8 +265,14 @@ async def test_init_context_collection_warns_qdrant_acl_migration_does_not_backf
 
         async def get_collection_meta(self):
             schema = CollectionSchemas.context_collection("context", 2)
+            description = "Unified context collection"
+            if has_embedding_metadata:
+                description += (
+                    "\n\n[openviking.embedding]\n"
+                    + json.dumps(_build_embedding_metadata(config), sort_keys=True)
+                )
             return {
-                "Description": "Unified context collection",
+                "Description": description,
                 "Fields": [
                     field
                     for field in schema["Fields"]
@@ -317,12 +286,19 @@ async def test_init_context_collection_warns_qdrant_acl_migration_does_not_backf
             }
 
         async def count(self):
-            return 3
+            raise AssertionError("tenant-scoped count must not be used")
+
+        async def count_unscoped(self):
+            if unscoped_count is None:
+                raise RuntimeError("count backend exploded")
+            return unscoped_count
+
+        async def update_collection_description(self, description):
+            description_updates.append(description)
 
         async def update_collection_schema(self, fields, scalar_index):
             schema_updates.append((fields, scalar_index))
 
-    config = _DummyConfig(_DummyEmbedder(), backend="qdrant")
     monkeypatch.setattr(
         "openviking_cli.utils.config.get_openviking_config",
         lambda: config,
@@ -336,9 +312,21 @@ async def test_init_context_collection_warns_qdrant_acl_migration_does_not_backf
 
     assert created is False
     assert len(schema_updates) == 1
+    fields, scalar_index = schema_updates[0]
+    fields_by_name = {field["FieldName"]: field for field in fields}
+    assert fields_by_name["acl_enabled"]["FieldType"] == "bool"
+    assert all(fields_by_name[field]["FieldType"] == "list<string>" for field in ACL_GRANT_FIELDS)
+    assert ACL_CONTEXT_FIELDS <= set(scalar_index)
+    if has_embedding_metadata:
+        assert not description_updates
+    else:
+        assert len(description_updates) == 1
+        assert "[openviking.embedding]" in description_updates[0]
     log_output = "\n".join(warnings)
-    assert "without backfilling records" in log_output
-    assert "legacy URI-namespace visibility" in log_output
+    for warning_fragment in warning_fragments:
+        assert warning_fragment in log_output
+    if unscoped_count == 0:
+        assert "Qdrant ACL schema migration" not in log_output
 
 
 @pytest.mark.asyncio
@@ -2174,6 +2162,32 @@ async def test_single_account_backend_count_raises_when_adapter_count_fails():
 
     with pytest.raises(RuntimeError, match="count backend exploded"):
         await backend.count()
+
+
+@pytest.mark.asyncio
+async def test_viking_vector_index_backend_count_unscoped_bypasses_account_filter(monkeypatch):
+    calls = []
+
+    class _Adapter:
+        mode = "qdrant"
+        USE_CONTENT_FIELD = False
+
+        def count(self, filter=None):
+            calls.append(filter)
+            return 2
+
+    monkeypatch.setattr(
+        "openviking.storage.viking_vector_index_backend.create_collection_adapter",
+        lambda config: _Adapter(),
+    )
+    backend = VikingVectorIndexBackend(
+        config=VectorDBBackendConfig(
+            backend="qdrant", name="context", dimension=2, url="http://qdrant"
+        )
+    )
+
+    assert await backend.count_unscoped() == 2
+    assert calls == [None]
 
 
 @pytest.mark.asyncio
