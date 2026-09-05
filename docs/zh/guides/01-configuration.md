@@ -1493,6 +1493,11 @@ term dictionary。没有 marker 的既有 Qdrant collection 会 fail closed，�
 及服务端 content grep 不支持，因此 grep 继续使用 filesystem fallback
 （`USE_CONTENT_FIELD=False`）。
 
+**ACL 迁移不会回填既有记录。** 在已有 Qdrant 数据的部署上启用 ACL，不会追溯
+保护这些记录：启动时的 schema migration 只会新增 ACL 字段和 scalar index。
+缺少 ACL 字段的记录会继续遵循原有的 URI namespace 可见性规则，直到被重写或
+重新导入。
+
 要运行 live coverage，请设置 `QDRANT_URL`（可选 `QDRANT_API_KEY`）：
 
 ```bash

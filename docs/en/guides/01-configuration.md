@@ -1519,6 +1519,12 @@ instead of being adopted. URI scope metadata and account/tag filters are retaine
 `Contains` and server-side content grep are unsupported, so grep uses the
 filesystem fallback (`USE_CONTENT_FIELD=False`).
 
+**ACL migration is not a backfill.** Enabling ACL on a deployment with existing
+Qdrant data does not retroactively protect those records: schema migration only
+adds the ACL fields and scalar indexes. Records with missing ACL fields continue
+to follow the legacy URI-namespace visibility rules until they are rewritten or
+re-ingested.
+
 For live coverage, set `QDRANT_URL` and optionally `QDRANT_API_KEY`, then run:
 
 ```bash
