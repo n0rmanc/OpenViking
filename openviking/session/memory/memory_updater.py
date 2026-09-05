@@ -131,7 +131,6 @@ async def write_stored_links(
 
     updated_uris: List[str] = []
     for uri, link_groups in file_links.items():
-        lease_coverage_fallback = False
         try:
             content = await viking_fs.read_file(uri, ctx=ctx)
             if not content:
@@ -147,45 +146,14 @@ async def write_stored_links(
             if current_trace_id:
                 mf.extra_fields["last_update_trace_id"] = current_trace_id
             bump_memory_version(mf)
-            try:
-                await viking_fs.write_file(
-                    uri,
-                    MemoryFileUtils.write(mf),
-                    ctx=ctx,
-                    lease_ref=lease_ref,
-                )
-            except Exception as e:
-                if "does not cover the requested operation" not in str(e):
-                    raise
-                lease_coverage_fallback = True
-                agfs = getattr(viking_fs, "_async_agfs", None)
-                acquire_exact = getattr(agfs, "pathlock_acquire_exact", None)
-                release = getattr(agfs, "pathlock_release", None)
-                uri_to_path = getattr(viking_fs, "_uri_to_path", None)
-                if (
-                    lease_ref is None
-                    or not callable(acquire_exact)
-                    or not callable(release)
-                    or not callable(uri_to_path)
-                ):
-                    raise
-                child_lease = await acquire_exact(
-                    uri_to_path(uri, ctx=ctx),
-                    owner_lease_ref=lease_ref,
-                )
-                try:
-                    await viking_fs.write_file(
-                        uri,
-                        MemoryFileUtils.write(mf),
-                        ctx=ctx,
-                        lease_ref=child_lease,
-                    )
-                finally:
-                    await release(child_lease)
+            await viking_fs.write_file(
+                uri,
+                MemoryFileUtils.write(mf),
+                ctx=ctx,
+                lease_ref=lease_ref,
+            )
             updated_uris.append(uri)
         except Exception as e:
-            if lease_coverage_fallback or "does not cover the requested operation" in str(e):
-                raise
             tracer.error(f"Failed to apply links to {uri}: {e}")
     return updated_uris
 
