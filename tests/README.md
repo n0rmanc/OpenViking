@@ -74,7 +74,9 @@ authentication:
 
 ```bash
 QDRANT_URL=http://127.0.0.1:6333 \
-  pytest --confcutdir=tests/storage -q tests/storage/test_qdrant_integration.py
+  pytest --confcutdir=tests/storage -q \
+  tests/storage/test_qdrant_integration.py \
+  tests/storage/test_qdrant_migration_integration.py
 ```
 
 ### Common Test Scenarios

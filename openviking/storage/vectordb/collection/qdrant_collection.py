@@ -22,6 +22,7 @@ from openviking.storage.vectordb.collection.result import (
 from openviking.storage.vectordb.qdrant_sparse import SparseTermDictionary
 from openviking.storage.vectordb.qdrant_utils import (
     build_qdrant_payload,
+    qdrant_payload_field_schema,
     to_qdrant_point_id,
 )
 
@@ -31,6 +32,18 @@ _META_VECTOR_NAME = "meta"
 _INTERNAL_PAYLOAD_FIELDS = {
     "uri_depth",
     "scope_roots",
+}
+_ADAPTER_MARKER_FIELDS = {
+    "_openviking_meta_version",
+    "collection_name",
+    "schema",
+    "dense_vector_name",
+    "sparse_vector_name",
+    "vector_dim",
+    "distance",
+    "sparse_enabled",
+    "sparse_weight",
+    "indexes",
 }
 
 
@@ -68,6 +81,7 @@ class QdrantCollection(ICollection):
         self._schema: dict[str, Any] = {}
         self._indexes: dict[str, dict[str, Any]] = {}
         self._sparse_dictionary: SparseTermDictionary | None = None
+        self._migration_marker_fields: dict[str, Any] | None = None
 
     @staticmethod
     def _normalize_distance(distance: str) -> str:
@@ -96,9 +110,12 @@ class QdrantCollection(ICollection):
     def collection_exists(self) -> bool:
         return self._exists(self._collection_name)
 
-    def _create_collection(self, name: str, *, metadata: bool = False) -> None:
-        if self._exists(name):
-            return
+    def _create_collection(
+        self,
+        name: str,
+        *,
+        metadata: bool = False,
+    ) -> None:
         if metadata:
             vectors = {_META_VECTOR_NAME: {"size": 1, "distance": "Dot"}}
             body: dict[str, Any] = {"vectors": vectors}
@@ -118,6 +135,9 @@ class QdrantCollection(ICollection):
         except QdrantError as exc:
             if exc.status != 409:
                 raise
+            raise RuntimeError(
+                f"Qdrant collection {name!r} appeared during creation"
+            ) from exc
 
     def create_remote_collection(self, metadata: dict[str, Any]) -> None:
         self._schema = dict(metadata)
@@ -128,21 +148,40 @@ class QdrantCollection(ICollection):
                     break
         if self._vector_dim <= 0:
             raise ValueError("Qdrant backend requires a positive dense vector dimension")
+        collection_exists = self._exists(self._collection_name)
+        metadata_exists = self._exists(self._metadata_collection_name)
+        if collection_exists:
+            raise RuntimeError(
+                f"Qdrant collection {self._collection_name!r} appeared during creation; "
+                "refusing to adopt existing data"
+            )
+        if metadata_exists:
+            raise RuntimeError(
+                f"Qdrant metadata collection {self._metadata_collection_name!r} "
+                f"exists without data collection {self._collection_name!r}"
+            )
         self._create_collection(self._collection_name)
         self._create_collection(self._metadata_collection_name, metadata=True)
+        self._migration_marker_fields = {}
         self._write_metadata_marker()
 
     def has_openviking_metadata(self) -> bool:
         payload = self._load_metadata_marker()
+        setup_complete = payload.get("setup_complete", True) if payload else None
         return bool(
             payload
+            and isinstance(setup_complete, bool)
+            and setup_complete
             and payload.get("_openviking_meta_version") == _META_VERSION
             and payload.get("collection_name") == self._collection_name
             and isinstance(payload.get("schema"), dict)
         )
 
     def _metadata_payload(self) -> dict[str, Any]:
+        if self._migration_marker_fields is None:
+            self._load_metadata_marker()
         return {
+            **(self._migration_marker_fields or {}),
             "_openviking_meta_version": _META_VERSION,
             "collection_name": self._collection_name,
             "schema": self._schema,
@@ -169,6 +208,7 @@ class QdrantCollection(ICollection):
 
     def _load_metadata_marker(self) -> dict[str, Any] | None:
         if not self._exists(self._metadata_collection_name):
+            self._migration_marker_fields = {}
             return None
         points = self._retrieve_points(
             self._metadata_collection_name,
@@ -176,9 +216,18 @@ class QdrantCollection(ICollection):
             with_vectors=False,
         )
         if not points:
+            self._migration_marker_fields = {}
             return None
         payload = points[0].get("payload")
-        return payload if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            self._migration_marker_fields = {}
+            return None
+        self._migration_marker_fields = {
+            name: value
+            for name, value in payload.items()
+            if name not in _ADAPTER_MARKER_FIELDS
+        }
+        return payload
 
     def _ensure_loaded(self) -> None:
         if self._schema:
@@ -187,6 +236,15 @@ class QdrantCollection(ICollection):
         if not marker:
             raise RuntimeError(
                 f"Qdrant collection {self._collection_name!r} is missing OpenViking metadata"
+            )
+        setup_complete = marker.get("setup_complete", True)
+        if not isinstance(setup_complete, bool):
+            raise RuntimeError(
+                f"Qdrant collection {self._collection_name!r} has an invalid setup_complete flag"
+            )
+        if not setup_complete:
+            raise RuntimeError(
+                f"Qdrant collection {self._collection_name!r} has an incomplete migration"
             )
         if marker.get("collection_name") != self._collection_name:
             raise RuntimeError(
@@ -258,34 +316,7 @@ class QdrantCollection(ICollection):
         return True
 
     def _field_schema(self, field: str) -> str:
-        fields = self._schema.get("Fields", [])
-        for item in fields:
-            if item.get("FieldName") != field:
-                continue
-            field_type = str(item.get("FieldType") or "").lower()
-            if field_type.startswith("list<") and field_type.endswith(">"):
-                field_type = field_type[5:-1]
-            if field_type in {
-                "int",
-                "int8",
-                "int16",
-                "int32",
-                "int64",
-                "uint",
-                "uint8",
-                "uint16",
-                "uint32",
-                "uint64",
-            }:
-                return "integer"
-            if field_type in {"float", "float16", "float32", "float64", "double"}:
-                return "float"
-            if field_type in {"bool", "boolean"}:
-                return "bool"
-            if field_type in {"date_time", "datetime"}:
-                return "datetime"
-            return "keyword"
-        return "keyword"
+        return qdrant_payload_field_schema(field, self._schema.get("Fields", []))
 
     @staticmethod
     def _index_fields(meta: dict[str, Any]) -> list[str]:
