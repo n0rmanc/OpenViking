@@ -155,7 +155,12 @@ class QdrantCollection(ICollection):
             raise ValueError("Qdrant backend requires a positive dense vector dimension")
         collection_exists = self._exists(self._collection_name)
         metadata_exists = self._exists(self._metadata_collection_name)
-        if metadata_exists and not collection_exists:
+        if collection_exists:
+            raise RuntimeError(
+                f"Qdrant collection {self._collection_name!r} appeared during creation; "
+                "refusing to adopt existing data"
+            )
+        if metadata_exists:
             raise RuntimeError(
                 f"Qdrant metadata collection {self._metadata_collection_name!r} "
                 f"exists without data collection {self._collection_name!r}"

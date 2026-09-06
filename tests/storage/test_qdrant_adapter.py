@@ -1063,6 +1063,34 @@ def test_collection_creation_race_fails_closed_before_metadata_marker() -> None:
     )
 
 
+def test_collection_creation_race_rejects_foreign_data_collection() -> None:
+    transport = _ScriptedTransport(
+        (404, {}),
+        (200, {"result": True}),
+        (404, {}),
+    )
+    config = VectorDBBackendConfig(
+        backend="qdrant",
+        qdrant={"url": "http://qdrant.local"},
+        project="project",
+        name="docs",
+        dimension=3,
+    )
+    adapter = QdrantCollectionAdapter.from_config(config)
+    adapter._client = QdrantRestClient("http://qdrant.local", opener=transport)
+
+    with pytest.raises(RuntimeError, match="refusing to adopt existing data"):
+        adapter.create_collection(
+            "docs",
+            {"CollectionName": "docs", "Fields": [{"FieldName": "vector", "Dim": 3}]},
+            distance="cosine",
+            sparse_weight=0.0,
+            index_name="default",
+        )
+
+    assert not any(request["method"] == "PUT" for request in transport.requests)
+
+
 def test_collection_lifecycle_infers_dimension_from_vector_field_type() -> None:
     transport = _ScriptedTransport(
         (404, {}),
