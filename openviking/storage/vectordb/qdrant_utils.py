@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime
-from typing import Any
+from typing import Any, Iterable, Mapping
 
 from openviking.storage.expr import (
     And,
@@ -23,6 +23,40 @@ from openviking.storage.expr import (
 
 _OPENVIKING_QDRANT_ID_NAMESPACE = uuid.UUID("4b6bb5a8-7f1f-5b1a-9d4c-b93f29b1d67c")
 _URI_FIELDS = {"uri", "parent_uri"}
+
+
+def qdrant_payload_field_schema(
+    field_name: str,
+    fields: Iterable[Mapping[str, Any]],
+) -> str:
+    """Map an OpenViking field declaration to a Qdrant payload index type."""
+    for field_meta in fields:
+        if field_meta.get("FieldName") != field_name:
+            continue
+        field_type = str(field_meta.get("FieldType") or "").lower()
+        if field_type.startswith("list<") and field_type.endswith(">"):
+            field_type = field_type[5:-1]
+        if field_type in {
+            "int",
+            "int8",
+            "int16",
+            "int32",
+            "int64",
+            "uint",
+            "uint8",
+            "uint16",
+            "uint32",
+            "uint64",
+        }:
+            return "integer"
+        if field_type in {"float", "float16", "float32", "float64", "double"}:
+            return "float"
+        if field_type in {"bool", "boolean"}:
+            return "bool"
+        if field_type in {"date_time", "datetime"}:
+            return "datetime"
+        return "keyword"
+    return "keyword"
 
 
 def _normalize_path(value: Any) -> Any:

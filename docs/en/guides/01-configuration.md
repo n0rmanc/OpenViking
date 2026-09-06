@@ -1519,17 +1519,31 @@ instead of being adopted. URI scope metadata and account/tag filters are retaine
 `Contains` and server-side content grep are unsupported, so grep uses the
 filesystem fallback (`USE_CONTENT_FIELD=False`).
 
-**ACL migration is not a backfill.** Enabling ACL on a deployment with existing
-Qdrant data does not retroactively protect those records: schema migration only
-adds the ACL fields and scalar indexes. Records with missing ACL fields continue
-to follow the legacy URI-namespace visibility rules until they are rewritten or
-re-ingested.
+Collections created before PR `#3872` cannot be adopted by the current adapter.
+Run the [pre-`#3872` migration runbook](../../../scripts/maintenance/README.md)
+or re-ingest the data before cutting configuration over to the current target
+collection. Keep the source collection and legacy metadata sidecar for the
+rollback window.
+
+Hybrid search sends separate dense and sparse requests to Qdrant and combines
+the results in the client with a weighted reciprocal-rank score. This is not
+Qdrant's server-side RRF: the score is a client-side rank score, and hybrid
+queries cost both vector round trips.
+
+**ACL migration is not a backfill.** The migration copies ACL payloads as-is;
+records with missing or malformed ACL fields remain fail-open and continue to
+follow legacy URI-namespace visibility rules until they are rewritten or
+re-ingested. Review the reported incomplete-record count and pass
+`--allow-acl-fail-open` only when the temporary exposure is explicitly accepted;
+omit it once every source record has complete ACL fields.
 
 For live coverage, set `QDRANT_URL` and optionally `QDRANT_API_KEY`, then run:
 
 ```bash
 QDRANT_URL=http://127.0.0.1:6333 \
-  pytest --confcutdir=tests/storage -q tests/storage/test_qdrant_integration.py
+  pytest --confcutdir=tests/storage -q \
+  tests/storage/test_qdrant_integration.py \
+  tests/storage/test_qdrant_migration_integration.py
 ```
 </details>
 

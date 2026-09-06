@@ -1493,16 +1493,28 @@ term dictionary。没有 marker 的既有 Qdrant collection 会 fail closed，�
 及服务端 content grep 不支持，因此 grep 继续使用 filesystem fallback
 （`USE_CONTENT_FIELD=False`）。
 
-**ACL 迁移不会回填既有记录。** 在已有 Qdrant 数据的部署上启用 ACL，不会追溯
-保护这些记录：启动时的 schema migration 只会新增 ACL 字段和 scalar index。
-缺少 ACL 字段的记录会继续遵循原有的 URI namespace 可见性规则，直到被重写或
-重新导入。
+PR `#3872` 之前建立的 collection 不能由当前 adapter 直接接管。切换配置到
+当前 target collection 前，请先执行
+[pre-`#3872` migration runbook](../../../scripts/maintenance/README.md)，或
+重新导入数据。请在回滚窗口内保留 source collection 和旧 metadata sidecar。
+
+Hybrid search 会分别向 Qdrant 发出 dense 和 sparse 请求，再由客户端以
+weighted reciprocal-rank score 合并结果。这不是 Qdrant 的 server-side RRF：
+分数是客户端 rank 合并分数，hybrid query 会额外进行两次向量 round trip。
+
+**ACL 迁移不会回填既有记录。** migration 会原样复制 ACL payload；缺少或格式
+错误 ACL 字段的记录会继续 fail-open，并遵循原有的 URI namespace 可见性规则，
+直到被重写或重新导入。请先审阅 incomplete record 数量，仅在明确接受这段暂时
+暴露风险时传入 `--allow-acl-fail-open`；当所有 source 记录的 ACL 字段完整后
+应移除该选项。
 
 要运行 live coverage，请设置 `QDRANT_URL`（可选 `QDRANT_API_KEY`）：
 
 ```bash
 QDRANT_URL=http://127.0.0.1:6333 \
-  pytest --confcutdir=tests/storage -q tests/storage/test_qdrant_integration.py
+  pytest --confcutdir=tests/storage -q \
+  tests/storage/test_qdrant_integration.py \
+  tests/storage/test_qdrant_migration_integration.py
 ```
 </details>
 
