@@ -962,8 +962,8 @@ def test_rest_client_sends_json_and_api_key() -> None:
 def test_collection_lifecycle_writes_marker_and_payload_indexes() -> None:
     transport = _ScriptedTransport(
         (404, {}),
-        (200, {"result": True}),
         (404, {}),
+        (200, {"result": True}),
         (200, {"result": True}),
         (200, {"result": True}),
         (200, {"result": True}),
@@ -997,7 +997,6 @@ def test_collection_lifecycle_writes_marker_and_payload_indexes() -> None:
 
     assert [request["method"] for request in transport.requests] == [
         "GET",
-        "PUT",
         "GET",
         "PUT",
         "PUT",
@@ -1006,9 +1005,10 @@ def test_collection_lifecycle_writes_marker_and_payload_indexes() -> None:
         "PUT",
         "PUT",
         "PUT",
+        "PUT",
     ]
-    assert urlsplit(transport.requests[1]["url"]).path == "/collections/project__docs"
-    assert transport.requests[1]["body"] == {
+    assert urlsplit(transport.requests[2]["url"]).path == "/collections/project__docs"
+    assert transport.requests[2]["body"] == {
         "vectors": {"dense": {"size": 3, "distance": "Cosine"}},
         "sparse_vectors": {"sparse": {}},
     }
@@ -1031,11 +1031,71 @@ def test_collection_lifecycle_writes_marker_and_payload_indexes() -> None:
     ]
 
 
-def test_collection_lifecycle_infers_dimension_from_vector_field_type() -> None:
+def test_collection_creation_race_fails_closed_before_metadata_marker() -> None:
+    transport = _ScriptedTransport(
+        (404, {}),
+        (404, {}),
+        (409, {}),
+    )
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=transport),
+        collection_name="project__docs",
+        metadata_collection_name="project__docs__meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=3,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+    )
+
+    with pytest.raises(RuntimeError, match="appeared during creation"):
+        collection.create_remote_collection(
+            {
+                "CollectionName": "docs",
+                "Fields": [{"FieldName": "vector", "Dim": 3}],
+            }
+        )
+
+    assert not any(
+        urlsplit(request["url"]).path.endswith("/project__docs__meta/points")
+        for request in transport.requests
+    )
+
+
+def test_collection_creation_race_rejects_foreign_data_collection() -> None:
     transport = _ScriptedTransport(
         (404, {}),
         (200, {"result": True}),
         (404, {}),
+    )
+    config = VectorDBBackendConfig(
+        backend="qdrant",
+        qdrant={"url": "http://qdrant.local"},
+        project="project",
+        name="docs",
+        dimension=3,
+    )
+    adapter = QdrantCollectionAdapter.from_config(config)
+    adapter._client = QdrantRestClient("http://qdrant.local", opener=transport)
+
+    with pytest.raises(RuntimeError, match="refusing to adopt existing data"):
+        adapter.create_collection(
+            "docs",
+            {"CollectionName": "docs", "Fields": [{"FieldName": "vector", "Dim": 3}]},
+            distance="cosine",
+            sparse_weight=0.0,
+            index_name="default",
+        )
+
+    assert not any(request["method"] == "PUT" for request in transport.requests)
+
+
+def test_collection_lifecycle_infers_dimension_from_vector_field_type() -> None:
+    transport = _ScriptedTransport(
+        (404, {}),
+        (404, {}),
+        (200, {"result": True}),
         (200, {"result": True}),
         (200, {"result": True}),
     )
@@ -1058,7 +1118,7 @@ def test_collection_lifecycle_infers_dimension_from_vector_field_type() -> None:
         }
     )
 
-    assert transport.requests[1]["body"]["vectors"] == {
+    assert transport.requests[2]["body"]["vectors"] == {
         "dense": {"size": 3, "distance": "Cosine"}
     }
 
@@ -1097,6 +1157,91 @@ def test_metadata_marker_round_trips_index_metadata() -> None:
     assert reloaded.get_meta_data() == {"CollectionName": "docs", "Fields": []}
     assert reloaded.has_index("default")
     assert reloaded.get_index_meta_data("default") == {"ScalarIndex": ["account_id"]}
+
+
+def test_metadata_updates_preserve_migration_provenance() -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="docs",
+        metadata_collection_name="docs__meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=True,
+        sparse_weight=0.5,
+    )
+    collection._schema = {"CollectionName": "docs", "Fields": []}
+    collection._migration_marker_fields = {
+        "source_collection": "legacy__docs",
+        "source_metadata_collection": "__openviking_meta",
+        "source_fingerprint": "source-fingerprint",
+        "metadata_fingerprint": "metadata-fingerprint",
+        "sparse_map_fingerprint": "sparse-map-fingerprint",
+        "setup_complete": True,
+        "acl_incomplete_count": 2,
+        "dense_datatype": "float16",
+        "sparse_modifier": "idf",
+    }
+    marker: dict[str, object] = {}
+    collection._upsert_points = (  # type: ignore[method-assign]
+        lambda _name, points: marker.update(points[0]["payload"])
+    )
+
+    collection.update(description="updated")
+
+    for field_name, expected in collection._migration_marker_fields.items():
+        assert marker[field_name] == expected
+    assert marker["schema"]["Description"] == "updated"
+
+
+def test_incomplete_migration_marker_is_not_loadable() -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="docs",
+        metadata_collection_name="docs__meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+    )
+    collection._load_metadata_marker = lambda: {  # type: ignore[method-assign]
+        "_openviking_meta_version": 1,
+        "collection_name": "docs",
+        "schema": {"CollectionName": "docs", "Fields": []},
+        "setup_complete": False,
+    }
+
+    assert collection.has_openviking_metadata() is False
+    with pytest.raises(RuntimeError, match="incomplete"):
+        collection.get_meta_data()
+
+
+@pytest.mark.parametrize("setup_complete", ["false", 0, None])
+def test_malformed_migration_marker_flag_is_not_loadable(setup_complete) -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="docs",
+        metadata_collection_name="docs__meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+    )
+    collection._load_metadata_marker = lambda: {  # type: ignore[method-assign]
+        "_openviking_meta_version": 1,
+        "collection_name": "docs",
+        "schema": {"CollectionName": "docs", "Fields": []},
+        "setup_complete": setup_complete,
+    }
+
+    assert collection.has_openviking_metadata() is False
+    with pytest.raises(RuntimeError, match="setup_complete"):
+        collection.get_meta_data()
 
 
 def test_collection_crud_search_count_and_scalar_scroll_use_qdrant_shapes() -> None:
@@ -1412,6 +1557,36 @@ def test_existing_unmarked_collection_fails_closed() -> None:
 
     with pytest.raises(RuntimeError, match="metadata is missing"):
         adapter.get_collection()
+
+
+def test_metadata_only_sidecar_is_not_adopted_by_adapter() -> None:
+    transport = _ScriptedTransport(
+        (404, {}),
+        (404, {}),
+        (404, {}),
+        (200, {"result": True}),
+    )
+    config = VectorDBBackendConfig(
+        backend="qdrant",
+        qdrant={"url": "http://qdrant.local"},
+        project="project",
+        name="docs",
+        dimension=2,
+    )
+    adapter = QdrantCollectionAdapter.from_config(config)
+    adapter._client = QdrantRestClient("http://qdrant.local", opener=transport)
+
+    assert adapter.collection_exists() is False
+    with pytest.raises(RuntimeError, match="exists without data collection"):
+        adapter.create_collection(
+            "docs",
+            {"CollectionName": "docs", "Fields": []},
+            distance="cosine",
+            sparse_weight=0.0,
+            index_name="default",
+        )
+
+    assert not any(request["method"] == "PUT" for request in transport.requests)
 
 
 def test_qdrant_rejects_sparse_weight_outside_rrf_range() -> None:
