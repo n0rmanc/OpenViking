@@ -115,11 +115,7 @@ class QdrantCollection(ICollection):
         name: str,
         *,
         metadata: bool = False,
-        exists: bool | None = None,
-    ) -> bool:
-        already_exists = self._exists(name) if exists is None else exists
-        if already_exists:
-            return False
+    ) -> None:
         if metadata:
             vectors = {_META_VECTOR_NAME: {"size": 1, "distance": "Dot"}}
             body: dict[str, Any] = {"vectors": vectors}
@@ -142,7 +138,6 @@ class QdrantCollection(ICollection):
             raise RuntimeError(
                 f"Qdrant collection {name!r} appeared during creation"
             ) from exc
-        return True
 
     def create_remote_collection(self, metadata: dict[str, Any]) -> None:
         self._schema = dict(metadata)
@@ -165,13 +160,9 @@ class QdrantCollection(ICollection):
                 f"Qdrant metadata collection {self._metadata_collection_name!r} "
                 f"exists without data collection {self._collection_name!r}"
             )
-        self._create_collection(self._collection_name, exists=collection_exists)
-        metadata_created = self._create_collection(
-            self._metadata_collection_name,
-            metadata=True,
-            exists=metadata_exists,
-        )
-        self._migration_marker_fields = {} if metadata_created else None
+        self._create_collection(self._collection_name)
+        self._create_collection(self._metadata_collection_name, metadata=True)
+        self._migration_marker_fields = {}
         self._write_metadata_marker()
 
     def has_openviking_metadata(self) -> bool:
