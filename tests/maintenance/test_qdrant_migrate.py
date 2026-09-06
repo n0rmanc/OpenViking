@@ -1289,12 +1289,17 @@ def test_index_409_without_physical_index_fails_closed() -> None:
     assert marker["setup_complete"] is False
 
 
-def test_target_creation_race_does_not_leave_migration_marker() -> None:
+def test_target_creation_race_preserves_competing_metadata_marker() -> None:
     qdrant = _legacy_fixture(sparse=False)
     original_request = qdrant.request
 
     def race_on_target(method, path, body=None, *, params=None):
         if method == "PUT" and path.endswith("/current__context"):
+            original_request(method, path, body, params=params)
+            marker = qdrant.collections["current__context__openviking_meta"]["points"][
+                to_qdrant_point_id("openviking:metadata")
+            ]["payload"]
+            marker["competing_migration"] = "preserve-me"
             raise _FakeHttpError(409)
         return original_request(method, path, body, params=params)
 
@@ -1303,8 +1308,12 @@ def test_target_creation_race_does_not_leave_migration_marker() -> None:
     with pytest.raises(MigrationError, match="appeared during migration"):
         _apply(_migration(qdrant), confirm=True, allow_acl_fail_open=True)
 
-    assert "current__context" not in qdrant.collections
-    assert "current__context__openviking_meta" not in qdrant.collections
+    assert "current__context" in qdrant.collections
+    marker = qdrant.collections["current__context__openviking_meta"]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    assert marker["competing_migration"] == "preserve-me"
+    assert marker["setup_complete"] is False
 
 
 def test_completion_marker_write_is_verified(monkeypatch) -> None:
@@ -1369,6 +1378,32 @@ def test_dense_vector_override_survives_resume_preflight() -> None:
     _apply(migration, confirm=True, allow_acl_fail_open=True)
 
     assert migration.preflight().dense_vector_name == "embedding"
+
+
+def test_unnamed_dense_vector_rejects_a_name_override() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    qdrant.collections["legacy__context"]["config"]["params"]["vectors"] = {
+        "size": 2,
+        "distance": "Cosine",
+    }
+    for point in qdrant.collections["legacy__context"]["points"].values():
+        point["vector"][""] = point["vector"].pop("vector")
+
+    with pytest.raises(MigrationError, match="unnamed source dense vector"):
+        _migration(qdrant, dense_vector_name="embedding").preflight()
+
+
+def test_multiple_named_dense_vectors_require_selection() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    qdrant.collections["legacy__context"]["config"]["params"]["vectors"] = {
+        "vector": {"size": 2, "distance": "Cosine"},
+        "image": {"size": 2, "distance": "Cosine"},
+    }
+    for point in qdrant.collections["legacy__context"]["points"].values():
+        point["vector"]["image"] = [0.0, 1.0]
+
+    with pytest.raises(MigrationError, match="multiple named dense vectors"):
+        _migration(qdrant).preflight()
 
 
 def test_sparse_map_rejects_non_string_terms_and_fractional_indexes() -> None:

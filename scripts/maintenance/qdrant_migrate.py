@@ -398,39 +398,22 @@ def _legacy_sparse_map(value: Mapping[Any, Any] | None) -> dict[int, str]:
         # A JSON object turns integer keys into strings.  Prefer the reverse
         # form when the value is an integer so {"123": 111} remains a
         # numeric-looking term instead of being parsed as old-index -> term.
-        if (
-            isinstance(raw_key, str)
-            and isinstance(raw_value, int)
-            and not isinstance(raw_value, bool)
-        ):
-            old_index = _sparse_index(
-                raw_value,
-                field_name="sparse map index",
-            )
-            term = _sparse_term(raw_key, field_name="sparse map term")
-        elif isinstance(raw_key, int) and not isinstance(raw_key, bool):
-            old_index = _sparse_index(
-                raw_key,
-                field_name="sparse map index",
-            )
-            term = _sparse_term(raw_value, field_name="sparse map term")
-        elif isinstance(raw_key, str) and _INTEGER_RE.fullmatch(raw_key.strip()):
-            old_index = _sparse_index(
-                raw_key,
-                field_name="sparse map index",
-                allow_numeric_string=True,
-            )
-            term = _sparse_term(raw_value, field_name="sparse map term")
+        if isinstance(raw_key, int) and not isinstance(raw_key, bool):
+            raw_index, raw_term = raw_key, raw_value
         elif isinstance(raw_value, int) and not isinstance(raw_value, bool):
-            old_index = _sparse_index(
-                raw_value,
-                field_name="sparse map index",
-            )
-            term = _sparse_term(raw_key, field_name="sparse map term")
+            raw_index, raw_term = raw_value, raw_key
+        elif isinstance(raw_key, str) and _INTEGER_RE.fullmatch(raw_key.strip()):
+            raw_index, raw_term = raw_key, raw_value
         else:
             raise SparseMigrationError(
                 "sparse map entries must be {old_index: term} or {term: old_index}"
             )
+        old_index = _sparse_index(
+            raw_index,
+            field_name="sparse map index",
+            allow_numeric_string=isinstance(raw_index, str),
+        )
+        term = _sparse_term(raw_term, field_name="sparse map term")
         if old_index in normalized and normalized[old_index] != term:
             raise SparseMigrationError(
                 f"sparse map contains conflicting terms for old index {old_index}"
@@ -664,6 +647,11 @@ class QdrantMigration:
         dense_config: Mapping[str, Any] | None = None
         dense_override = self._dense_vector_name_override if honor_overrides else None
         if "size" in vectors:
+            if dense_override:
+                raise MigrationError(
+                    "cannot rename an unnamed source dense vector; "
+                    "remove --dense-vector-name"
+                )
             dense_name = dense_override or "vector"
             dense_config = vectors
         else:
@@ -685,8 +673,6 @@ class QdrantMigration:
                 dense_name, dense_config = selected
             elif len(named) == 1:
                 dense_name, dense_config = named[0]
-            elif any(name == "vector" for name, _ in named):
-                dense_name, dense_config = next(item for item in named if item[0] == "vector")
             else:
                 raise MigrationError(
                     "source collection has multiple named dense vectors; "
@@ -2419,7 +2405,6 @@ class QdrantMigration:
         target_created = False
         metadata_created = False
         marker_written = False
-        target_creation_race = False
         try:
             if not target_metadata_exists:
                 self._create_collection(
@@ -2444,41 +2429,37 @@ class QdrantMigration:
                 # Claim the data collection before writing its marker.  This
                 # prevents a concurrent collection creator from inheriting a
                 # migration marker after a 409 race.
-                try:
-                    self._create_collection(
-                        self.target_collection,
-                        {
-                            "vectors": {
-                                layout.dense_vector_name: {
-                                    "size": layout.vector_dimension,
-                                    "distance": layout.distance,
-                                    **(
-                                        {"datatype": layout.dense_datatype}
-                                        if layout.dense_datatype is not None
-                                        else {}
-                                    ),
-                                }
-                            },
-                            **(
-                                {
-                                    "sparse_vectors": {
-                                        layout.sparse_vector_name: {
-                                            **(
-                                                {"modifier": layout.sparse_modifier}
-                                                if layout.sparse_modifier is not None
-                                                else {}
-                                            )
-                                        }
+                self._create_collection(
+                    self.target_collection,
+                    {
+                        "vectors": {
+                            layout.dense_vector_name: {
+                                "size": layout.vector_dimension,
+                                "distance": layout.distance,
+                                **(
+                                    {"datatype": layout.dense_datatype}
+                                    if layout.dense_datatype is not None
+                                    else {}
+                                ),
+                            }
+                        },
+                        **(
+                            {
+                                "sparse_vectors": {
+                                    layout.sparse_vector_name: {
+                                        **(
+                                            {"modifier": layout.sparse_modifier}
+                                            if layout.sparse_modifier is not None
+                                            else {}
+                                        )
                                     }
                                 }
-                                if layout.sparse_enabled
-                                else {}
-                            ),
-                        },
-                    )
-                except MigrationError as exc:
-                    target_creation_race = "appeared during migration" in str(exc)
-                    raise
+                            }
+                            if layout.sparse_enabled
+                            else {}
+                        ),
+                    },
+                )
                 target_created = True
                 if not marker_written:
                     self._write_marker(marker_incomplete)
@@ -2536,12 +2517,6 @@ class QdrantMigration:
                 raise MigrationError("target completion marker was not persisted")
             self._assert_marker_fingerprints(completed_marker, plan)
         except Exception:
-            if target_creation_race and metadata_created:
-                try:
-                    self._delete_collection(self.target_metadata_collection)
-                except Exception:
-                    pass
-                marker_written = False
             if not marker_written:
                 for collection in (
                     self.target_collection if target_created else None,
