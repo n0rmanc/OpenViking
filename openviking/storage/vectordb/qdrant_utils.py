@@ -103,6 +103,40 @@ def qdrant_payload_field_schema(
     return "keyword"
 
 
+def qdrant_payload_field_schema(
+    field_name: str,
+    fields: Iterable[Mapping[str, Any]],
+) -> str:
+    """Map an OpenViking field declaration to a Qdrant payload index type."""
+    for field_meta in fields:
+        if field_meta.get("FieldName") != field_name:
+            continue
+        field_type = str(field_meta.get("FieldType") or "").lower()
+        if field_type.startswith("list<") and field_type.endswith(">"):
+            field_type = field_type[5:-1]
+        if field_type in {
+            "int",
+            "int8",
+            "int16",
+            "int32",
+            "int64",
+            "uint",
+            "uint8",
+            "uint16",
+            "uint32",
+            "uint64",
+        }:
+            return "integer"
+        if field_type in {"float", "float16", "float32", "float64", "double"}:
+            return "float"
+        if field_type in {"bool", "boolean"}:
+            return "bool"
+        if field_type in {"date_time", "datetime"}:
+            return "datetime"
+        return "keyword"
+    return "keyword"
+
+
 def _normalize_path(value: Any) -> Any:
     if not isinstance(value, str):
         return value
