@@ -829,6 +829,80 @@ def test_uri_sidecars_are_recomputed_and_payload_is_not_dropped() -> None:
     assert payload["tags"] == ["keep", "this"]
 
 
+def test_ownerless_uri_does_not_require_owner_user_id() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    payload = qdrant.collections["legacy__context"]["points"]["1"]["payload"]
+    payload["uri"] = "/user"
+    payload.pop("owner_user_id")
+
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+
+    target_payload = qdrant.collections["current__context"]["points"][
+        to_qdrant_point_id("1")
+    ]["payload"]
+    assert "owner_user_id" not in target_payload
+    result = _apply(migration, confirm=True, allow_acl_fail_open=True)
+    assert result.migrated_count == 0
+
+
+def test_missing_owner_user_id_is_backfilled_from_user_uri() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    payload = qdrant.collections["legacy__context"]["points"]["1"]["payload"]
+    payload["uri"] = "/user/alice/memories/a.md"
+    payload.pop("owner_user_id")
+
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+
+    target_payload = qdrant.collections["current__context"]["points"][
+        to_qdrant_point_id("1")
+    ]["payload"]
+    assert target_payload["owner_user_id"] == "alice"
+
+
+def test_owner_user_id_mismatch_fails_closed() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    payload = qdrant.collections["legacy__context"]["points"]["1"]["payload"]
+    payload["uri"] = "/user/alice/memories/a.md"
+    payload["owner_user_id"] = "bob"
+
+    with pytest.raises(MigrationError, match="owner_user_id"):
+        _migration(qdrant).preflight()
+
+
+def test_owner_normalization_resumes_legacy_target(monkeypatch) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    payload = qdrant.collections["legacy__context"]["points"]["1"]["payload"]
+    payload["uri"] = "/user/alice/memories/a.md"
+    payload.pop("owner_user_id")
+
+    migration = _migration(qdrant)
+    monkeypatch.setattr(
+        "scripts.maintenance.qdrant_migrate._normalize_owner_user_id",
+        lambda payload, *, uri, point_id, source_keys: None,
+    )
+    monkeypatch.setattr(
+        QdrantMigration,
+        "_validate_target_payload",
+        staticmethod(lambda *args, **kwargs: None),
+    )
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    monkeypatch.undo()
+
+    plan = migration.preflight()
+    result = migration.apply(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+    )
+
+    assert result.migrated_count == 1
+    assert qdrant.collections["current__context"]["points"][
+        to_qdrant_point_id("1")
+    ]["payload"]["owner_user_id"] == "alice"
+
+
 def test_apply_requires_explicit_confirmation() -> None:
     qdrant = _legacy_fixture(sparse=False)
 
