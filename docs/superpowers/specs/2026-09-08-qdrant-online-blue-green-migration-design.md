@@ -2,197 +2,224 @@
 
 ## Status
 
-Proposed design for the follow-up to `volcengine/OpenViking#4458`.
+Proposed follow-up design for `volcengine/OpenViking#4458`.
 
-The approved approach is a Qdrant blue-green migration with physical
-generations, a current-format target, resumable reconciliation, a short final
-write barrier, and explicit source retention.
+The scope is deliberately one-way:
+
+```text
+pre-#3872 legacy source -> current-format target
+```
+
+The long copy runs while the legacy deployment continues to serve the source.
+Only the final reconciliation and application rollout require a short write
+barrier.
 
 ## Goal
 
-Migrate a pre-`#3872` OpenViking Qdrant collection to a new physical
-generation that the current-format adapter can read and write. The legacy
-deployment remains the source of truth during the long copy phase; it is not
-dual-written because the current adapter intentionally cannot read or safely
-write the legacy layout.
+Migrate a legacy Qdrant data collection and its pre-`#3872` metadata sidecar to
+a new physical data/metadata pair that the current-format adapter can read and
+write. The source remains unchanged and retained for audit and a
+barrier-held rollback.
 
 The migration must provide:
 
-- a target generation built without mutating the source generation;
-- bounded-memory, resumable background copying;
-- a safe way to reconcile writes and deletes that happen during copying;
-- an atomic publication of the target data and metadata aliases;
-- a retained legacy source for audit and a bounded rollback window;
-- explicit recovery states for interrupted or failed operations;
+- no mutation of the legacy data or metadata collections;
+- bounded-batch, resumable copying;
+- reconciliation of source upserts, deletes, and payload changes that occur
+  during the long copy, plus fail-closed detection of sparse-map drift;
+- exact final verification of IDs, payloads, vectors, indexes, metadata, and
+  ACL state;
+- a current-format application rollout that is validated before the write
+  barrier is released;
+- explicit recovery for interrupted phases;
 - no new third-party dependency.
 
-The design covers only **legacy-source migration**. The upstream
-`volcengine/OpenViking/main` branch does not contain the current-format Qdrant
-adapter or migration code, so current-format-source migration and application
-dual-write are out of scope for this follow-up.
+The upstream `volcengine/OpenViking/main` branch does not contain the
+current-format Qdrant adapter or migration utility. At design time,
+`upstream/main` was `a843ab6bf220b2b3bc82321576d623d1c55c6598` and did not
+contain:
+
+```text
+openviking/storage/vectordb/collection/qdrant_collection.py
+openviking/storage/vectordb/collection/qdrant_rest.py
+openviking/storage/vectordb_adapters/qdrant_adapter.py
+scripts/maintenance/qdrant_migrate.py
+```
+
+Those files exist only in the fork/PR work, so current-format-source migration
+is not part of this change.
 
 ## Non-goals
 
-- Zero write downtime. A short final write barrier is required because the
-  legacy adapter has no current-format dual-write hook and Qdrant has no
-  cross-collection transaction.
-- A transparent rollback from a running current-format deployment back to the
-  legacy collection. The current adapter cannot consume the legacy marker; once
-  target writes are accepted, rollback requires a separate reverse migration.
-- A generic migration framework for non-Qdrant adapters.
-- Automatic adoption of an unmarked or ambiguous physical collection.
-- Automatic deletion of the source generation.
-- Migration from a current-format source or any application dual-write mode.
-- A server-side RRF redesign. Hybrid ranking remains the current
-  client-side weighted fusion contract.
-- A distributed workflow scheduler. One migration controller owns a migration
-  at a time; the target marker and migration ID reject later conflicting
-  controllers.
+- Migration from a current-format source.
+- Application dual-write or a second current-format generation.
+- Qdrant collection aliases. They add an adapter/configuration surface without
+  reducing the legacy cutover window; the target physical pair is activated by
+  one barrier-held application rollout.
+- Transparent rollback after the current-format target has accepted data
+  writes. That requires a separate reverse migration.
+- Automatic deletion of the legacy source.
+- Automatic adoption of an unmarked, ambiguous, or shared collection.
+- A generic migration framework for other vector backends.
+- A server-side RRF redesign. The existing client-side weighted rank contract
+  is retained; changing it is a separate benchmark/design.
+- A distributed scheduler. One controller owns a migration ID at a time; the
+  operator supplies the external per-source lock that prevents distinct target
+  generations from being copied concurrently.
 
 ## Current-state constraints
 
 The current Qdrant implementation in the fork:
 
-- binds `QdrantCollection` directly to a collection name;
-- stores its OpenViking marker and sparse dictionary in a sidecar collection;
-- writes through `CollectionAdapter.upsert`, `update_data`, and `delete`;
-- uses the standard-library `QdrantRestClient`;
-- has a frozen-write `qdrant_migrate.py` that copies into a separate target;
-- treats `setup_complete=false` as an adapter read gate.
+- binds `QdrantCollection` to a collection reference;
+- derives the physical data name from `project_name` and `name` unless an
+  explicit physical name is configured;
+- derives the metadata sidecar from the data name unless overridden;
+- stores the current marker and sparse dictionary in the metadata sidecar;
+- preserves migration-owned marker fields when normal adapter schema writes
+  rewrite the marker;
+- treats `setup_complete=false` as an adapter read gate;
+- uses the standard-library `QdrantRestClient`, whose default request timeout
+  is 10 seconds.
 
-The legacy source has the pre-`#3872` marker and physical-ID encoding. The
-current adapter intentionally refuses to load that metadata, so migration
-reads the source through raw Qdrant REST and writes only the new
-current-format target. Existing direct-name operation remains unchanged until
-the operator rolls out the alias-aware current adapter. Existing unmarked
-collections remain fail-closed.
-
-The design was verified against `upstream/main` at
-`a843ab6bf220b2b3bc82321576d623d1c55c6598`: it contains no
-`qdrant_collection.py`, `qdrant_rest.py`, `qdrant_adapter.py`, or
-`scripts/maintenance/qdrant_migrate.py`. Those current-format Qdrant files
-exist only in the fork/PR work.
+The legacy source has a different marker format and physical-ID encoding. The
+current adapter must not load it. The migration therefore reads the source
+through raw Qdrant REST and writes only the new current-format target.
 
 ## Terminology
 
-- **Logical collection**: the OpenViking configuration identity, such as
-  `default/context`.
-- **Data alias**: the Qdrant alias published for the current-format target
-  data generation.
-- **Metadata alias**: the Qdrant alias published for the current-format
-  target metadata and sparse-dictionary generation.
-- **Physical generation**: an immutable-name data collection plus its matching
-  metadata sidecar, for example:
-  `default__context__gen_20260908_abc` and
-  `default__context__gen_20260908_abc__openviking_meta`.
-- **Legacy source**: the pre-`#3872` physical data collection and metadata
-  sidecar that remain authoritative until the final write barrier ends.
-- **Target generation**: the generation being prepared.
-- **Write barrier**: a short operator-controlled pause of source writes used
-  for the final exact reconciliation, target verification, alias publication,
-  and application rollout.
+- **Logical collection**: the OpenViking identity, such as `default/context`.
+- **Legacy source**: the pre-`#3872` physical data collection plus its legacy
+  metadata sidecar.
+- **Target pair**: the immutable-name current-format data collection and its
+  current-format metadata sidecar.
+- **Write barrier**: an operator-owned pause that disables every legacy data
+  and metadata write, including deletes and partial updates. `cutover` requires
+  an explicit `--barrier-held` acknowledgement plus a final source fingerprint
+  check; the controller cannot infer that an application has stopped writing.
+- **Migration manifest**: a temporary standard-library SQLite database keyed by
+  target point ID. It stores only IDs and fingerprints, not full vectors.
+- **Target marker**: the current-format marker written only to the target
+  metadata sidecar.
+
+Source and target counts always mean user records in the data collections.
+Marker and sparse-dictionary points in the metadata sidecar are counted and
+verified separately.
 
 ## Architecture
 
-### 1. Paired target aliases
+### 1. Target physical pair and configuration
 
-The current-format deployment uses two aliases after cutover:
+The target data and metadata names must be pairwise distinct from each other,
+the legacy data collection, and the legacy metadata sidecar. A target metadata
+sidecar is never shared by two logical collections.
 
-```text
-<logical-data-alias>     -> active physical data generation
-<logical-metadata-alias> -> active physical metadata generation
+The current-format rollout adds explicit physical-name overrides:
+
+```yaml
+qdrant:
+  url: https://qdrant.example
+  timeout_seconds: 60
+  data_collection_name: default__context__gen_20260908_abc
+  metadata_collection_name: default__context__gen_20260908_abc__openviking_meta
 ```
 
-Both aliases are published or replaced in one Qdrant
-`POST /collections/aliases` request. The request contains delete/create
-operations for the two aliases, so the current-format deployment cannot
-intentionally publish data and metadata independently.
+`data_collection_name` and `metadata_collection_name` are physical Qdrant
+names, not aliases. Existing configurations that omit them keep the current
+`project_name`/`name` derivation. If only `data_collection_name` is set, the
+metadata name defaults to `{data_collection_name}__openviking_meta`; if an
+explicit metadata name is set, it must be pairwise distinct. The adapter must
+pass both references to `QdrantCollection` and must not silently derive a
+different target name. The explicit Qdrant fields take precedence over
+`custom_params`; legacy configurations keep their current precedence.
+`data_collection_name` is an optional `QdrantConfig` field with no non-null
+model default, so omitted and explicitly supplied values remain distinguishable.
 
-The legacy deployment does not use these aliases. It continues to use its
-direct physical source names until the operator rolls out the current-format
-adapter and configuration after final verification.
-
-Target alias rules:
-
-1. The data and metadata alias names must be pairwise distinct from every
-   physical source or target name.
-2. An existing alias is inspected and must be absent or owned by the declared
-   migration ID and target generation.
-3. An existing physical collection is never silently adopted as an alias.
-4. Alias publication is idempotent when both aliases already point to the
-   requested target generation.
-
-### 2. Physical generations and markers
-
-Every target generation has its own metadata sidecar. The marker payload is
-extended with:
+The target marker keeps the adapter's standard `collection_name` equal to the
+target physical data name and adds:
 
 ```json
 {
   "logical_collection": "default/context",
-  "data_alias": "default__context__active",
-  "metadata_alias": "default__context__active__openviking_meta",
-  "physical_collection": "default__context__gen_20260908_abc",
-  "physical_metadata_collection": "default__context__gen_20260908_abc__openviking_meta",
-  "generation": "20260908_abc",
-  "migration_id": "20260908_abc",
-  "migration_state": "building",
-  "source_collection": "default__context",
-  "source_marker_fingerprint": "...",
+  "collection_name": "default__context__gen_20260908_abc",
+  "metadata_collection_name": "default__context__gen_20260908_abc__openviking_meta",
+  "source_collection": "legacy__context",
+  "source_metadata_collection": "__openviking_meta",
+  "dense_vector_name": "vector",
+  "sparse_vector_name": "sparse_vector",
+  "vector_dimension": 1536,
+  "distance": "Cosine",
+  "sparse_enabled": true,
+  "sparse_weight": 0.5,
   "source_fingerprint": "...",
+  "source_count": 0,
+  "target_count": 0,
   "metadata_fingerprint": "...",
   "sparse_map_fingerprint": "...",
+  "migration_id": "20260908_abc",
   "migrator_version": "...",
+  "migration_state": "building",
+  "last_source_cursor": null,
   "setup_complete": false
 }
 ```
 
-`setup_complete` remains for compatibility with the adapter read gate.
-`migration_state` carries the online lifecycle and is not overloaded to mean
-both “copy complete” and “currently active”.
+The adapter validates the physical names and logical identity from this marker.
+It does not accept a legacy marker as a current-format marker.
 
-Allowed states are:
+`source_fingerprint` and the source count in the reviewed plan are the initial
+observations, not immutable online-copy inputs. Each successful reconciliation
+round replaces them with the fingerprint and count of the source snapshot that
+round transformed. The metadata and sparse-map fingerprints are pinned inputs:
+the controller recomputes them before and after every round and fails closed if
+either changes.
+
+The legacy metadata sidecar may be the pre-`#3872` global sidecar shared by
+several logical collections. The controller selects and fingerprints only the
+documents for the requested source collection; it never writes that shared
+sidecar.
+
+### 2. Migration state
+
+Allowed target states are:
 
 ```text
 building       target is being created or copied
-ready          target passed exact verification
-cutting_over   final write barrier and alias switch are in progress
-active         target is the alias target after cutover
-retained       target remains available for audit or later cleanup
-rolled_back    current-format rollout was reverted before target writes
+ready          target passed a point-in-time verification
+cutting_over   barrier-held final verification and rollout are in progress
+active         current-format rollout passed its read-only smoke gate
+retained       target is retained for audit or later cleanup
+rolled_back    rollout was reverted while the barrier was held
 failed         operator-visible failure requiring resume or cleanup
 ```
 
-`building` and `failed` have `setup_complete=false`. `ready`,
-`cutting_over`, `active`, `retained`, and `rolled_back` have
-`setup_complete=true`. A failed or interrupted target remains migration-owned
-and resumable; it is not adopted by another migration ID.
+`building`, `failed`, and `rolled_back` have `setup_complete=false`.
+`ready`, `cutting_over`, `active`, and `retained` have
+`setup_complete=true`. A persisted target marker is never adopted by another
+migration ID. A `rolled_back` target remains available for raw audit only; the
+current adapter must refuse to serve it.
+`ready` is not a publication signal: no application may route to it until
+`cutover` holds the barrier.
 
-### 3. Collection reference handling
+Successful phases have these transitions:
 
-`QdrantCollection` accepts a data collection reference and metadata collection
-reference independently. The legacy source uses direct physical names. The
-current-format deployment uses the paired target aliases.
+```text
+prepare                         -> building
+verify (outside cutover)        -> ready
+cutover start                   -> cutting_over
+final verify + rollout smoke    -> active
+barrier-held rollback           -> rolled_back
+retention completion             -> retained
+```
 
-All normal data-plane operations use the configured data reference:
+Mutating phases (`backfill` and `reconcile`) are allowed only before
+`active`/`retained`/`rolled_back`; they may temporarily keep the marker in
+`building` and must never make an already active target incomplete. `verify` on
+an active or retained target is read-only and does not change its state.
 
-- reads and searches use the data alias;
-- writes use the data alias after the current-format rollout;
-- marker and sparse-dictionary reads/writes use the metadata alias or the
-  explicit generation sidecar;
-- marker validation accepts the logical alias and verifies the physical
-  generation fields.
+### 3. Migration controller
 
-The adapter does not resolve an alias to a physical name for every request.
-Qdrant resolves the alias at the data plane; the migration controller uses
-physical names when preparing and inspecting generations.
-
-### 4. Migration controller
-
-`scripts/maintenance/qdrant_migrate.py` becomes an explicit phase controller.
-Each command is idempotent and records progress in the target marker.
-
-Commands:
+`scripts/maintenance/qdrant_migrate.py` becomes an explicit phase controller:
 
 ```text
 preflight
@@ -205,224 +232,313 @@ rollback
 retire
 ```
 
-`apply` remains accepted as a compatibility alias for the offline
-`prepare + backfill + verify` path, but it does not publish aliases or roll out
-the current-format application.
+Every phase receives the logical collection identity explicitly (for example,
+`--logical-collection default/context`) in addition to the physical source and
+target names. The controller validates that identity against the rollout's
+`project_name`/`name` configuration and stores it in the target marker.
+Every phase also receives an explicit `--migration-id`; the controller never
+silently generates a new ID during resume.
+
+The existing `apply` command may remain as an offline compatibility wrapper for
+`prepare + backfill + verify`. It retains its existing full-window source-write
+freeze semantics, must not perform application cutover, and must not pretend
+that the source is continuously dual-written. It refuses an `active`, `retained`,
+or `rolled_back` target rather than mutating data after cutover. The new online
+phases are explicit.
+
+All commands accept `--timeout-seconds`, pass it to every
+`QdrantRestClient` request, and record it in the plan. `cutover` and automatic
+`rollback` additionally require `--barrier-held`; this is an operator
+acknowledgement, not a claim that the controller can detect stopped application
+writers.
+Every target point upsert/delete and marker write uses Qdrant's
+acknowledged/waited write mode (`wait=true` on REST) with `ordering=strong`; if
+the endpoint cannot honor strong ordering, preflight fails instead of silently
+downgrading. Collection/index readiness polling and the final verify do not
+treat an accepted-but-not-visible write as complete.
 
 #### `preflight`
 
-Read-only validation records:
+Read-only checks record:
 
-- source and target names;
-- alias ownership;
-- collection layout and scalar indexes;
-- metadata and sparse-map fingerprints;
-- source point count and source snapshot fingerprint;
-- ACL completeness;
-- migration mode (`legacy`; the only supported mode);
-- expected target generation and migration ID.
+- legacy source and target physical names;
+- logical collection identity used by the current-format rollout;
+- source metadata sidecar (default `__openviking_meta`) and target sidecar;
+- collection layouts, scalar indexes, and vector names;
+- selected legacy metadata and sparse-map fingerprints;
+- exact source and target counts;
+- ACL-incomplete count;
+- migration ID, migrator version, batch size, and the exact
+  `--timeout-seconds` passed to every REST request;
+- whether the target is absent or already owned by this migration ID.
 
-The plan JSON contains counts, fingerprints, names, and configuration only.
-It does not serialize a full `id_map` or target ID set.
+The plan JSON contains counts, fingerprints, names, and non-secret configuration
+only. It never contains the Qdrant URL or API key, a full point map, a full
+target ID set, vectors, or payloads.
+An existing target or metadata collection is plan-eligible only when its marker
+already belongs to the same migration ID; an unmarked or foreign collection
+fails preflight rather than being adopted.
 
 #### `prepare`
 
-Creates the target data and metadata collections, writes the incomplete marker,
-creates the required indexes, and creates the target sparse dictionary. A
-target that already belongs to the same migration ID is resumed. A target
-with a different marker, missing marker, or mismatched fingerprints fails
-closed.
+Creates the target data and metadata collections, required indexes, and target
+sparse dictionary. It writes the incomplete marker only after both collections
+are owned by this migration ID. A pre-existing unmarked collection, a
+different marker, a target metadata sidecar shared by another logical
+collection, or a source/target name collision fails closed.
+Collection-creation races are handled by re-reading a 409 response and
+accepting only the same migration-owned marker; the controller never overwrites
+a foreign collection.
 
 #### `backfill`
 
-Scrolls the legacy source in bounded batches and transforms each page into the
-current-format target. The scroll cursor is persisted after every successful
-batch in the target marker:
+Scrolls the legacy source in bounded batches, transforms each page, and
+upserts the target. After every successful batch it persists the opaque
+Qdrant `next_page_offset` in `last_source_cursor`. The cursor may be an
+integer or string; a malformed or repeated cursor fails closed.
 
-```json
-{
-  "last_source_cursor": null
-}
-```
-
-The cursor is treated as an opaque Qdrant value and may be an integer or
-string. A repeated cursor or malformed page fails closed.
-
-The process retains only one source page, one write batch, and bounded
-fingerprint state in memory. Sparse dictionary writes are also chunked by the
-configured batch size.
+Only one source page, one target write batch, and bounded transform state are
+held in memory. A failed batch is retried by rerunning that batch; the source
+is never written.
 
 #### `reconcile`
 
-Reconciles source and target after backfill:
+Each reconciliation round:
 
-- upserts source records whose transformed fingerprint differs;
-- validates payload security fields and vector shapes;
-- removes target records absent from the source;
-- verifies sparse dictionary completeness;
-- repeats until the source and target fingerprints/counts converge.
+1. creates a fresh temporary SQLite migration manifest;
+2. scans the source from the beginning, transforms records, upserts changed
+   target records in bounded batches, and stores
+   `(target_id, transformed_fingerprint)` in the manifest;
+3. streams the target and compares it with the manifest, deleting target
+   records absent from the source and rechecking records whose fingerprints
+   differ;
+4. verifies sparse dictionary membership and writes missing terms in chunks;
+5. recomputes the pinned legacy metadata and sparse-map fingerprints before and
+   after the round, failing if either changed;
+6. records the round's source/target fingerprints and counts in the target
+   marker.
 
-This repeated reconciliation is the only online safety mechanism available
-while legacy writes continue: the legacy adapter cannot dual-write
-current-format points. A final write barrier is still mandatory, and the
-controller must report non-convergence rather than claiming readiness when
-source churn prevents the fingerprints from matching.
+When invoked by `cutover`, reconciliation preserves `migration_state=cutting_over`
+and `setup_complete=true`; it never exposes an intermediate incomplete marker
+during the barrier-held final pass.
+
+The manifest is rebuilt after an interrupted round and is deleted after a
+successful verification. It is not included in plan JSON or target metadata.
+This makes exact extra detection disk-backed rather than an unbounded Python
+set. If the source keeps changing and a bounded number of rounds does not
+converge, or if the legacy metadata/sparse-map fingerprint changes during a
+round, the controller fails closed and reports non-convergence or source
+metadata drift. The implementation uses a fixed maximum of three rounds; it
+does not add another operator tuning knob.
+
+Fingerprints are only a bounded candidate filter. Final point verification
+compares canonical IDs, payloads, and dense/sparse vector values directly; a
+hash match alone never proves equality.
 
 #### `verify`
 
-Performs exact, streamed validation:
+Verification is streamed and exact:
 
-- source and target point counts;
-- transformed source fingerprint;
-- target ID coverage and no extras;
-- per-point payload/security fields;
-- dense and sparse vector layout;
-- scalar indexes;
-- metadata and sparse-map fingerprints;
-- ACL gate;
-- marker state and migration ID.
+- source and target counts;
+- transformed source fingerprint and target fingerprint;
+- target ID coverage and absence of extras;
+- logical-ID, physical-ID, and payload identity;
+- dense vector values, sparse vectors, vector names, dimensions, and distance;
+- collection/index readiness, scalar indexes, and metadata schema;
+- sparse dictionary completeness and collision-free term IDs;
+- ACL completeness and the target marker;
+- migration ID and migrator version.
 
-Successful verification writes `migration_state=ready` and
-`setup_complete=true`. Verification before the barrier is a point-in-time
-check; `cutover` always repeats it while the barrier is held.
+Verification before the barrier is point-in-time only. A successful
+non-cutover verify changes `building` to `ready`; it never changes an active or
+retained target. `cutover` must run a fresh `reconcile` and `verify` while the
+barrier is held. The final verify records success without changing
+`cutting_over` back to `ready`.
 
 #### `cutover`
 
-Cutover requires all of the following:
+The controller:
 
-1. target marker is `ready`;
-2. source and target fingerprints match;
-3. no concurrent migration owns either alias;
-4. the legacy write barrier is held;
-5. a final reconcile/verify succeeds while the barrier is held.
+1. requires `migration_state=ready`, `--barrier-held`, and a held write
+   barrier;
+2. changes the target marker to `cutting_over`;
+3. drains in-flight legacy writes and waits for their Qdrant requests to
+   complete before taking the final source snapshot;
+4. drains and removes the legacy deployment from the serving path so old and
+   current-format replicas cannot serve mixed generations;
+5. runs final `reconcile` and `verify`;
+6. rolls out the current-format application with both explicit target physical
+   names and the configured Qdrant request timeout;
+7. waits for every new replica to pass readiness and a read-only marker,
+   count, and representative dense/sparse query smoke test;
+8. changes the target marker to `active`;
+9. releases the write barrier only after the old deployment is stopped and the new
+   deployment is serving the target pair.
 
-The controller then sends one atomic aliases request that creates or replaces
-both target aliases. The target marker becomes `active`. The operator rolls
-out the current-format adapter configured with those aliases and only then
-releases the barrier. The old application must not resume writes to the legacy
-physical collection after the switch.
+The read-only smoke gate must not upsert, delete, or partially update data.
+Source and target remain available for audit; the source is not rewritten.
+
+If any step fails while the barrier is held, the controller leaves the target
+in `cutting_over` or `failed` and requires `rollback` or an explicit resume.
+It never releases the barrier automatically. The barrier procedure must also
+drain in-flight legacy requests; `--barrier-held` is an acknowledgement, not
+proof that writers have stopped.
 
 #### `rollback`
 
-Rollback is a deployment rollback to the legacy adapter and direct source
-names, not an alias switch: the current adapter cannot consume the legacy
-marker. It is allowed only while the barrier is still held or after the
-operator proves that the current-format target has accepted no writes since
-cutover. Otherwise the command fails closed and a separate reverse migration
-is required. Before that boundary, rollback removes target aliases owned by
-this migration in one Qdrant request, restores the legacy deployment, and
-records the target as `rolled_back`. Rollback never deletes the target.
+Automatic rollback is allowed only while the write barrier is held. It:
+
+It accepts only a `cutting_over` or barrier-held `active` target and requires
+the operator to attest that no current-format data write has been accepted.
+
+1. stops/removes the current-format rollout before any post-cutover target
+   write can be accepted;
+2. restores the legacy deployment's direct source configuration and serving
+   path;
+3. verifies the legacy marker and source read path;
+4. marks the target `rolled_back` and retains it.
+
+After the barrier is released, the target may contain writes that do not exist
+in the legacy source. The controller therefore refuses automatic rollback and
+requires a separately designed reverse migration.
 
 #### `retire`
 
-Deletion is a separate explicit command. It requires the operator to name the
-generation and migration ID, verifies that neither alias points to it, and
-prints the exact collections before requiring `--confirm`. Normal cutover and
-rollback never delete source data. A legacy source without a current marker is
-protected by the migration plan and explicit source name rather than being
-silently treated as an unowned collection.
+Deletion is explicit and requires the operator to name the migration ID and
+target pair, verify that no deployment serves the pair, print the exact
+collections, and pass `--confirm`. After the retention window, it first writes
+`migration_state=retained`, re-reads that marker, and only then deletes the
+pair. If a process died before its first marker write, the reviewed plan's
+`target_absent=true` plus the external per-source lock permits cleanup of that
+migration-owned orphan only after both names are rechecked as unmarked; an
+unmarked collection that was not absent in the reviewed plan is never deleted
+by the tool. Normal migration and rollback never delete the legacy source.
 
-## Legacy-source flow
+### 4. Legacy-to-current transform contract
 
-The pre-`#3872` collection uses a different metadata marker and ID encoding.
-The current adapter must not read or write current-format points into it. The
-flow therefore uses:
+The transform must:
 
-- raw REST reads from the old collection;
-- the current-format transformer for the target;
-- repeated streamed reconciliation;
-- a short final source-write barrier;
-- atomic publication of the paired target aliases;
-- configuration rollout to the current adapter using those aliases.
+- require `_openviking_original_id`; it is the authoritative logical ID;
+- validate the raw legacy ID type before normalizing it to the current
+  string-valued target payload;
+- preserve that normalized logical ID in the target payload;
+- validate the legacy physical point ID against the pre-`#3872` encoding:
+  uint64 integers pass through, canonical UUID strings remain UUIDs, and other
+  values use the legacy uuid5 namespace;
+- derive the current target point ID with the current `to_qdrant_point_id`
+  rule;
+- fail closed on duplicate logical IDs, target-ID collisions, missing URI,
+  invalid/non-finite vector values, or payload loss;
+- preserve documented URI/owner normalization and all ACL fields without
+  silently backfilling ACL grants;
+- require an authoritative old sparse-index-to-term map and fail closed on
+  missing terms or stable-index collisions.
 
-The controller never claims continuous dual-write. The maintenance window is
-part of the runbook and is required for exact delete handling. The source is
-retained unchanged; it is the rollback source only before the target accepts
-new writes.
+### 5. Failure and recovery
 
-## Failure and recovery
-
-- A source read or target write failure leaves the legacy application and
-  physical source unchanged.
-- An interrupted `backfill` resumes from the last persisted cursor.
-- A target created before its marker is persisted is deleted only when the
-  target is still migration-owned and no marker was written.
-- Once a migration marker is persisted, cleanup leaves the target in an
-  explicit resumable state instead of deleting it.
-- Cleanup catches `BaseException` only to remove pre-marker orphan resources,
-  then immediately re-raises the original exception.
-- A completed target is never temporarily marked incomplete during a
-  same-fingerprint rerun; application reads remain available.
-- A version, fingerprint, alias, or count mismatch fails before mutation.
-- Alias publication is one atomic Qdrant request; a rejected request leaves
-  the previous alias mapping in place.
-- Deployment rollback is available only before target writes are accepted;
-  after that boundary a reverse migration is required.
-
-Only one controller may operate a given migration ID. A different migration
-ID cannot adopt an existing target or marker. The runbook explicitly forbids
-two controllers targeting the same alias.
+- Source reads and target writes are separate; a target failure never mutates
+  the source.
+- Backfill resumes from the persisted cursor. Reconciliation restarts its
+  temporary manifest from the beginning.
+- A collection created before its first marker is persisted is cleaned up only
+  when it is still migration-owned; a foreign marker is never deleted.
+- A process-death orphan is recoverable only through the reviewed
+  `target_absent=true` plan, the external per-source lock, an exact-name
+  recheck, and `--confirm`; it is never auto-adopted.
+- Cleanup catches `BaseException` only for pre-marker orphan cleanup, then
+  re-raises `KeyboardInterrupt` or `SystemExit`.
+- A completed target is never changed back to `setup_complete=false` by a
+  same-fingerprint read-only rerun; an active, retained, or rolled-back target
+  rejects mutating reruns.
+- Pinned metadata/sparse-map fingerprints, names, counts, ACL, and vector
+  mismatches fail before cutover; the rolling source fingerprint must equal the
+  target fingerprint at the barrier.
+- A process death during `cutting_over` leaves the barrier held. Recovery
+  inspects the marker and deployment state, then resumes or rolls back; it
+  never assumes that a partial application rollout succeeded.
+- Same-target controllers with different migration IDs fail closed. Distinct
+  target names cannot be detected without a distributed scheduler, so the
+  operator must hold one external per-source migration lock and must not run
+  two controllers for the same logical collection.
 
 ## Configuration and compatibility
 
-Direct-name configuration remains the default for the legacy deployment and
-remains compatible with current deployments. The post-cutover current-format
-deployment opts into the paired target aliases through the existing Qdrant
-collection and metadata-name configuration; there is no secondary collection
-or dual-write setting.
+Direct-name configuration remains the default. The only new current-format
+configuration needed for cutover is the explicit target physical data and
+metadata names plus the migration REST timeout. No alias or secondary
+collection configuration is added.
 
-New marker fields are ignored by older adapters as unknown metadata fields,
-but the legacy adapter must not be pointed at a new alias. The normal
-deployment gate verifies the alias-aware current-format version before
-releasing the write barrier.
+For physical names, resolution is exact: an explicitly present
+`qdrant.data_collection_name` or `qdrant.metadata_collection_name` wins;
+otherwise the corresponding `custom_params` value is used; otherwise the
+existing derived name is used. For every pre-existing option, preserve the
+current resolver and fallback order exactly; this migration must not silently
+change legacy `qdrant`/top-level/`custom_params` behavior. Only the new
+physical-name fields need omitted-versus-explicit detection.
 
-Old markers without `migrator_version` are not adopted by the migration
-controller as target markers. The legacy source is accepted only through an
-explicit source declaration and a fresh preflight; it is never rewritten.
-The application read path continues to validate the existing
-`_openviking_meta_version` separately.
+The legacy adapter is never pointed at the target. The current adapter is
+never pointed at the legacy marker. The target marker's physical names,
+logical collection, vector layout, sparse mode/weight, migration ID, and
+migrator version must all match the rollout configuration.
+`migrator_version` is a stable code constant combined with the transform-schema
+version; changing either requires a new migration ID and target.
 
-The existing ACL fail-open contract remains explicit: incomplete ACL records
-block `verify` and `cutover` unless the operator supplies the existing
-acknowledgement flag. Migration does not backfill ACL fields.
+The migration exposes the existing `--allow-acl-fail-open` acknowledgement.
+Without it, incomplete or malformed ACL records block `verify` and `cutover`.
+With it, the command prints a warning and records the incomplete count in the
+target marker; it does not claim that those records are protected. Enabling ACL
+after this migration therefore does not retroactively protect records that were
+accepted through this gate.
 
-## Testing strategy
+Hybrid search remains the existing client-side weighted rank fusion. Qdrant
+supports server-side `prefetch` + `fusion: RRF`, but that contract is
+unweighted and would change score semantics and pagination behavior; the
+sidecar term lookup is performed before the two data-collection queries. A
+server-side fusion change is intentionally a separate benchmark/design.
 
-### REST and alias tests
+## Testing and documentation
 
-- alias create, delete, and paired atomic switch request shapes;
-- target alias ownership and refusal to adopt an unrelated physical collection;
-- alias switch failure leaves both aliases unchanged;
-- opaque integer and string scroll cursors round-trip;
-- timeout propagation through the REST client.
+### REST and controller tests
 
-### Migration controller tests
-
-- prepare/backfill/reconcile/verify state transitions;
-- bounded batch writes and sparse dictionary chunking;
-- cursor resume after an injected failure;
-- legacy source transformation preserves logical IDs and current-format
-  physical IDs;
-- legacy mode requires the write barrier before cutover;
-- target extras are deleted during reconcile;
-- completed-target rerun keeps `setup_complete=true`;
-- marker version mismatch and stale fingerprints fail closed;
-- `KeyboardInterrupt` and `SystemExit` clean pre-marker orphans;
-- rollback refuses after target writes and restores the legacy deployment
-  before that boundary;
-- retire refuses to delete an aliased generation.
+- opaque integer/string cursor persistence and repeated-cursor failure;
+- timeout propagation through `QdrantRestClient`;
+- waited writes and strong ordering are sent for every target mutation;
+- collection/index readiness is awaited before verify and smoke;
+- explicit Qdrant physical-name precedence over `custom_params` and derived
+  names;
+- target creation ordering and foreign-marker refusal;
+- pre-marker orphan cleanup requires a reviewed absent-target plan;
+- bounded batch upsert/delete and temporary-manifest reconciliation;
+- cutover reconciliation preserves `cutting_over` and the read gate;
+- resume after a failed batch or interrupted reconciliation;
+- completed-target rerun preserves `setup_complete=true`;
+- active/retained/rolled-back targets reject mutating reruns;
+- migrator-version, source-fingerprint, vector, metadata, ACL, and sparse-map
+  mismatch failures;
+- exact legacy ID mapping, duplicate/collision rejection, and payload
+  fail-closed decoding;
+- cutover failure keeps the barrier held;
+- source-write drain and final source snapshot occur before final verify;
+- read-only rollout smoke gate and barrier-held rollback;
+- rollback refusal after target writes;
+- retire refuses a serving target and marks a non-serving target retained
+  before deletion.
 
 ### Adapter tests
 
-- direct-name mode remains unchanged;
-- alias mode routes data and metadata operations through paired aliases;
-- marker physical/logical generation fields round-trip;
-- missing `_openviking_original_id` never fabricates a record ID;
-- current-format rollout smoke tests read and write through the paired aliases.
+- existing direct-name mode remains unchanged;
+- explicit data/metadata physical-name overrides route every operation to the
+  configured pair;
+- target marker physical/logical fields round-trip;
+- vector layout and sparse configuration must match the target marker;
+- migration fingerprints and state survive normal adapter marker rewrites;
+- required logical collection identity must match rollout configuration;
+- the adapter refuses legacy markers and mismatched target names;
+- missing `_openviking_original_id` never fabricates a record ID.
 
-### Integration and CI
+### CI and documentation
 
-The conditional Qdrant job runs:
+The conditional Qdrant CI job runs:
 
 ```text
 tests/maintenance/test_qdrant_migrate.py
@@ -432,51 +548,66 @@ tests/storage/test_qdrant_integration.py
 tests/storage/test_collection_schemas.py
 ```
 
-Fake-REST tests are mandatory in CI. Live Qdrant alias and cutover tests run
-only when `QDRANT_URL` is configured and are skipped otherwise. No test
-deletes a user collection or performs a live migration against Monster.
+Fake-REST tests are mandatory. Live Qdrant tests run only when `QDRANT_URL`
+is configured and never migrate Monster or delete a user collection.
+
+The implementation updates `scripts/maintenance/README.md`,
+`openviking/storage/vectordb_adapters/README.md`, and the bilingual
+configuration guides so they describe the phase commands, the short final
+barrier, the exact ACL flag, the timeout option, the physical-name override,
+the post-release rollback boundary, and the disk-space budget for the
+temporary manifest. Existing text that says to freeze the whole long copy
+window for the online phases must be removed; the compatibility `apply` path
+must retain its documented full-window freeze semantics.
 
 ## Operational runbook
 
-1. Confirm source and target names, aliases, sparse map, and Qdrant endpoint.
-2. Confirm the current-format deployment version supports paired aliases and
-   the chosen migration state.
-3. Run and review read-only `preflight`.
-4. Run `prepare`, `backfill`, `reconcile`, and `verify` while the legacy
-   deployment continues serving the source.
-5. Stop legacy writes for the documented short barrier.
-6. Run final `reconcile`, `verify`, and `cutover`; publish both target aliases
-   in one request.
-7. Roll out the current-format application configured with the target aliases
-   while the barrier is still held, then release the barrier.
-8. Verify active aliases, metadata marker, point counts, ACL fields, and a
-   representative dense/sparse read.
-9. Retain the legacy source for the agreed audit and pre-write rollback
-   window.
-10. Run `retire` only after the rollback window and explicit confirmation.
+1. Confirm logical collection identity, source data name, legacy metadata name
+   (default `__openviking_meta`), target pair, sparse map, timeout, and
+   migration ID;
+   acquire the external per-source migration lock.
+2. Run read-only `preflight` and review the compact plan.
+3. Run `prepare`, `backfill`, `reconcile`, and point-in-time `verify` while
+   the legacy deployment serves the source.
+4. Acquire the write barrier. Stop legacy upserts, deletes, partial updates,
+   and metadata writes; drain/remove the legacy deployment from the serving
+   path; keep the barrier held.
+5. Run final `reconcile` and `verify` with `--allow-acl-fail-open` only if the
+   recorded ACL risk is explicitly accepted.
+6. Run `cutover`; keep the barrier held until every current-format replica
+   passes read-only smoke. The representative sparse query uses already
+   migrated dictionary terms (or pre-encoded indices), so the smoke gate cannot
+   create metadata points as a side effect.
+7. Release the barrier and perform the first normal write/read acceptance
+   check.
+8. Retain the legacy source and target marker for the agreed audit window.
+9. Run `retire` only after the retention window and explicit confirmation.
 
 ## Comment coverage
 
-This design closes the remaining PR findings as follows:
+This design closes the previously reported findings as follows:
 
-- M1: bounded batches, cursors, streamed reconciliation, and scale guidance;
-- M2: completed markers remain readable during same-generation reruns;
-- M3: marker and plan migrator-version binding;
-- M4: interrupt-safe cleanup;
-- L5: CLI timeout propagation;
+- M1: bounded batches plus a disk-backed manifest; no full ID map in plan JSON;
+- M2: completed targets remain readable during same-fingerprint reruns;
+- M3: marker-bound migrator version;
+- M4: interrupt-safe pre-marker cleanup;
+- L5: explicit REST timeout configuration and CLI propagation;
 - L6: compact plan JSON;
-- L10: migration ownership and one-controller rule;
-- legacy-only scope: no current-format source mode or application dual-write;
-- CI gap: focused conditional CI job;
-- RRF question: architecture documentation keeps client-side fusion;
-- payload fallback: fail-closed record decoding.
+- L10: one-controller ownership and concurrent-run refusal;
+- legacy compatibility: exact pre-`#3872` ID validation and transformation;
+- ACL: explicit `--allow-acl-fail-open` gate and recorded warning;
+- RRF: weighted client-side ranking is retained intentionally;
+- payload fallback: missing logical IDs fail closed;
+- metadata sharing: target pair names and sidecars are unique;
+- CI/docs: maintenance/storage tests and operator documentation are in scope.
 
-The pre-existing random-vector behavior is intentionally not changed in this
-migration design; it belongs to a separate adapter-wide contract change.
+The pre-existing random-vector behavior is intentionally not changed here; it
+belongs to a separate adapter-wide contract change.
 
 ## References
 
-- Qdrant collection aliases:
-  <https://qdrant.tech/documentation/manage-data/collections>
-- Qdrant blue-green embedding migration:
+- Qdrant migration guidance and persisted scroll offsets:
   <https://qdrant.tech/documentation/tutorials-operations/embedding-model-migration/>
+- Qdrant collection operations and write ordering:
+  <https://qdrant.tech/documentation/manage-data/collections>
+  <https://qdrant.tech/documentation/scaling/consistency-guarantees/>
