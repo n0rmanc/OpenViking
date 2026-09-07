@@ -56,12 +56,21 @@ multiple named sparse vectors also requires `--sparse-vector-name`.
    preflight, apply, and verification window.
 2. Run `preflight` and save its JSON output. Confirm the source/target names,
    exact counts, vector layout, sparse terms, and fingerprints.
-3. Review the ACL gate. Records missing or containing malformed
+3. Review ownership normalization. For a user-scoped URI such as
+   `/user/alice/memories/a.md`, a missing `owner_user_id` is derived as
+   `alice`; the target payload can therefore intentionally differ from the
+   source payload. The ownerless roots `/user` and `/resources` remain without
+   an owner when their source value is null or absent. A malformed owner or an
+   owner that does not match the URI fails preflight/apply closed. Verify a
+   representative target payload against its URI before cutover. A
+   migration-owned target from an older script is backfilled only for this
+   missing/null-owner normalization; other target payload changes are preserved.
+4. Review the ACL gate. Records missing or containing malformed
    `acl_enabled`, `acl_direct_grants`, or `acl_inherited_grants` remain
    fail-open after the copy. Grant values must be encoded ACL tokens. Do not
    expose the target until those records are rewritten or an operator
    explicitly accepts the risk with `--allow-acl-fail-open`.
-4. Apply only after the plan is reviewed:
+5. Apply only after the plan is reviewed:
 
    ```bash
    ./.venv/bin/python scripts/maintenance/qdrant_migrate.py \
@@ -77,16 +86,17 @@ multiple named sparse vectors also requires `--sparse-vector-name`.
    do not put secrets in command-line arguments.
    Remove `--allow-acl-fail-open` when all source records have complete ACL
    fields. `--confirm` is always required for writes.
-5. Verify the reported `source_count`, `target_count`, and source/metadata
+6. Verify the reported `source_count`, `target_count`, and source/metadata
    fingerprints. Read back the target marker and verify that
-   `setup_complete` is `true`; inspect the physical target scalar indexes and
-   decode a representative dense and sparse record through the current
-   adapter.
-6. Change the OpenViking collection configuration to the target collection and
+   `setup_complete` is `true`; inspect the physical target scalar indexes,
+   confirm normalized `owner_user_id` on user-scoped records and its absence
+   on ownerless roots, and decode a representative dense and sparse record
+   through the current adapter.
+7. Change the OpenViking collection configuration to the target collection and
    its target metadata sidecar, then restart/roll out the application through
    the normal deployment process. Configuration cutover is separate from this
    script.
-7. Retain the legacy source collection and metadata sidecar for the agreed
+8. Retain the legacy source collection and metadata sidecar for the agreed
    rollback/audit window. Roll back by pointing configuration at the retained
    source; do not delete it as part of this migration.
 

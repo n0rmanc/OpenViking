@@ -1508,6 +1508,13 @@ weighted reciprocal-rank score 合并结果。这不是 Qdrant 的 server-side R
 暴露风险时传入 `--allow-acl-fail-open`；当所有 source 记录的 ACL 字段完整后
 应移除该选项。
 
+**迁移也会规范化 ownership。** 对 `/user/alice/memories/a.md` 这类个人 URI，
+若缺少 `owner_user_id`，会从 URI 推导为 `alice`，所以 target payload 可能会
+有意不同于 source payload。ownerless root `/user` 和 `/resources` 在 source
+值为 null 或缺失时保持无 owner。owner 格式错误或与 URI 不一致会让
+preflight/apply fail closed。切换前请在 target 分别验证一笔推导出的 user owner
+和一笔 ownerless root。
+
 要运行 live coverage，请设置 `QDRANT_URL`（可选 `QDRANT_API_KEY`）：
 
 ```bash

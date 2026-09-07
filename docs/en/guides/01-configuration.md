@@ -1537,6 +1537,14 @@ re-ingested. Review the reported incomplete-record count and pass
 `--allow-acl-fail-open` only when the temporary exposure is explicitly accepted;
 omit it once every source record has complete ACL fields.
 
+**Ownership normalization is part of the migration.** For a user-scoped URI
+such as `/user/alice/memories/a.md`, a missing `owner_user_id` is derived as
+`alice`, so the target payload can intentionally differ from the source
+payload. The ownerless roots `/user` and `/resources` remain without an owner
+when their source value is null or absent. A malformed owner or an owner that
+does not match the URI fails preflight/apply closed. Verify both a derived
+user owner and an ownerless root in the target before cutover.
+
 For live coverage, set `QDRANT_URL` and optionally `QDRANT_API_KEY`, then run:
 
 ```bash
