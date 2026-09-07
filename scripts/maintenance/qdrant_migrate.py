@@ -11,8 +11,10 @@ Freeze writes to the source collection and legacy metadata sidecar during the
 copy, keep them for rollback/audit, and perform any application cutover
 separately.  The pre-#3872 global metadata sidecar defaults to
 ``__openviking_meta``; pass an override when the old deployment used a
-different sidecar name.  ACL fields are copied as-is: missing or malformed
-legacy ACL fields remain fail-open until records are rewritten.
+different sidecar name.  Missing ``owner_user_id`` values are derived from
+user-scoped URIs when possible; ownerless roots remain ownerless.  ACL fields
+are copied as-is: missing or malformed legacy ACL fields remain fail-open until
+records are rewritten.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from openviking.core.namespace import owner_fields_for_uri  # noqa: E402
 from openviking.storage.acl import DirectAcl  # noqa: E402
 from openviking.storage.vectordb.collection.qdrant_rest import (  # noqa: E402
     QdrantError,
@@ -339,6 +342,32 @@ def _acl_complete(payload: Mapping[str, Any]) -> bool:
     except (RuntimeError, TypeError, ValueError):
         return False
     return True
+
+
+def _normalize_owner_user_id(
+    payload: dict[str, Any],
+    *,
+    uri: str,
+    point_id: Any,
+    source_keys: set[str],
+) -> None:
+    expected_owner = owner_fields_for_uri(
+        f"viking://{uri.lstrip('/')}"
+    ).get("owner_user_id")
+    actual_owner = payload.get("owner_user_id")
+    if actual_owner is None:
+        if expected_owner is None:
+            payload.pop("owner_user_id", None)
+            source_keys.discard("owner_user_id")
+        else:
+            payload["owner_user_id"] = expected_owner
+        return
+    if not isinstance(actual_owner, str) or not actual_owner.strip():
+        raise MigrationError(f"point {point_id!r} has an invalid owner_user_id")
+    if expected_owner is not None and actual_owner != expected_owner:
+        raise MigrationError(
+            f"point {point_id!r} owner_user_id does not match uri {uri!r}"
+        )
 
 
 def _assert_security_payload(
@@ -1031,6 +1060,12 @@ class QdrantMigration:
                 payload["parent_uri"],
                 field_name="parent_uri",
             )
+        _normalize_owner_user_id(
+            payload,
+            uri=payload["uri"],
+            point_id=point.get("id"),
+            source_keys=source_keys,
+        )
         payload["uri_depth"] = _path_depth(payload["uri"])
         payload["scope_roots"] = _scope_roots(payload["uri"])
 
@@ -1057,7 +1092,7 @@ class QdrantMigration:
                 raise MigrationError(
                     f"point {point.get('id')!r} has invalid context_type {context_type!r}"
                 )
-        for identity_field in ("account_id", "owner_user_id"):
+        for identity_field in ("account_id",):
             if identity_field in payload or identity_field in field_names:
                 value = payload.get(identity_field)
                 if not isinstance(value, str) or not value.strip():
@@ -1205,10 +1240,17 @@ class QdrantMigration:
             source_identities[target_id] = raw_identity
             id_map[logical_id] = target_id
             sparse_terms.update(terms)
+            fingerprint_payload = dict(transformed["payload"])
+            if "owner_user_id" in raw_payload:
+                fingerprint_payload["owner_user_id"] = raw_payload["owner_user_id"]
+            else:
+                fingerprint_payload.pop("owner_user_id", None)
+            fingerprint_point = dict(transformed)
+            fingerprint_point["payload"] = fingerprint_payload
             point_fingerprints.append(
                 _point_fingerprint(
                     source_point_id=raw_point_id,
-                    transformed=transformed,
+                    transformed=fingerprint_point,
                 )
             )
             payload = transformed["payload"]
@@ -2248,13 +2290,21 @@ class QdrantMigration:
             for field in schema.get("Fields", [])
             if isinstance(field, Mapping) and field.get("FieldName")
         }
-        for identity_field in ("account_id", "owner_user_id"):
+        for identity_field in ("account_id",):
             if identity_field in expected_payload or identity_field in schema_fields:
                 value = payload.get(identity_field)
                 if not isinstance(value, str) or not value.strip():
                     raise MigrationError(
                         f"target point {point_id!r} is missing {identity_field}"
                     )
+        expected_owner = owner_fields_for_uri(
+            f"viking://{normalized_uri.lstrip('/')}"
+        ).get("owner_user_id")
+        actual_owner = payload.get("owner_user_id")
+        if expected_owner is not None and actual_owner != expected_owner:
+            raise MigrationError(
+                f"target point {point_id!r} owner_user_id does not match uri"
+            )
 
         if not _acl_complete(expected_payload) and not allow_acl_fail_open:
             raise MigrationError(
@@ -2563,6 +2613,22 @@ class QdrantMigration:
                     f"target point-id collision for {point_id}: "
                     f"existing={current_id!r} source={source_id!r}"
                 )
+            expected_payload = point["payload"]
+            if payload == expected_payload:
+                skipped += 1
+                continue
+            if (
+                isinstance(payload, Mapping)
+                and isinstance(expected_payload, Mapping)
+                and payload.get("owner_user_id") is None
+            ):
+                current_without_owner = dict(payload)
+                expected_without_owner = dict(expected_payload)
+                current_without_owner.pop("owner_user_id", None)
+                expected_without_owner.pop("owner_user_id", None)
+                if current_without_owner == expected_without_owner:
+                    write.append(point)
+                    continue
             skipped += 1
         self._write_points(self.target_collection, write)
         return len(write), skipped, {str(point["id"]) for point in write}
