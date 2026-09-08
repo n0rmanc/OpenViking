@@ -749,12 +749,12 @@ def _validate_cursor(
     *,
     field_name: str = "Qdrant page offset",
 ) -> int | str | None:
-    """Validate Qdrant's unsigned-integer/string page cursor."""
+    """Validate Qdrant's unsigned-integer/UUID page cursor."""
 
     if value is None:
         return None
     if isinstance(value, bool):
-        raise MigrationError(f"{field_name} must be an unsigned integer or string")
+        raise MigrationError(f"{field_name} must be an unsigned integer or UUID string")
     if isinstance(value, int):
         if value < 0 or value > _LEGACY_UINT64_MAX:
             raise MigrationError(
@@ -763,9 +763,13 @@ def _validate_cursor(
         return value
     if isinstance(value, str):
         if not value or not value.strip():
-            raise MigrationError(f"{field_name} must be a non-empty string")
+            raise MigrationError(f"{field_name} must be a non-empty UUID string")
+        try:
+            uuid.UUID(value)
+        except ValueError as exc:
+            raise MigrationError(f"{field_name} is not a valid UUID string") from exc
         return value
-    raise MigrationError(f"{field_name} must be an unsigned integer or string")
+    raise MigrationError(f"{field_name} must be an unsigned integer or UUID string")
 
 
 def _legacy_sparse_map(value: Mapping[Any, Any] | None) -> dict[int, str]:
@@ -1739,7 +1743,7 @@ class QdrantMigration:
         *,
         transformed: Mapping[str, Any],
         terms: Iterable[str],
-    ) -> tuple[bool, str]:
+    ) -> None:
         """Record one transformed source point in the bounded scan manifest."""
 
         raw_point_id = point.get("id")
@@ -1773,7 +1777,6 @@ class QdrantMigration:
             fingerprint=fingerprint,
             terms=terms,
         )
-        return _acl_complete(transformed["payload"]), fingerprint
 
     def _scan_source(
         self,
@@ -1835,6 +1838,8 @@ class QdrantMigration:
         sparse_map_fingerprint: str,
         setup_complete: bool,
         acl_incomplete_count: int,
+        sparse_term_count: int,
+        sparse_term_fingerprint: str,
         migration_state: str = "building",
         source_count: int = 0,
         target_count: int = 0,
@@ -1865,6 +1870,8 @@ class QdrantMigration:
             "source_count": source_count,
             "target_count": target_count,
             "acl_incomplete_count": acl_incomplete_count,
+            "sparse_term_count": sparse_term_count,
+            "sparse_term_fingerprint": sparse_term_fingerprint,
             "schema": metadata.schema,
             "dense_vector_name": layout.dense_vector_name,
             "sparse_vector_name": layout.sparse_vector_name,
@@ -2067,6 +2074,8 @@ class QdrantMigration:
             "source_count",
             "target_count",
             "acl_incomplete_count",
+            "sparse_term_count",
+            "sparse_term_fingerprint",
             "schema",
             "dense_vector_name",
             "sparse_vector_name",
@@ -2127,7 +2136,7 @@ class QdrantMigration:
             raise MigrationError(
                 "target current marker migration_state and setup_complete disagree"
             )
-        for field_name in ("source_count", "target_count"):
+        for field_name in ("source_count", "target_count", "sparse_term_count"):
             value = marker.get(field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise MigrationError(
@@ -2147,6 +2156,10 @@ class QdrantMigration:
             raise MigrationError(
                 "target current marker has an invalid last_source_cursor"
             ) from exc
+        if marker["backfill_complete"] and cursor is not None:
+            raise MigrationError(
+                "target current marker has an inconsistent completion cursor"
+            )
         if not isinstance(marker.get("source_fingerprint"), str) or not marker["source_fingerprint"]:
             raise MigrationError(
                 "target current marker has no valid source fingerprint"
@@ -2161,6 +2174,13 @@ class QdrantMigration:
             or not marker["sparse_map_fingerprint"]
         ):
             raise MigrationError("target current marker has no valid sparse-map fingerprint")
+        if (
+            not isinstance(marker.get("sparse_term_fingerprint"), str)
+            or not marker["sparse_term_fingerprint"]
+        ):
+            raise MigrationError(
+                "target current marker has no valid sparse-term fingerprint"
+            )
         if not isinstance(marker.get("setup_complete"), bool):
             raise MigrationError("target current marker has an invalid setup_complete flag")
         acl_incomplete_count = marker.get("acl_incomplete_count")
@@ -3274,6 +3294,8 @@ class QdrantMigration:
                 sparse_map_fingerprint=current_plan.sparse_map_fingerprint,
                 setup_complete=False,
                 acl_incomplete_count=current_plan.acl_incomplete_count,
+                sparse_term_count=current_plan.sparse_term_count,
+                sparse_term_fingerprint=current_plan.sparse_term_fingerprint,
                 source_count=current_plan.source_count,
                 target_count=current_plan.target_count,
             )
@@ -3303,9 +3325,9 @@ class QdrantMigration:
                     "source_fingerprint": current_plan.source_fingerprint,
                     "source_count": current_plan.source_count,
                     "acl_incomplete_count": current_plan.acl_incomplete_count,
+                    "sparse_term_count": current_plan.sparse_term_count,
+                    "sparse_term_fingerprint": current_plan.sparse_term_fingerprint,
                     "target_count": current_plan.target_count,
-                    "last_source_cursor": None,
-                    "backfill_complete": False,
                 }
             )
             if updated != marker:
@@ -3657,7 +3679,6 @@ class QdrantMigration:
         plan: MigrationPlan,
         allow_acl_fail_open: bool = False,
         lock_held: bool = False,
-        _source_frozen: bool = False,
     ) -> dict[str, Any]:
         """Copy bounded source pages and durably advance the opaque cursor."""
 
@@ -3727,9 +3748,6 @@ class QdrantMigration:
                 if next_cursor is not None and _cursor_key(next_cursor) == _cursor_key(cursor):
                     raise MigrationError("Qdrant backfill repeated its page offset")
                 pending: list[dict[str, Any]] = []
-                page_fingerprints: list[str] = []
-                page_terms: set[str] = set()
-                page_acl_incomplete = 0
                 for point in page:
                     _, transformed, terms = self._transform_point(
                         point,
@@ -3740,16 +3758,12 @@ class QdrantMigration:
                         raise MigrationError(
                             f"point {point.get('id')!r} lacks complete ACL fields"
                         )
-                    acl_complete, fingerprint = self._record_source_point(
+                    self._record_source_point(
                         manifest,
                         point,
                         transformed=transformed,
                         terms=terms,
                     )
-                    page_fingerprints.append(fingerprint)
-                    page_terms.update(terms)
-                    if not acl_complete:
-                        page_acl_incomplete += 1
                     pending.append(transformed)
                     if len(pending) >= self.batch_size:
                         self._validate_sparse_terms(manifest.iter_sparse_terms())
@@ -3766,35 +3780,6 @@ class QdrantMigration:
                 if next_cursor is not None and not offsets.add(next_cursor):
                     raise MigrationError("Qdrant backfill repeated its page offset")
                 updated = dict(marker)
-                if not _source_frozen:
-                    if cursor is None:
-                        source_count = 0
-                        acl_incomplete_count = 0
-                        source_fingerprint = ""
-                        sparse_term_count = 0
-                        sparse_term_fingerprint = ""
-                    else:
-                        source_count = int(marker["source_count"])
-                        acl_incomplete_count = int(marker["acl_incomplete_count"])
-                        source_fingerprint = str(marker["source_fingerprint"])
-                        sparse_term_count = int(marker["sparse_term_count"])
-                        sparse_term_fingerprint = str(marker["sparse_term_fingerprint"])
-                    page_fingerprint = _fingerprint_values(page_fingerprints)
-                    source_fingerprint = _fingerprint_values(
-                        [source_fingerprint, page_fingerprint]
-                    )
-                    sparse_term_fingerprint = _fingerprint_values(
-                        [sparse_term_fingerprint, _fingerprint_values(page_terms)]
-                    )
-                    updated.update(
-                        {
-                            "source_count": source_count + len(page),
-                            "source_fingerprint": source_fingerprint,
-                            "acl_incomplete_count": acl_incomplete_count + page_acl_incomplete,
-                            "sparse_term_count": sparse_term_count + len(page_terms),
-                            "sparse_term_fingerprint": sparse_term_fingerprint,
-                        }
-                    )
                 updated.update(
                     {
                         "migration_state": "building",
@@ -3959,7 +3944,6 @@ class QdrantMigration:
                 plan=plan,
                 allow_acl_fail_open=allow_acl_fail_open,
                 lock_held=lock_held,
-                _source_frozen=True,
             )
             migrated = int(backfill_result["migrated_count"])
             skipped = int(backfill_result["skipped_count"])

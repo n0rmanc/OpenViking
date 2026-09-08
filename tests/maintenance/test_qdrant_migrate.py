@@ -627,6 +627,8 @@ def _add_current_marker(
         sparse_map_fingerprint=plan.sparse_map_fingerprint,
         setup_complete=migration_state in {"ready", "cutting_over", "active", "retained"},
         acl_incomplete_count=plan.acl_incomplete_count,
+        sparse_term_count=plan.sparse_term_count,
+        sparse_term_fingerprint=plan.sparse_term_fingerprint,
         migration_state=migration_state,
         source_count=plan.source_count,
         target_count=0,
@@ -654,6 +656,10 @@ def _mark_current_target_building(
     ]["payload"]
     marker["migration_state"] = "building"
     marker["setup_complete"] = False
+    # Model an explicit ready-to-building reconciliation window, not an
+    # interrupted apply whose durable backfill progress must be preserved.
+    marker["last_source_cursor"] = None
+    marker["backfill_complete"] = False
 
 
 def test_preflight_plan_is_compact_and_binds_identity() -> None:
@@ -985,6 +991,8 @@ def test_prepare_race_re_reads_409_and_accepts_only_same_migration_marker() -> N
                             sparse_map_fingerprint=plan.sparse_map_fingerprint,
                             setup_complete=False,
                             acl_incomplete_count=plan.acl_incomplete_count,
+                            sparse_term_count=plan.sparse_term_count,
+                            sparse_term_fingerprint=plan.sparse_term_fingerprint,
                             source_count=plan.source_count,
                             target_count=0,
                         ),
@@ -1045,6 +1053,8 @@ def test_prepare_rejects_rolled_back_creation_race() -> None:
                             setup_complete=False,
                             migration_state="rolled_back",
                             acl_incomplete_count=plan.acl_incomplete_count,
+                            sparse_term_count=plan.sparse_term_count,
+                            sparse_term_fingerprint=plan.sparse_term_fingerprint,
                             source_count=plan.source_count,
                             target_count=0,
                         ),
@@ -1537,6 +1547,52 @@ def test_backfill_rejects_malformed_or_repeated_cursor(monkeypatch) -> None:
         )
 
 
+def test_backfill_rejects_invalid_uuid_cursor(monkeypatch) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_backfill(qdrant, batch_size=1)
+    source_point = next(
+        iter(qdrant.collections[migration.source_collection]["points"].values())
+    )
+    original_scroll_page = migration._scroll_page
+
+    def malformed_uuid(collection, *, offset, with_vectors, filter=None):
+        if collection != migration.source_collection:
+            return original_scroll_page(
+                collection,
+                offset=offset,
+                with_vectors=with_vectors,
+                filter=filter,
+            )
+        return [copy.deepcopy(source_point)], "not-a-qdrant-uuid"
+
+    monkeypatch.setattr(migration, "_scroll_page", malformed_uuid)
+    with pytest.raises(MigrationError, match="UUID"):
+        migration.backfill(
+            confirm=True,
+            plan=plan,
+            allow_acl_fail_open=True,
+            lock_held=True,
+        )
+
+
+def test_backfill_rejects_completed_marker_with_cursor() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_backfill(qdrant, batch_size=1)
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    marker["backfill_complete"] = True
+    marker["last_source_cursor"] = 1
+
+    with pytest.raises(MigrationError, match="completion"):
+        migration.backfill(
+            confirm=True,
+            plan=plan,
+            allow_acl_fail_open=True,
+            lock_held=True,
+        )
+
+
 def test_failed_batch_can_be_retried_without_source_mutation(monkeypatch) -> None:
     qdrant = _legacy_fixture(sparse=False)
     migration, plan = _prepare_backfill(qdrant, batch_size=1)
@@ -1727,6 +1783,96 @@ def test_cross_page_duplicate_source_point_fails_closed(monkeypatch) -> None:
     ]["payload"]
     assert marker["last_source_cursor"] == 1
     assert marker["backfill_complete"] is False
+
+
+def test_backfill_preserves_canonical_observations_across_batch_boundaries() -> None:
+    qdrant = _legacy_fixture(sparse=True)
+    second = next(
+        point
+        for point in qdrant.collections["legacy__context"]["points"].values()
+        if point["payload"]["_openviking_original_id"]
+        == "550e8400-e29b-41d4-a716-446655440000"
+    )
+    second["vector"]["sparse_vector"] = {"indices": [111], "values": [0.3]}
+    migration = _migration(
+        qdrant,
+        sparse_map={111: "hello"},
+        batch_size=1,
+    )
+    plan = migration.preflight()
+    migration.prepare(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+    marker_before = copy.deepcopy(
+        qdrant.collections[migration.target_metadata_collection]["points"][
+            to_qdrant_point_id("openviking:metadata")
+        ]["payload"]
+    )
+
+    migration.backfill(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+
+    marker_after = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    for field_name in (
+        "source_count",
+        "source_fingerprint",
+        "acl_incomplete_count",
+        "sparse_term_count",
+        "sparse_term_fingerprint",
+    ):
+        assert marker_after[field_name] == marker_before[field_name] == plan.to_dict()[
+            field_name
+        ]
+
+
+def test_apply_resumes_from_persisted_backfill_cursor(monkeypatch) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant, batch_size=1)
+    plan = migration.preflight()
+    original_upsert = migration._upsert_target_batch
+    calls = 0
+
+    def fail_second_batch(points):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise MigrationError("simulated failed apply batch")
+        return original_upsert(points)
+
+    monkeypatch.setattr(migration, "_upsert_target_batch", fail_second_batch)
+    with pytest.raises(MigrationError, match="simulated failed apply batch"):
+        migration.apply(
+            confirm=True,
+            plan=plan,
+            allow_acl_fail_open=True,
+            lock_held=True,
+        )
+
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    assert marker["last_source_cursor"] == 1
+    assert marker["backfill_complete"] is False
+
+    monkeypatch.setattr(migration, "_upsert_target_batch", original_upsert)
+    result = migration.apply(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+
+    assert result.migrated_count == 1
+    assert result.target_count == 2
 
 
 def test_target_count_must_match_pagination() -> None:
