@@ -189,6 +189,10 @@ class _ScanManifest:
                 target_id TEXT PRIMARY KEY,
                 original_id TEXT
             );
+            CREATE TABLE target_logical_points (
+                logical_id TEXT PRIMARY KEY,
+                target_id TEXT NOT NULL
+            );
             """
         )
 
@@ -261,10 +265,30 @@ class _ScanManifest:
         )
 
     def add_target(self, point_id: Any, original_id: Any) -> None:
+        if original_id is None or str(original_id) == "":
+            raise MigrationError(
+                f"target point {point_id!r} is missing {_ORIGINAL_ID_FIELD}"
+            )
+        logical_id = str(original_id)
+        try:
+            self._connection.execute(
+                "INSERT INTO target_logical_points(logical_id, target_id) VALUES (?, ?)",
+                (logical_id, str(point_id)),
+            )
+        except sqlite3.IntegrityError as exc:
+            existing = self._connection.execute(
+                "SELECT target_id FROM target_logical_points WHERE logical_id = ?",
+                (logical_id,),
+            ).fetchone()
+            previous = existing[0] if existing else "<unknown>"
+            raise MigrationError(
+                "target contains duplicate logical record id "
+                f"{logical_id!r}: targets={previous!r},{point_id!r}"
+            ) from exc
         try:
             self._connection.execute(
                 "INSERT INTO target_points(target_id, original_id) VALUES (?, ?)",
-                (str(point_id), None if original_id is None else str(original_id)),
+                (str(point_id), logical_id),
             )
         except sqlite3.IntegrityError as exc:
             raise MigrationError(
@@ -568,6 +592,8 @@ def _finite_vector(value: Any, *, field_name: str, dimension: int | None = None)
             f"{field_name} dimension mismatch: expected {dimension}, got {len(value)}"
         )
     try:
+        if any(isinstance(item, bool) for item in value):
+            raise TypeError("boolean vector element")
         vector = [float(item) for item in value]
     except (TypeError, ValueError) as exc:
         raise MigrationError(f"{field_name} contains a non-numeric value") from exc
@@ -578,6 +604,8 @@ def _finite_vector(value: Any, *, field_name: str, dimension: int | None = None)
 
 def _canonical_float32(value: Any, *, field_name: str) -> float:
     try:
+        if isinstance(value, bool):
+            raise TypeError("boolean vector element")
         numeric = float(value)
         canonical = struct.unpack("!f", struct.pack("!f", numeric))[0]
     except (OverflowError, TypeError, ValueError, struct.error) as exc:
@@ -683,6 +711,27 @@ def _acl_complete(payload: Mapping[str, Any]) -> bool:
     return True
 
 
+def _typed_equal(left: Any, right: Any) -> bool:
+    """Compare payload JSON values without treating booleans as integers."""
+
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, Mapping) or isinstance(right, Mapping):
+        if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+            return False
+        if set(left) != set(right):
+            return False
+        return all(_typed_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list) or isinstance(right, list):
+        if not isinstance(left, list) or not isinstance(right, list):
+            return False
+        return len(left) == len(right) and all(
+            _typed_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    return left == right
+
+
 def _normalize_owner_user_id(
     payload: dict[str, Any],
     *,
@@ -719,7 +768,8 @@ def _assert_security_payload(
         expected_present = field_name in expected_payload
         actual_present = field_name in payload
         if expected_present != actual_present or (
-            expected_present and payload[field_name] != expected_payload[field_name]
+            expected_present
+            and not _typed_equal(payload[field_name], expected_payload[field_name])
         ):
             label = "ACL field" if field_name in _ACL_FIELDS else "security field"
             raise MigrationError(
@@ -3880,6 +3930,72 @@ class QdrantMigration:
                     f"target point {point.get('id')!r} sparse vector {name!r} differs"
                 )
 
+    def _verify_point_pair(
+        self,
+        source_point: Mapping[str, Any],
+        target_point: Mapping[str, Any],
+        schema: Mapping[str, Any],
+        layout: CollectionLayout,
+        allow_acl_fail_open: bool,
+    ) -> None:
+        """Compare one transformed source point with its target point exactly."""
+
+        source_payload = source_point.get("payload")
+        if not isinstance(source_payload, Mapping):
+            raise MigrationError(
+                f"source point {source_point.get('id')!r} has an invalid payload"
+            )
+        if "uri_depth" in source_payload and "scope_roots" in source_payload:
+            expected = {
+                "id": source_point.get("id"),
+                "vector": source_point.get("vector", source_point.get("vectors")),
+                "payload": dict(source_payload),
+            }
+        else:
+            _, expected, _ = self._transform_point(
+                source_point,
+                layout=layout,
+                schema=schema,
+            )
+
+        expected_id = expected.get("id")
+        actual_id = target_point.get("id")
+        if actual_id is None or expected_id is None or str(actual_id) != str(expected_id):
+            raise MigrationError(
+                f"target point {actual_id!r} has the wrong target id; "
+                f"expected={expected_id!r}"
+            )
+        expected_payload = expected.get("payload")
+        actual_payload = target_point.get("payload")
+        if not isinstance(expected_payload, Mapping) or not isinstance(
+            actual_payload, Mapping
+        ):
+            raise MigrationError(
+                f"target point {actual_id!r} has an invalid payload"
+            )
+        original_id = actual_payload.get(_ORIGINAL_ID_FIELD)
+        expected_original_id = expected_payload.get(_ORIGINAL_ID_FIELD)
+        if original_id is None or expected_original_id is None:
+            raise MigrationError(
+                f"target point {actual_id!r} is missing {_ORIGINAL_ID_FIELD}"
+            )
+        if str(original_id) != str(expected_original_id):
+            raise MigrationError(
+                f"target point {actual_id!r} has the wrong original id"
+            )
+        self._validate_target_payload(
+            actual_payload,
+            expected_payload,
+            schema=schema,
+            allow_acl_fail_open=allow_acl_fail_open,
+            point_id=str(actual_id),
+        )
+        if not _typed_equal(actual_payload, expected_payload):
+            raise MigrationError(
+                f"target point {actual_id!r} payload differs from copied source"
+            )
+        self._assert_target_vectors(target_point, expected, exact=True)
+
     def _validate_final_target(
         self,
         *,
@@ -3916,31 +4032,13 @@ class QdrantMigration:
                             raise MigrationError(
                                 f"target records differ after copy: missing={target_id!r}"
                             )
-                        payload = actual.get("payload")
-                        expected_payload = expected.get("payload")
-                        if not isinstance(payload, Mapping) or not isinstance(
-                            expected_payload, Mapping
-                        ):
-                            raise MigrationError(
-                                f"target point {target_id!r} has an invalid payload"
-                            )
-                        if str(payload.get(_ORIGINAL_ID_FIELD)) != str(
-                            expected_payload.get(_ORIGINAL_ID_FIELD)
-                        ):
-                            raise MigrationError(
-                                f"target point {target_id!r} has the wrong original id"
-                            )
-                        self._validate_target_payload(
-                            payload,
-                            expected_payload,
+                        self._verify_point_pair(
+                            expected,
+                            actual,
                             schema=schema,
+                            layout=layout,
                             allow_acl_fail_open=allow_acl_fail_open,
-                            point_id=target_id,
                         )
-                        if payload != expected_payload:
-                            raise MigrationError(
-                                f"target point {target_id!r} payload differs from copied source"
-                            )
                         self._assert_target_vectors(
                             actual,
                             expected,
@@ -3965,6 +4063,11 @@ class QdrantMigration:
                 if (
                     actual_source.source_count != source.source_count
                     or actual_source.fingerprint != source.fingerprint
+                    or actual_source.acl_incomplete_count
+                    != source.acl_incomplete_count
+                    or actual_source.sparse_term_count != source.sparse_term_count
+                    or actual_source.sparse_term_fingerprint
+                    != source.sparse_term_fingerprint
                 ):
                     raise MigrationError("source changed final verification")
                 if pending:
@@ -4025,10 +4128,211 @@ class QdrantMigration:
                 f"target point {point_id!r} owner_user_id does not match uri"
             )
 
+        expected_acl_fields = _ACL_FIELDS & set(expected_payload)
+        actual_acl_fields = _ACL_FIELDS & set(payload)
+        if (
+            len(expected_acl_fields) == len(_ACL_FIELDS)
+            and not _acl_complete(expected_payload)
+        ) or (
+            len(actual_acl_fields) == len(_ACL_FIELDS) and not _acl_complete(payload)
+        ):
+            raise MigrationError(f"target point {point_id!r} has malformed ACL fields")
         if not _acl_complete(expected_payload) and not allow_acl_fail_open:
             raise MigrationError(
                 f"target point {point_id!r} lacks complete ACL fields"
             )
+
+    def _verify_target_marker(
+        self,
+        marker: Mapping[str, Any],
+        *,
+        expected_state: str | None = None,
+    ) -> None:
+        """Validate marker ownership and the requested state without writing."""
+
+        if not isinstance(marker, Mapping):
+            raise MigrationError("target current marker is malformed")
+        self._validate_marker_ownership(marker)
+        state = marker.get("migration_state")
+        if expected_state is not None and state != expected_state:
+            raise MigrationError(
+                f"target current marker must be {expected_state!r}; got {state!r}"
+            )
+        if state == "rolled_back" and marker.get("setup_complete") is True:
+            raise MigrationError("rolled_back target cannot be serving-ready")
+
+    def verify(
+        self,
+        *,
+        plan: MigrationPlan,
+        allow_acl_fail_open: bool = False,
+        final: bool = False,
+        confirm: bool = False,
+        lock_held: bool = False,
+    ) -> dict[str, Any]:
+        """Stream an exact source/target audit and publish readiness once."""
+
+        if not isinstance(plan, MigrationPlan):
+            raise MigrationError("verify requires a reviewed migration plan")
+        self._assert_prepare_plan_identity(plan)
+        layout = self._layout_from_plan(plan)
+        metadata = self._legacy_metadata()
+        self._validate_source_metadata_layout(metadata.schema, layout)
+        metadata_fingerprint = _metadata_fingerprint(metadata)
+        sparse_map_fingerprint = _sparse_map_fingerprint(self._sparse_map)
+        if metadata_fingerprint != plan.metadata_fingerprint:
+            raise MigrationError(
+                "legacy metadata fingerprint differs from the reviewed plan"
+            )
+        if sparse_map_fingerprint != plan.sparse_map_fingerprint:
+            raise MigrationError(
+                "authoritative sparse map fingerprint differs from the reviewed plan"
+            )
+
+        marker = self._load_current_marker()
+        if marker is None:
+            raise MigrationError("verify requires an owned target marker")
+        self._verify_target_marker(
+            marker,
+            expected_state="cutting_over" if final else None,
+        )
+        state = marker["migration_state"]
+        if final:
+            if marker.get("setup_complete") is not True:
+                raise MigrationError(
+                    "final verify requires a cutting_over target with setup_complete=true"
+                )
+            if not confirm:
+                raise MigrationError(
+                    "final verify requires explicit confirm=True / --confirm"
+                )
+            if not lock_held:
+                raise MigrationError(
+                    "final verify requires external source lock acknowledgement via "
+                    "lock_held=True / --lock-held"
+                )
+        elif state == "cutting_over":
+            raise MigrationError(
+                "cutting_over verification requires final=True"
+            )
+        elif state == "building":
+            if not confirm:
+                raise MigrationError(
+                    "verify requires explicit confirm=True / --confirm when "
+                    "publishing ready"
+                )
+            if not lock_held:
+                raise MigrationError(
+                    "verify requires external source lock acknowledgement via "
+                    "lock_held=True / --lock-held when publishing ready"
+                )
+        elif state not in {"ready", "failed", "active", "retained", "rolled_back"}:
+            raise MigrationError(f"verify does not support target state {state!r}")
+
+        self._validate_metadata_layout(self.target_metadata_collection)
+        target_info = self._collection_info(self.target_collection)
+        self._validate_existing_target(
+            target_info=target_info,
+            marker=marker,
+            layout=layout,
+            metadata=metadata,
+        )
+        expected_payload_fields = set(
+            self._expected_payload_indexes(
+                metadata.schema,
+                metadata.indexes,
+            )
+        )
+        self._wait_collection_ready(
+            self.target_collection,
+            payload_fields=expected_payload_fields,
+        )
+        self._wait_collection_ready(self.target_metadata_collection)
+        self._validate_payload_indexes(metadata.schema, metadata.indexes)
+        self._assert_sparse_dictionary_complete(self._sparse_map.values())
+
+        marker_source = SourceSnapshot(
+            source_count=marker["source_count"],
+            fingerprint=marker["source_fingerprint"],
+            acl_incomplete_count=marker["acl_incomplete_count"],
+            sparse_term_count=marker["sparse_term_count"],
+            sparse_term_fingerprint=marker["sparse_term_fingerprint"],
+        )
+        target_count = self._validate_final_target(
+            source=marker_source,
+            layout=layout,
+            schema=metadata.schema,
+            allow_acl_fail_open=allow_acl_fail_open,
+        )
+
+        current = self._load_current_marker()
+        if current is None:
+            raise MigrationError("target current marker disappeared during verify")
+        self._verify_target_marker(
+            current,
+            expected_state="cutting_over" if final else state,
+        )
+        if (
+            current.get("metadata_fingerprint") != metadata_fingerprint
+            or current.get("sparse_map_fingerprint") != sparse_map_fingerprint
+            or current.get("source_count") != marker_source.source_count
+            or current.get("source_fingerprint") != marker_source.fingerprint
+            or current.get("acl_incomplete_count")
+            != marker_source.acl_incomplete_count
+            or current.get("sparse_term_count") != marker_source.sparse_term_count
+            or current.get("sparse_term_fingerprint")
+            != marker_source.sparse_term_fingerprint
+        ):
+            raise MigrationError("target marker changed during verification")
+
+        result_state = state
+        if state == "building" and not final:
+            updated = dict(current)
+            updated.update(
+                {
+                    "migration_state": "ready",
+                    "setup_complete": True,
+                    "target_count": target_count,
+                    "verification_complete": True,
+                    "verified_source_fingerprint": marker_source.fingerprint,
+                }
+            )
+            self._write_marker(updated)
+            result_state = "ready"
+        elif final:
+            updated = dict(current)
+            updated.update(
+                {
+                    "migration_state": "cutting_over",
+                    "setup_complete": True,
+                    "target_count": target_count,
+                    "verification_complete": True,
+                    "verified_source_fingerprint": marker_source.fingerprint,
+                }
+            )
+            self._write_marker(updated)
+            result_state = "cutting_over"
+
+        verified = self._load_current_marker()
+        if verified is None:
+            raise MigrationError("target current marker disappeared after verify")
+        try:
+            self._verify_target_marker(verified, expected_state=result_state)
+        except MigrationError as exc:
+            raise MigrationError(
+                f"target completion marker was not persisted: {exc}"
+            ) from exc
+        if verified.get("setup_complete") is not (
+            result_state in {"ready", "cutting_over", "active", "retained"}
+        ):
+            raise MigrationError("target verification marker has an invalid setup gate")
+        return {
+            "source_count": marker_source.source_count,
+            "target_count": target_count,
+            "target_collection": self.target_collection,
+            "migration_state": result_state,
+            "verification_complete": True,
+        }
 
     @staticmethod
     def _assert_marker_fingerprints(
@@ -4332,41 +4636,13 @@ class QdrantMigration:
                 raise MigrationError(
                     "legacy metadata changed during apply; rerun preflight with writes frozen"
                 )
-            self._wait_collection_ready(self.target_collection)
-            target_count = self._validate_final_target(
-                source=source,
-                layout=layout,
-                schema=metadata.schema,
+            verification = self.verify(
+                plan=plan,
                 allow_acl_fail_open=allow_acl_fail_open,
+                confirm=confirm,
+                lock_held=lock_held,
             )
-            marker_after_backfill = self._load_current_marker()
-            if marker_after_backfill is None:
-                raise MigrationError("target marker disappeared after backfill")
-            self._validate_owned_prepare_marker(
-                marker=marker_after_backfill,
-                layout=layout,
-                metadata=metadata,
-            )
-            self._validate_existing_target(
-                target_info=self._collection_info(self.target_collection),
-                marker=marker_after_backfill,
-                layout=layout,
-                metadata=metadata,
-            )
-            final_marker = self._load_current_marker()
-            if final_marker is None:
-                raise MigrationError("target marker disappeared before completion")
-            self._assert_marker_fingerprints(final_marker, plan)
-            self._assert_source_layout(layout, phase="completion")
-            marker_complete = dict(final_marker)
-            marker_complete["setup_complete"] = True
-            marker_complete["migration_state"] = "ready"
-            marker_complete["target_count"] = target_count
-            self._write_marker(marker_complete)
-            completed_marker = self._load_current_marker()
-            if completed_marker is None or completed_marker.get("setup_complete") is not True:
-                raise MigrationError("target completion marker was not persisted")
-            self._assert_marker_fingerprints(completed_marker, plan)
+            target_count = int(verification["target_count"])
         except Exception:
             raise
 

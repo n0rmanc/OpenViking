@@ -3435,3 +3435,191 @@ def test_all_migration_collection_names_must_be_distinct() -> None:
             logical_collection="legacy/context",
             migration_id="mig-1",
         )
+
+
+def _set_marker_state(qdrant: FakeQdrant, migration: QdrantMigration, state: str) -> None:
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    marker["migration_state"] = state
+    marker["setup_complete"] = state in {"ready", "cutting_over", "active", "retained"}
+
+
+def test_verify_detects_dense_vector_value_mismatch_even_when_fingerprint_matches() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_reconcile(qdrant)
+    target_id = to_qdrant_point_id("1")
+    qdrant.collections[migration.target_collection]["points"][str(target_id)]["vector"][
+        "vector"
+    ] = [9.0, 9.0]
+
+    with pytest.raises(MigrationError, match="vector"):
+        migration.verify(
+            plan=plan,
+            allow_acl_fail_open=True,
+            confirm=True,
+            lock_held=True,
+        )
+
+
+def test_verify_detects_sparse_vector_value_and_name_mismatch() -> None:
+    qdrant = _legacy_fixture(sparse=True)
+    migration = _migration(qdrant, sparse_map={111: "hello", 222: "world"})
+    plan = migration.preflight()
+    migration.prepare(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+    migration.backfill(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+    target_id = to_qdrant_point_id("1")
+    target_vector = qdrant.collections[migration.target_collection]["points"][str(target_id)][
+        "vector"
+    ]
+    target_vector["sparse_vector"]["values"] = [0.8]
+
+    with pytest.raises(MigrationError, match="sparse vector"):
+        migration.verify(
+            plan=plan,
+            allow_acl_fail_open=True,
+            confirm=True,
+            lock_held=True,
+        )
+
+    target_vector["sparse_vector"] = target_vector.pop("sparse_vector")
+    target_vector["other_sparse"] = target_vector.pop("sparse_vector")
+    with pytest.raises(MigrationError, match="vector names"):
+        migration.verify(
+            plan=plan,
+            allow_acl_fail_open=True,
+            confirm=True,
+            lock_held=True,
+        )
+
+
+def test_verify_detects_payload_and_acl_mismatch() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    for point in qdrant.collections["legacy__context"]["points"].values():
+        point["payload"].update(
+            {
+                "acl_enabled": False,
+                "acl_direct_grants": [],
+                "acl_inherited_grants": [],
+            }
+        )
+    migration, plan = _prepare_reconcile(qdrant)
+    target_id = to_qdrant_point_id("1")
+    target_payload = qdrant.collections[migration.target_collection]["points"][str(target_id)][
+        "payload"
+    ]
+    target_payload["acl_enabled"] = 1
+
+    with pytest.raises(MigrationError, match="ACL"):
+        migration.verify(
+            plan=plan,
+            allow_acl_fail_open=True,
+            confirm=True,
+            lock_held=True,
+        )
+
+
+def test_verify_detects_target_extra_and_missing_id() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_reconcile(qdrant)
+    points = qdrant.collections[migration.target_collection]["points"]
+    points.pop(str(to_qdrant_point_id("1")))
+    points["extra"] = copy.deepcopy(next(iter(points.values())))
+    points["extra"]["id"] = "extra"
+
+    with pytest.raises(MigrationError, match="target"):
+        migration.verify(
+            plan=plan,
+            allow_acl_fail_open=True,
+            confirm=True,
+            lock_held=True,
+        )
+
+
+def test_verify_requires_matching_indexes_metadata_and_marker_layout() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_reconcile(qdrant)
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    marker["indexes"]["default"]["Description"] = "tampered"
+
+    with pytest.raises(MigrationError, match="index"):
+        migration.verify(
+            plan=plan,
+            allow_acl_fail_open=True,
+            confirm=True,
+            lock_held=True,
+        )
+
+
+def test_non_cutover_verify_changes_building_to_ready() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_reconcile(qdrant)
+
+    result = migration.verify(
+        plan=plan,
+        allow_acl_fail_open=True,
+        confirm=True,
+        lock_held=True,
+    )
+
+    assert result["migration_state"] == "ready"
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    assert marker["migration_state"] == "ready"
+    assert marker["setup_complete"] is True
+
+
+def test_final_verify_does_not_reset_cutting_over_to_ready() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_reconcile(qdrant)
+    _set_marker_state(qdrant, migration, "cutting_over")
+
+    result = migration.verify(
+        plan=plan,
+        allow_acl_fail_open=True,
+        final=True,
+        confirm=True,
+        lock_held=True,
+    )
+
+    assert result["migration_state"] == "cutting_over"
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    assert marker["migration_state"] == "cutting_over"
+    assert marker["setup_complete"] is True
+
+
+@pytest.mark.parametrize("state", ["active", "retained", "rolled_back"])
+def test_active_retained_and_rolled_back_targets_reject_mutating_reruns(state: str) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    _set_marker_state(qdrant, migration, state)
+    plan = migration.preflight()
+    marker_before = copy.deepcopy(
+        qdrant.collections[migration.target_metadata_collection]["points"][
+            to_qdrant_point_id("openviking:metadata")
+        ]["payload"]
+    )
+
+    result = migration.verify(plan=plan, allow_acl_fail_open=True)
+
+    assert result["migration_state"] == state
+    marker_after = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    assert marker_after == marker_before
