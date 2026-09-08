@@ -4,6 +4,7 @@ import copy
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import unquote, urlsplit
@@ -18,6 +19,7 @@ from scripts.maintenance.qdrant_migrate import (
     MigrationError,
     QdrantMigration,
     SparseMigrationError,
+    _fingerprint_values,
     _legacy_collection_metadata_id,
     _legacy_index_metadata_id,
     _load_plan,
@@ -734,6 +736,38 @@ def test_preflight_plan_is_compact_and_binds_identity() -> None:
     assert "payloads" not in value
     assert "url" not in value
     assert "api_key" not in value
+
+
+def test_fingerprint_manifest_digest_does_not_materialize_ordered_rows(
+    monkeypatch,
+) -> None:
+    class NoSort:
+        def __iter__(self):
+            yield from ("a", "b", "c")
+
+    monkeypatch.setattr(
+        "scripts.maintenance.qdrant_migrate.sorted",
+        lambda _values: (_ for _ in ()).throw(AssertionError("sorted called")),
+        raising=False,
+    )
+    assert _fingerprint_values(NoSort(), ordered=True)
+
+
+def test_cli_help_describes_online_barrier_split() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).parents[2] / "scripts" / "maintenance" / "qdrant_migrate.py"),
+            "--help",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0
+    help_text = completed.stdout
+    assert "offline" in help_text
+    assert "barrier-held" in help_text
 
 
 def test_foreign_target_marker_is_rejected() -> None:
@@ -3032,6 +3066,74 @@ def test_acl_incomplete_records_require_explicit_acknowledgement() -> None:
         _apply(_migration(qdrant), confirm=True)
 
     assert "current__context" not in qdrant.collections
+
+
+def test_malformed_acl_records_complete_with_explicit_acknowledgement() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    for point in qdrant.collections["legacy__context"]["points"].values():
+        point["payload"].update(
+            {
+                "acl_enabled": True,
+                "acl_direct_grants": ["not-an-acl-token"],
+                "acl_inherited_grants": [],
+            }
+        )
+    migration = _migration(qdrant)
+    plan = migration.preflight()
+    assert plan.acl_incomplete_count == 2
+    with pytest.raises(MigrationError, match="ACL"):
+        migration.apply(confirm=True, plan=plan, lock_held=True)
+
+    result = migration.apply(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+    assert result.target_count == 2
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    assert marker["acl_incomplete_count"] == 2
+
+
+def test_malformed_logical_id_types_fail_before_target_mutation() -> None:
+    for malformed in (True, 1.5, [], {}):
+        qdrant = _legacy_fixture(sparse=False)
+        qdrant.collections["legacy__context"]["points"]["1"]["payload"][
+            "_openviking_original_id"
+        ] = malformed
+        with pytest.raises(MigrationError, match="logical ID"):
+            _migration(qdrant).preflight()
+        assert "current__context" not in qdrant.collections
+
+
+def test_logical_id_uint64_boundaries_remain_supported() -> None:
+    for logical_id in (0, 2**64 - 1, "550e8400-e29b-41d4-a716-446655440001"):
+        qdrant = _legacy_fixture(sparse=False)
+        source = qdrant.collections["legacy__context"]["points"]["1"]
+        source["payload"]["_openviking_original_id"] = logical_id
+        source["id"] = logical_id if isinstance(logical_id, int) else logical_id
+        plan = _migration(qdrant).preflight()
+        assert plan.source_count == 2
+
+
+def test_reconcile_persists_independent_content_receipts_before_verify() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_reconcile(qdrant)
+    result = migration.reconcile(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    assert result["migration_state"] == "building"
+    assert marker["transformed_source_fingerprint"]
+    assert marker["target_content_fingerprint"]
+    assert marker["transformed_source_fingerprint"] == marker["target_content_fingerprint"]
 
 
 def test_source_mutation_between_preflight_and_apply_is_rejected(monkeypatch) -> None:

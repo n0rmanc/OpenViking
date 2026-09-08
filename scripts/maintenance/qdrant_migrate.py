@@ -7,9 +7,11 @@ collection receives current-format metadata and records.  It is safe to
 re-run after an interrupted copy; points that already belong to the same
 logical record are retained rather than overwritten.
 
-Freeze writes to the source collection and legacy metadata sidecar during the
-copy, keep them for rollback/audit, and perform any application cutover
-separately.  The pre-#3872 global metadata sidecar defaults to
+The offline ``apply`` phase requires a frozen source compatibility window;
+online ``prepare``/``backfill``/``reconcile`` phases keep legacy serving
+available and only the final barrier-held reconcile/verify and cutover require
+a short write barrier.  Keep the source for rollback/audit and perform any
+application cutover separately.  The pre-#3872 global metadata sidecar defaults to
 ``__openviking_meta``; pass an override when the old deployment used a
 different sidecar name.  Missing ``owner_user_id`` values are derived from
 user-scoped URIs when possible; ownerless roots remain ownerless.  ACL fields
@@ -166,6 +168,9 @@ class SourceSnapshot:
     acl_incomplete_count: int
     sparse_term_count: int
     sparse_term_fingerprint: str
+    transformed_source_fingerprint: str = ""
+    target_content_fingerprint: str = ""
+    target_count: int = 0
 
 
 class _ScanManifest:
@@ -318,22 +323,6 @@ class _ScanManifest:
                 f"target pagination returned duplicate point id {point_id!r}"
             ) from exc
 
-    def target_original(self, target_id: str) -> str | None:
-        row = self._connection.execute(
-            "SELECT original_id FROM target_points WHERE target_id = ?",
-            (target_id,),
-        ).fetchone()
-        return row[0] if row is not None else None
-
-    def has_target(self, target_id: str) -> bool:
-        return (
-            self._connection.execute(
-                "SELECT 1 FROM target_points WHERE target_id = ?",
-                (target_id,),
-            ).fetchone()
-            is not None
-        )
-
     def has_source_target(self, target_id: str) -> bool:
         return (
             self._connection.execute(
@@ -346,6 +335,12 @@ class _ScanManifest:
     def delete_target(self, target_id: str) -> None:
         self._connection.execute(
             "UPDATE target_points SET matched = 1 WHERE target_id = ?",
+            (target_id,),
+        )
+
+    def remove_target(self, target_id: str) -> None:
+        self._connection.execute(
+            "DELETE FROM target_points WHERE target_id = ?",
             (target_id,),
         )
 
@@ -383,7 +378,10 @@ class _ScanManifest:
         rows = self._connection.execute(
             "SELECT fingerprint FROM source_targets ORDER BY fingerprint"
         )
-        return _fingerprint_values(str(fingerprint) for (fingerprint,) in rows)
+        return _fingerprint_values(
+            (str(fingerprint) for (fingerprint,) in rows),
+            ordered=True,
+        )
 
     def transformed_source_fingerprint(self) -> str:
         rows = self._connection.execute(
@@ -393,7 +391,10 @@ class _ScanManifest:
             ORDER BY content_fingerprint
             """
         )
-        return _fingerprint_values(str(fingerprint) for (fingerprint,) in rows)
+        return _fingerprint_values(
+            (str(fingerprint) for (fingerprint,) in rows),
+            ordered=True,
+        )
 
     def target_content_fingerprint(self) -> str:
         rows = self._connection.execute(
@@ -404,11 +405,16 @@ class _ScanManifest:
             ORDER BY content_fingerprint
             """
         )
-        fingerprints = [str(fingerprint) for (fingerprint,) in rows]
         expected = self._connection.execute("SELECT COUNT(*) FROM target_points").fetchone()
-        if expected is None or len(fingerprints) != int(expected[0]):
+        complete = self._connection.execute(
+            "SELECT COUNT(*) FROM target_points WHERE content_fingerprint IS NOT NULL"
+        ).fetchone()
+        if expected is None or complete is None or int(complete[0]) != int(expected[0]):
             raise MigrationError("target content fingerprint is incomplete")
-        return _fingerprint_values(fingerprints)
+        return _fingerprint_values(
+            (str(fingerprint) for (fingerprint,) in rows),
+            ordered=True,
+        )
 
     def sparse_term_count(self) -> int:
         row = self._connection.execute("SELECT COUNT(*) FROM sparse_terms").fetchone()
@@ -416,15 +422,23 @@ class _ScanManifest:
 
     def sparse_term_fingerprint(self) -> str:
         rows = self._connection.execute("SELECT term FROM sparse_terms ORDER BY term")
-        return _fingerprint_values(str(term) for (term,) in rows)
+        return _fingerprint_values(
+            (str(term) for (term,) in rows),
+            ordered=True,
+        )
 
 
 class _SparseDictionaryManifest:
     """Disk-backed target sparse term/index bindings for one bounded scan."""
 
     def __init__(self) -> None:
-        self._manifest = _ScanManifest()
-        self._connection = self._manifest.connection
+        descriptor, self._path = tempfile.mkstemp(
+            prefix="openviking-qdrant-sparse-",
+            suffix=".sqlite3",
+        )
+        os.close(descriptor)
+        self._connection = sqlite3.connect(self._path)
+        self._connection.execute("PRAGMA journal_mode=DELETE")
         self._connection.execute(
             """
             CREATE TABLE sparse_dictionary (
@@ -443,7 +457,13 @@ class _SparseDictionaryManifest:
         )
 
     def close(self) -> None:
-        self._manifest.close()
+        try:
+            self._connection.close()
+        finally:
+            try:
+                os.unlink(self._path)
+            except FileNotFoundError:
+                pass
 
     def __enter__(self) -> "_SparseDictionaryManifest":
         return self
@@ -691,10 +711,11 @@ def _point_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _fingerprint_values(values: Iterable[str]) -> str:
+def _fingerprint_values(values: Iterable[str], *, ordered: bool = False) -> str:
     digest = hashlib.sha256()
     first = True
-    for value in sorted(values):
+    iterable = values if ordered else sorted(values)
+    for value in iterable:
         if not first:
             digest.update(b"\n")
         digest.update(str(value).encode("utf-8"))
@@ -816,8 +837,19 @@ def _sparse_map_fingerprint(sparse_map: Mapping[int, str]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _validate_legacy_logical_id(value: Any) -> int | str:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise MigrationError("legacy logical ID must be a uint64 integer or non-empty string")
+    if isinstance(value, int) and not 0 <= value <= _LEGACY_UINT64_MAX:
+        raise MigrationError(f"legacy logical ID integer is outside uint64 range: {value!r}")
+    if isinstance(value, str) and not value:
+        raise MigrationError("legacy logical ID must not be empty")
+    return value
+
+
 def _legacy_qdrant_point_id(value: Any) -> Any:
-    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _LEGACY_UINT64_MAX:
+    value = _validate_legacy_logical_id(value)
+    if isinstance(value, int):
         return value
     value_string = str(value)
     try:
@@ -1902,6 +1934,7 @@ class QdrantMigration:
             raise MigrationError(
                 f"point {point.get('id')!r} is missing {_ORIGINAL_ID_FIELD} (original id)"
             )
+        _validate_legacy_logical_id(original_id)
         logical_id = str(original_id)
         source_keys = set(payload)
         payload[_ORIGINAL_ID_FIELD] = logical_id
@@ -2612,6 +2645,7 @@ class QdrantMigration:
     def _delete_points(self, collection: str, point_ids: list[str]) -> None:
         if not point_ids:
             return
+        self._assert_owned_target_mutation(collection)
         self._request(
             "POST",
             self._path(collection, "/points/delete"),
@@ -2666,7 +2700,7 @@ class QdrantMigration:
             self._write_sparse_dictionary(self._sparse_map.values())
 
             pending_deletes: list[str] = []
-            for point in self._scroll(self.target_collection, with_vectors=False):
+            for point in self._scroll(self.target_collection, with_vectors=True):
                 point_id = point.get("id")
                 if point_id is None:
                     raise MigrationError("target collection contains a point without an id")
@@ -2679,6 +2713,7 @@ class QdrantMigration:
                     raise MigrationError(
                         f"target point {point_id!r} is missing {_ORIGINAL_ID_FIELD}"
                     )
+                scan.add_target(point_id, original_id)
                 expected_id = str(to_qdrant_point_id(str(original_id)))
                 if expected_id != point_id:
                     raise MigrationError(
@@ -2692,17 +2727,35 @@ class QdrantMigration:
                             self.target_collection,
                             pending_deletes,
                         )
+                        for deleted_id in pending_deletes:
+                            scan.remove_target(deleted_id)
                         stats["deleted_count"] += len(pending_deletes)
                         pending_deletes.clear()
+                else:
+                    scan.set_target_content_fingerprint(
+                        point_id,
+                        _canonical_point_content_fingerprint(point),
+                    )
             if pending_deletes:
                 self._delete_points(
                     self.target_collection,
                     pending_deletes,
                 )
+                for deleted_id in pending_deletes:
+                    scan.remove_target(deleted_id)
                 stats["deleted_count"] += len(pending_deletes)
 
             self._reconcile_last_stats = stats
-            return source
+            return SourceSnapshot(
+                source_count=source.source_count,
+                fingerprint=source.fingerprint,
+                acl_incomplete_count=source.acl_incomplete_count,
+                sparse_term_count=source.sparse_term_count,
+                sparse_term_fingerprint=source.sparse_term_fingerprint,
+                transformed_source_fingerprint=scan.transformed_source_fingerprint(),
+                target_content_fingerprint=scan.target_content_fingerprint(),
+                target_count=self._count(self.target_collection),
+            )
 
     def reconcile(
         self,
@@ -2868,6 +2921,8 @@ class QdrantMigration:
                     "sparse_term_count": final_source.sparse_term_count,
                     "sparse_term_fingerprint": final_source.sparse_term_fingerprint,
                     "target_count": target_count,
+                    "transformed_source_fingerprint": final_source.transformed_source_fingerprint,
+                    "target_content_fingerprint": final_source.target_content_fingerprint,
                 }
             )
             if barrier_held:
@@ -3351,7 +3406,29 @@ class QdrantMigration:
             raise MigrationError(f"Qdrant collection creation did not complete for {name}")
         return True
 
-    def _delete_collection(self, name: str) -> None:
+    def _assert_owned_target_mutation(self, collection: str) -> dict[str, Any]:
+        """Re-read ownership immediately before a target mutation."""
+
+        if collection not in {
+            self.target_collection,
+            self.target_metadata_collection,
+        }:
+            raise MigrationError(f"refusing mutation outside owned target pair: {collection!r}")
+        marker = self._load_current_marker()
+        if marker is None:
+            raise MigrationError("target migration marker disappeared before mutation")
+        self._validate_marker_ownership(marker)
+        return marker
+
+    def _delete_collection(
+        self,
+        name: str,
+        *,
+        allow_unmarked: bool = False,
+        require_owned: bool = False,
+    ) -> None:
+        if require_owned and not allow_unmarked:
+            self._assert_owned_target_mutation(name)
         try:
             response = self._request(
                 "DELETE",
@@ -3365,9 +3442,31 @@ class QdrantMigration:
         if response.get("result") is not True:
             raise MigrationError(f"Qdrant collection deletion did not complete for {name}")
 
-    def _write_points(self, collection: str, points: list[dict[str, Any]]) -> None:
+    def _write_points(
+        self,
+        collection: str,
+        points: list[dict[str, Any]],
+        *,
+        allow_unmarked: bool = False,
+    ) -> None:
         if not points:
             return
+        if allow_unmarked or getattr(self, "_allow_unmarked_target_write", False):
+            self._assert_collection_layout(
+                self.target_collection,
+                layout=self._layout(
+                    self._collection_info(self.source_collection),
+                ),
+            )
+            self._assert_collection_layout(
+                self.target_metadata_collection,
+                layout=self._layout(self._collection_info(self.source_collection)),
+                metadata=True,
+            )
+            self._assert_empty_collection(self.target_collection)
+            self._assert_empty_collection(self.target_metadata_collection)
+        else:
+            self._assert_owned_target_mutation(collection)
         self._request(
             "PUT",
             self._path(collection, "/points"),
@@ -3375,22 +3474,33 @@ class QdrantMigration:
             mutation=True,
         )
 
-    def _write_marker(self, marker: Mapping[str, Any]) -> None:
-        self._write_points(
-            self.target_metadata_collection,
-            [
-                {
-                    "id": _META_MARKER_ID,
-                    "vector": {_META_VECTOR_NAME: [0.0]},
-                    "payload": dict(marker),
-                }
-            ],
-        )
+    def _write_marker(
+        self,
+        marker: Mapping[str, Any],
+        *,
+        allow_unmarked: bool = False,
+    ) -> None:
+        points = [
+            {
+                "id": _META_MARKER_ID,
+                "vector": {_META_VECTOR_NAME: [0.0]},
+                "payload": dict(marker),
+            }
+        ]
+        if allow_unmarked:
+            self._allow_unmarked_target_write = True
+            try:
+                self._write_points(self.target_metadata_collection, points)
+            finally:
+                self._allow_unmarked_target_write = False
+        else:
+            self._write_points(self.target_metadata_collection, points)
 
     def _write_indexes(
         self, schema: Mapping[str, Any], indexes: Mapping[str, Mapping[str, Any]]
     ) -> None:
         for field_name, field_schema in self._expected_payload_indexes(schema, indexes).items():
+            self._assert_owned_target_mutation(self.target_collection)
             try:
                 self._request(
                     "PUT",
@@ -3665,7 +3775,7 @@ class QdrantMigration:
             recheck_pair()
             if not self._exists(collection):
                 continue
-            self._delete_collection(collection)
+            self._delete_collection(collection, allow_unmarked=True)
 
     def _create_target_pair(
         self,
@@ -3758,7 +3868,7 @@ class QdrantMigration:
                                     layout=layout,
                                     metadata=is_metadata,
                                 )
-                                self._delete_collection(collection)
+                                self._delete_collection(collection, allow_unmarked=True)
                             except BaseException:
                                 # The pair is no longer provably ours.
                                 pass
@@ -3861,7 +3971,7 @@ class QdrantMigration:
                 target_count=current_plan.target_count,
             )
             try:
-                self._write_marker(marker)
+                self._write_marker(marker, allow_unmarked=True)
             except BaseException:
                 try:
                     self._cleanup_pre_marker_orphan(
@@ -4285,7 +4395,8 @@ class QdrantMigration:
         if (
             len(expected_acl_fields) == len(_ACL_FIELDS) and not _acl_complete(expected_payload)
         ) or (len(actual_acl_fields) == len(_ACL_FIELDS) and not _acl_complete(payload)):
-            raise MigrationError(f"target point {point_id!r} has malformed ACL fields")
+            if not allow_acl_fail_open:
+                raise MigrationError(f"target point {point_id!r} has malformed ACL fields")
         if not _acl_complete(expected_payload) and not allow_acl_fail_open:
             raise MigrationError(f"target point {point_id!r} lacks complete ACL fields")
 
@@ -4836,7 +4947,7 @@ class QdrantMigration:
                 target_exists=True,
             )
             hooks.assert_target_not_served(self)
-            self._delete_collection(self.target_collection)
+            self._delete_collection(self.target_collection, require_owned=True)
             if self._exists(self.target_collection):
                 raise MigrationError(
                     "target data collection remains after a successful delete receipt"
@@ -4860,7 +4971,7 @@ class QdrantMigration:
         hooks.assert_target_not_served(self)
         if self._exists(self.target_collection):
             raise MigrationError("target data collection reappeared before metadata deletion")
-        self._delete_collection(self.target_metadata_collection)
+        self._delete_collection(self.target_metadata_collection, require_owned=True)
         if self._exists(self.target_metadata_collection):
             raise MigrationError(
                 "target metadata collection remains after a successful delete receipt"
