@@ -35,6 +35,7 @@
 
 - Modify `openviking_cli/utils/config/vectordb_config.py`: add the optional explicit Qdrant data physical-name field without changing old resolver precedence.
 - Modify `openviking/storage/vectordb_adapters/qdrant_adapter.py`: resolve physical names, logical identity, timeout, and marker compatibility.
+- Modify `openviking/storage/viking_vector_index_backend.py`: delegate Qdrant schema/index updates through the concrete adapter's public method, without reading its private configuration.
 - Modify `openviking/storage/vectordb/collection/qdrant_collection.py`: validate the target marker, preserve migration-owned fields, and send strong-ordered writes.
 - Modify `openviking/storage/vectordb/collection/qdrant_rest.py`: expose the configured timeout and a single request path used by mutation/readiness checks.
 
@@ -1059,3 +1060,100 @@ and the following safety clarifications:
 
 The per-task ledger under this plan's `.superpowers/sdd/` directory contains
 the detailed shared-file/dependency scan and all execution rulings.
+
+### Task 12: Close the original shared-layer private adapter comment
+
+This corrects an omission from the original whole-PR-comment scope, not a new
+migration mode. It executes after Task 11 preparation and before final reviews.
+
+**Files:**
+- Modify: `openviking/storage/vectordb_adapters/qdrant_adapter.py`
+- Modify: `openviking/storage/viking_vector_index_backend.py`
+- Test: `tests/storage/test_qdrant_adapter.py`
+
+**Interfaces:**
+- Add concrete synchronous
+  `QdrantCollectionAdapter.update_collection_schema(self, fields: list[dict[str, Any]], scalar_index: list[str], index_name: str) -> None`.
+- `_AsyncVectorAdapter.update_collection_schema` retains its signature and
+  `asyncio.to_thread` boundary. Only its Qdrant branch delegates publicly.
+- Preserve existing missing-index defaults, schema/index scalar union, field
+  metadata, custom indexes, retries, and all non-Qdrant behavior.
+- Do not add a base-class interface, configuration getters, or duplicate merge
+  logic. Existing private hooks remain internal to their owning adapter.
+
+- [ ] **Step 1: Add and run the public-boundary regression**
+
+```python
+@pytest.mark.asyncio
+async def test_qdrant_schema_update_uses_public_adapter_method():
+    calls = []
+
+    class PublicAdapter:
+        mode = "qdrant"
+
+        def update_collection_schema(self, fields, scalar_index, index_name):
+            calls.append((fields, scalar_index, index_name))
+
+    fields = [{"FieldName": "acl_enabled", "FieldType": "bool"}]
+    await _AsyncVectorAdapter(PublicAdapter()).update_collection_schema(
+        fields, ["acl_enabled"], "custom-index"
+    )
+    assert calls == [(fields, ["acl_enabled"], "custom-index")]
+```
+
+Run with live endpoint variables unset:
+
+```bash
+rtk proxy env -u QDRANT_URL -u QDRANT_API_KEY uv run --project . pytest -q -o addopts= tests/storage/test_qdrant_adapter.py -k qdrant_schema_update_uses_public_adapter_method
+```
+
+Expected RED: the old facade tries to call `get_collection` on an adapter
+that deliberately exposes only the public operation.
+
+- [ ] **Step 2: Move the existing Qdrant branch into its adapter**
+
+Move the current Qdrant branch body intact into the public method, changing
+`self._adapter` references to `self`; its collection comes from
+`self.get_collection()`. In the existing facade worker closure, replace that
+branch with:
+
+```python
+if self._adapter.mode == "qdrant":
+    self._adapter.update_collection_schema(fields, scalar_index, index_name)
+else:
+    collection = self._adapter.get_collection()
+    # Keep the existing non-Qdrant branch body unchanged.
+```
+
+Remove the shared pre-branch `get_collection()` call so the public method owns
+Qdrant collection access. Keep all merge/default-index logic in the adapter,
+not in both locations.
+
+- [ ] **Step 3: Preserve behavioral regression coverage**
+
+Adapt the existing schema-update tests to use a real
+`QdrantCollectionAdapter` with a fake collection, rather than fake adapters
+that reimplement its private defaults. Retain assertions for field metadata,
+schema and per-index scalar unions, custom index metadata, configured distance
+and sparse weight, and retry after a failed index operation. Cover the
+non-Qdrant local/cuVS branch without requiring the new Qdrant-only method.
+No live endpoint is needed for these tests.
+
+- [ ] **Step 4: Run focused and shared verification**
+
+```bash
+rtk proxy env -u QDRANT_URL -u QDRANT_API_KEY uv run --project . pytest -q -o addopts= tests/storage/test_qdrant_adapter.py tests/storage/test_collection_schemas.py
+rtk proxy uv run --project . ruff check openviking/storage/viking_vector_index_backend.py openviking/storage/vectordb_adapters/qdrant_adapter.py tests/storage/test_qdrant_adapter.py
+rtk git diff --check
+```
+
+Then run the required five-path suite from Task 11, inspect every caller, and
+confirm no `_adapter._` accesses remain in the facade. Record real RED/GREEN
+output; do not substitute static string checks for behavioral assertions.
+
+- [ ] **Step 5: Commit and independently review**
+
+Commit only the three implementation/test files and the two scope-corrected
+spec/plan files. The same consolidated PR receives this commit. No production
+operation, upstream PR, or change to the server-side fusion implementation is
+part of this task.

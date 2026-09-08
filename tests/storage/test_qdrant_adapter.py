@@ -97,6 +97,24 @@ def _index_request(requests):
     return request
 
 
+def _qdrant_adapter_for_collection(collection: QdrantCollection) -> QdrantCollectionAdapter:
+    adapter = QdrantCollectionAdapter(
+        url="http://qdrant.local",
+        api_key=None,
+        timeout_seconds=1.0,
+        project_name="project",
+        collection_name="docs",
+        index_name="default",
+        distance_metric="cosine",
+        dimension=2,
+        sparse_weight=0.0,
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+    )
+    adapter._collection = collection
+    return adapter
+
+
 def _target_marker(**updates):
     marker = {
         "_openviking_meta_version": 1,
@@ -388,6 +406,23 @@ def test_numeric_scalar_field_types_map_to_qdrant_numeric_schemas() -> None:
 
 
 @pytest.mark.asyncio
+async def test_qdrant_schema_update_uses_public_adapter_method():
+    calls = []
+
+    class PublicAdapter:
+        mode = "qdrant"
+
+        def update_collection_schema(self, fields, scalar_index, index_name):
+            calls.append((fields, scalar_index, index_name))
+
+    fields = [{"FieldName": "acl_enabled", "FieldType": "bool"}]
+    await _AsyncVectorAdapter(PublicAdapter()).update_collection_schema(
+        fields, ["acl_enabled"], "custom-index"
+    )
+    assert calls == [(fields, ["acl_enabled"], "custom-index")]
+
+
+@pytest.mark.asyncio
 async def test_update_collection_schema_accepts_openviking_field_list() -> None:
     collection = QdrantCollection(
         client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
@@ -411,13 +446,7 @@ async def test_update_collection_schema_accepts_openviking_field_list() -> None:
     )
     collection._ensure_remote_indexes = lambda _meta: None  # type: ignore[method-assign]
 
-    adapter = type(
-        "_Adapter",
-        (),
-        {"mode": "qdrant", "get_collection": lambda self: collection},
-    )()
-
-    await _AsyncVectorAdapter(adapter).update_collection_schema(
+    await _AsyncVectorAdapter(_qdrant_adapter_for_collection(collection)).update_collection_schema(
         [
             {"FieldName": "acl_enabled", "FieldType": "bool"},
         ],
@@ -517,22 +546,7 @@ async def test_update_collection_schema_creates_missing_qdrant_index() -> None:
     requests: list[tuple[str, str, dict[str, object], dict[str, object]]] = []
 
     collection._client.request = _index_request(requests)  # type: ignore[method-assign]
-    adapter = type(
-        "_Adapter",
-        (),
-        {
-            "mode": "qdrant",
-            "_distance_metric": "cosine",
-            "_sparse_weight": 0.0,
-            "get_collection": lambda self: collection,
-            "_build_default_index_meta": lambda self, **kwargs: {
-                "IndexName": kwargs["index_name"],
-                "ScalarIndex": kwargs["scalar_index_fields"],
-            },
-        },
-    )()
-
-    await _AsyncVectorAdapter(adapter).update_collection_schema(
+    await _AsyncVectorAdapter(_qdrant_adapter_for_collection(collection)).update_collection_schema(
         [
             {"FieldName": "account_id", "FieldType": "string"},
             {"FieldName": "acl_enabled", "FieldType": "bool"},
@@ -543,7 +557,9 @@ async def test_update_collection_schema_creates_missing_qdrant_index() -> None:
 
     assert collection.get_index_meta_data("default") == {
         "IndexName": "default",
+        "VectorIndex": {"IndexType": "hnsw", "Distance": "cosine"},
         "ScalarIndex": ["account_id", "tenant_custom", "acl_enabled"],
+        "SparseWeight": 0.0,
     }
     assert (
         "PUT",
@@ -587,13 +603,7 @@ async def test_update_collection_schema_preserves_custom_qdrant_indexes() -> Non
     requests: list[tuple[str, str, dict[str, object], dict[str, object]]] = []
 
     collection._client.request = _index_request(requests)  # type: ignore[method-assign]
-    adapter = type(
-        "_Adapter",
-        (),
-        {"mode": "qdrant", "get_collection": lambda self: collection},
-    )()
-
-    await _AsyncVectorAdapter(adapter).update_collection_schema(
+    await _AsyncVectorAdapter(_qdrant_adapter_for_collection(collection)).update_collection_schema(
         [
             {"FieldName": "account_id", "FieldType": "string"},
             {"FieldName": "acl_enabled", "FieldType": "bool"},

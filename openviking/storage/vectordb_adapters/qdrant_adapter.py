@@ -214,6 +214,31 @@ class QdrantCollectionAdapter(CollectionAdapter):
             "SparseWeight": sparse_weight,
         }
 
+    def update_collection_schema(
+        self, fields: list[dict[str, Any]], scalar_index: list[str], index_name: str
+    ) -> None:
+        collection = self.get_collection()
+        current_schema = collection.get_meta_data()
+        schema_scalar_index = list(
+            dict.fromkeys([*(current_schema.get("ScalarIndex") or []), *scalar_index])
+        )
+        current_index = collection.get_index_meta_data(index_name) or {}
+        index_scalar_index = list(
+            dict.fromkeys([*(current_index.get("ScalarIndex") or []), *scalar_index])
+        )
+        collection.update(fields={"Fields": fields, "ScalarIndex": schema_scalar_index})
+        if collection.has_index(index_name):
+            collection.update_index(index_name, scalar_index=index_scalar_index)
+        else:
+            index_meta = self._build_default_index_meta(
+                index_name=index_name,
+                distance=self._distance_metric,
+                use_sparse=self._sparse_weight > 0.0,
+                sparse_weight=self._sparse_weight,
+                scalar_index_fields=schema_scalar_index,
+            )
+            collection.create_index(index_name, index_meta)
+
     def _compile_filter(self, expr: Any) -> dict[str, Any]:
         return compile_qdrant_filter(expr)
 

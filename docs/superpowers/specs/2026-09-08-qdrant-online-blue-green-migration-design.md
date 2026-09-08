@@ -86,6 +86,19 @@ The legacy source has a different marker format and physical-ID encoding. The
 current adapter must not load it. The migration therefore reads the source
 through raw Qdrant REST and writes only the new current-format target.
 
+### Public adapter boundary
+
+Original PR comment `5529502476`, item 5, is part of this consolidated change.
+The shared `_AsyncVectorAdapter` must not call Qdrant's protected
+`_build_default_index_meta` hook or read `_distance_metric` / `_sparse_weight`.
+Qdrant schema/index updates belong in a concrete public
+`QdrantCollectionAdapter.update_collection_schema(fields, scalar_index, index_name)`.
+The async facade delegates to that method in its existing worker thread.
+Preserve missing-index creation with configured Qdrant defaults, additive schema
+and scalar-index behavior, custom field/index metadata, retry behavior, and all
+non-Qdrant paths. Do not expose private configuration getters or add a generic
+adapter framework to implement this boundary.
+
 ## Terminology
 
 - **Logical collection**: the OpenViking identity, such as `default/context`.
@@ -538,10 +551,14 @@ after this migration therefore does not retroactively protect records that were
 accepted through this gate.
 
 Hybrid search remains the existing client-side weighted rank fusion. Qdrant
-supports server-side `prefetch` + `fusion: RRF`, but that contract is
-unweighted and would change score semantics and pagination behavior; the
-sidecar term lookup is performed before the two data-collection queries. A
-server-side fusion change is intentionally a separate benchmark/design.
+supports server-side `prefetch` + `fusion: RRF` from v1.10, and
+[weighted RRF from v1.17](https://qdrant.tech/documentation/search/hybrid-queries/#weighted-rrf).
+Weighted RRF is therefore not available across the entire supported `>=1.10`
+range. The current adapter performs sidecar term lookup before two
+data-collection queries; that encoding step does not prevent server-side
+prefetch. Switching fusion implementations still requires score and pagination
+contract validation, so this change preserves existing behavior and leaves
+server-side fusion to a separate benchmark/design.
 
 ## Testing and documentation
 
@@ -648,6 +665,8 @@ This design closes the previously reported findings as follows:
 - RRF: weighted client-side ranking is retained intentionally;
 - payload fallback: missing logical IDs fail closed;
 - metadata sharing: target pair names and sidecars are unique;
+- private adapter boundary: Qdrant schema updates stay behind the concrete
+  adapter's public method;
 - CI/docs: maintenance/storage tests and operator documentation are in scope.
 
 The pre-existing random-vector behavior is intentionally not changed here; it
