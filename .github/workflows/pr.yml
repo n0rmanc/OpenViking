@@ -199,6 +199,10 @@ jobs:
     needs: check-deps
     if: ${{ needs.check-deps.outputs.langchain_changed == 'true' }}
     runs-on: ubuntu-24.04
+    env:
+      # Give tagless fork CI a dependency-compatible local test artifact version.
+      # Release workflows continue deriving versions from their release tags.
+      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENVIKING_SDK: "0.1.1"
     strategy:
       fail-fast: false
       matrix:
