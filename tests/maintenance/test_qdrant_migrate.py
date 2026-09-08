@@ -10,6 +10,7 @@ import pytest
 from openviking.storage.vectordb.qdrant_sparse import stable_sparse_index
 from openviking.storage.vectordb.qdrant_utils import to_qdrant_point_id
 from scripts.maintenance.qdrant_migrate import (
+    DeploymentHooks,
     MigrationError,
     QdrantMigration,
     SparseMigrationError,
@@ -3952,3 +3953,562 @@ def test_verify_rejects_non_string_physical_target_id() -> None:
 
     with pytest.raises(MigrationError, match="canonical UUID"):
         migration.verify(plan=plan, allow_acl_fail_open=True)
+
+
+class _LifecycleHooks:
+    def __init__(
+        self,
+        *,
+        accepted_writes: bool = False,
+        fail: str | None = None,
+        on_drain=None,
+    ) -> None:
+        self.events: list[str] = []
+        self.accepted_writes = accepted_writes
+        self.fail = fail
+        self.on_drain = on_drain
+
+    def _call(self, name: str) -> None:
+        self.events.append(name)
+        if name == "drain_legacy_writes" and self.on_drain is not None:
+            self.on_drain()
+        if self.fail == name:
+            raise RuntimeError(f"{name} failed")
+
+    def drain_legacy_writes(self, migration) -> None:
+        self._call("drain_legacy_writes")
+
+    def remove_legacy_from_serving_path(self, migration) -> None:
+        self._call("remove_legacy_from_serving_path")
+
+    def rollout_current(self, migration) -> None:
+        self._call("rollout_current")
+
+    def wait_current_ready(self, migration) -> None:
+        self._call("wait_current_ready")
+
+    def smoke_current_read_only(self, migration) -> None:
+        self._call("smoke_current_read_only")
+
+    def remove_current_from_serving_path(self, migration) -> None:
+        self._call("remove_current_from_serving_path")
+
+    def restore_legacy(self, migration) -> None:
+        self._call("restore_legacy")
+
+    def verify_legacy_read_path(self, migration) -> None:
+        self._call("verify_legacy_read_path")
+
+    def current_target_has_accepted_writes(self, migration) -> bool:
+        self._call("current_target_has_accepted_writes")
+        return self.accepted_writes
+
+    def assert_target_not_served(self, migration) -> None:
+        self._call("assert_target_not_served")
+
+
+def _ready_migration(qdrant: FakeQdrant) -> tuple[QdrantMigration, object]:
+    migration, plan = _prepare_reconcile(qdrant)
+    migration.verify(
+        plan=plan,
+        allow_acl_fail_open=True,
+        confirm=True,
+        lock_held=True,
+    )
+    return migration, migration.preflight()
+
+
+def test_cutover_requires_ready_target_and_barrier() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _ready_migration(qdrant)
+    hooks = _LifecycleHooks()
+
+    with pytest.raises(MigrationError, match="barrier"):
+        migration.cutover(
+            confirm=True,
+            plan=plan,
+            barrier_held=False,
+            lock_held=True,
+            hooks=hooks,
+        )
+
+    assert qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]["migration_state"] == "ready"
+
+
+def test_cutover_drains_legacy_before_final_source_snapshot() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _ready_migration(qdrant)
+
+    def mutate_after_drain() -> None:
+        qdrant.collections[migration.source_collection]["points"]["1"]["payload"][
+            "name"
+        ] = "drained"
+
+    hooks = _LifecycleHooks(on_drain=mutate_after_drain)
+    result = migration.cutover(
+        confirm=True,
+        plan=plan,
+        barrier_held=True,
+        lock_held=True,
+        hooks=hooks,
+        allow_acl_fail_open=True,
+    )
+
+    assert result["migration_state"] == "active"
+    assert qdrant.collections[migration.target_collection]["points"][
+        to_qdrant_point_id("1")
+    ]["payload"]["name"] == "drained"
+    assert hooks.events.index("drain_legacy_writes") < hooks.events.index(
+        "remove_legacy_from_serving_path"
+    )
+
+
+def test_cutover_removes_old_serving_path_before_current_rollout() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _ready_migration(qdrant)
+    hooks = _LifecycleHooks()
+
+    migration.cutover(
+        confirm=True,
+        plan=plan,
+        barrier_held=True,
+        lock_held=True,
+        hooks=hooks,
+        allow_acl_fail_open=True,
+    )
+
+    assert hooks.events.index("remove_legacy_from_serving_path") < hooks.events.index(
+        "rollout_current"
+    )
+
+
+def test_cutover_readiness_and_smoke_are_read_only() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _ready_migration(qdrant)
+    hooks = _LifecycleHooks()
+    writes_before_hooks: list[int] = []
+
+    def observe_readiness(migration) -> None:
+        writes_before_hooks.append(
+            len([request for request in qdrant.requests if request[0] in {"PUT", "DELETE"}])
+        )
+        hooks._call("wait_current_ready")
+
+    hooks.wait_current_ready = observe_readiness
+    migration.cutover(
+        confirm=True,
+        plan=plan,
+        barrier_held=True,
+        lock_held=True,
+        hooks=hooks,
+        allow_acl_fail_open=True,
+    )
+
+    assert writes_before_hooks
+    assert "smoke_current_read_only" in hooks.events
+
+
+def test_cutover_failure_leaves_barrier_held_and_cutting_over_marker() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _ready_migration(qdrant)
+    hooks = _LifecycleHooks(fail="wait_current_ready")
+
+    with pytest.raises(RuntimeError, match="wait_current_ready"):
+        migration.cutover(
+            confirm=True,
+            plan=plan,
+            barrier_held=True,
+            lock_held=True,
+            hooks=hooks,
+            allow_acl_fail_open=True,
+        )
+
+    assert qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]["migration_state"] == "cutting_over"
+
+
+def test_rollback_requires_barrier_and_no_accepted_target_writes() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    _set_marker_state(qdrant, migration, "cutting_over")
+    hooks = _LifecycleHooks()
+
+    with pytest.raises(MigrationError, match="barrier"):
+        migration.rollback(
+            confirm=True,
+            barrier_held=False,
+            lock_held=True,
+            no_current_format_writes_accepted=True,
+            hooks=hooks,
+        )
+    with pytest.raises(MigrationError, match="no-current-format"):
+        migration.rollback(
+            confirm=True,
+            barrier_held=True,
+            lock_held=True,
+            no_current_format_writes_accepted=False,
+            hooks=hooks,
+        )
+
+
+def test_rollback_restores_legacy_and_marks_target_rolled_back() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    _set_marker_state(qdrant, migration, "cutting_over")
+    hooks = _LifecycleHooks()
+
+    result = migration.rollback(
+        confirm=True,
+        barrier_held=True,
+        lock_held=True,
+        no_current_format_writes_accepted=True,
+        hooks=hooks,
+    )
+
+    assert result["migration_state"] == "rolled_back"
+    assert hooks.events.index("remove_current_from_serving_path") < hooks.events.index(
+        "restore_legacy"
+    )
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    assert marker["migration_state"] == "rolled_back"
+    assert marker["setup_complete"] is False
+    assert migration.target_collection in qdrant.collections
+    assert migration.source_collection in qdrant.collections
+
+
+@pytest.mark.parametrize(
+    ("barrier_held", "accepted_writes"),
+    [(False, False), (True, True)],
+)
+def test_rollback_refuses_after_target_write_or_released_barrier(
+    barrier_held: bool,
+    accepted_writes: bool,
+) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    _set_marker_state(qdrant, migration, "active")
+    hooks = _LifecycleHooks(accepted_writes=accepted_writes)
+
+    with pytest.raises(MigrationError):
+        migration.rollback(
+            confirm=True,
+            barrier_held=barrier_held,
+            lock_held=True,
+            no_current_format_writes_accepted=True,
+            hooks=hooks,
+        )
+
+
+def test_retire_refuses_a_serving_target() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    _set_marker_state(qdrant, migration, "active")
+    plan = migration.preflight()
+    hooks = _LifecycleHooks(fail="assert_target_not_served")
+
+    with pytest.raises(RuntimeError, match="assert_target_not_served"):
+        migration.retire(
+            confirm=True,
+            plan=plan,
+            lock_held=True,
+            hooks=hooks,
+        )
+
+    assert migration.target_collection in qdrant.collections
+
+
+def test_retire_marks_retained_before_deleting_non_serving_pair() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    _set_marker_state(qdrant, migration, "active")
+    plan = migration.preflight()
+    hooks = _LifecycleHooks()
+
+    result = migration.retire(
+        confirm=True,
+        plan=plan,
+        lock_held=True,
+        hooks=hooks,
+    )
+
+    assert result["migration_state"] == "retained"
+    assert migration.target_collection not in qdrant.collections
+    assert migration.target_metadata_collection not in qdrant.collections
+    marker_writes = [
+        index
+        for index, (method, path, _body) in enumerate(qdrant.requests)
+        if method == "PUT"
+        and path.endswith("/current__context__openviking_meta/points")
+    ]
+    data_deletes = [
+        index
+        for index, (method, path, _body) in enumerate(qdrant.requests)
+        if method == "DELETE" and path.endswith("/current__context")
+    ]
+    assert marker_writes and data_deletes
+    assert marker_writes[-1] < data_deletes[0]
+
+
+def test_retire_orphan_cleanup_requires_absent_plan_exact_names_and_confirm() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    plan = migration.preflight()
+    qdrant.add_collection(
+        migration.target_collection,
+        vectors={"vector": {"size": 2, "distance": "Cosine"}},
+    )
+    qdrant.add_collection(
+        migration.target_metadata_collection,
+        vectors={"meta": {"size": 1, "distance": "Dot"}},
+    )
+    hooks = _LifecycleHooks()
+
+    with pytest.raises(MigrationError, match="confirm"):
+        migration.retire(
+            confirm=False,
+            plan=plan,
+            lock_held=True,
+            hooks=hooks,
+        )
+    with pytest.raises(MigrationError, match="lock"):
+        migration.retire(
+            confirm=True,
+            plan=plan,
+            lock_held=False,
+            hooks=hooks,
+        )
+
+    result = migration.retire(
+        confirm=True,
+        plan=plan,
+        lock_held=True,
+        hooks=hooks,
+    )
+    assert result["migration_state"] == "orphan_cleaned"
+    assert migration.target_collection not in qdrant.collections
+    assert migration.target_metadata_collection not in qdrant.collections
+
+
+class _CliMigration:
+    instances: list["_CliMigration"] = []
+
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.instances.append(self)
+
+    def reconcile(self, **kwargs):
+        self.calls.append(("reconcile", kwargs))
+        return {"migration_state": "building"}
+
+    def verify(self, **kwargs):
+        self.calls.append(("verify", kwargs))
+        return {"migration_state": "ready"}
+
+    def cutover(self, **kwargs):
+        self.calls.append(("cutover", kwargs))
+        return {"migration_state": "active"}
+
+    def rollback(self, **kwargs):
+        self.calls.append(("rollback", kwargs))
+        return {"migration_state": "rolled_back"}
+
+    def retire(self, **kwargs):
+        self.calls.append(("retire", kwargs))
+        return {"migration_state": "retained"}
+
+
+@pytest.mark.parametrize(
+    ("command", "phase_args", "expected_call", "expected"),
+    [
+        (
+            "reconcile",
+            ["--confirm", "--lock-held", "--barrier-held", "--allow-acl-fail-open"],
+            "reconcile",
+            {
+                "confirm": True,
+                "lock_held": True,
+                "barrier_held": True,
+                "allow_acl_fail_open": True,
+            },
+        ),
+        (
+            "verify",
+            [
+                "--confirm",
+                "--lock-held",
+                "--barrier-held",
+                "--final",
+                "--allow-acl-fail-open",
+            ],
+            "verify",
+            {
+                "confirm": True,
+                "lock_held": True,
+                "barrier_held": True,
+                "final": True,
+                "allow_acl_fail_open": True,
+            },
+        ),
+        (
+            "cutover",
+            [
+                "--confirm",
+                "--lock-held",
+                "--barrier-held",
+                "--resume",
+                "--allow-acl-fail-open",
+                "--deployment-hooks",
+                "hooks.json",
+            ],
+            "cutover",
+            {
+                "confirm": True,
+                "lock_held": True,
+                "barrier_held": True,
+                "resume": True,
+                "allow_acl_fail_open": True,
+            },
+        ),
+        (
+            "rollback",
+            [
+                "--confirm",
+                "--lock-held",
+                "--barrier-held",
+                "--no-current-format-writes-accepted",
+                "--deployment-hooks",
+                "hooks.json",
+            ],
+            "rollback",
+            {
+                "confirm": True,
+                "lock_held": True,
+                "barrier_held": True,
+                "no_current_format_writes_accepted": True,
+            },
+        ),
+        (
+            "retire",
+            ["--confirm", "--lock-held", "--deployment-hooks", "hooks.json"],
+            "retire",
+            {"confirm": True, "lock_held": True},
+        ),
+    ],
+)
+def test_cli_dispatches_lifecycle_phase_arguments(
+    monkeypatch,
+    tmp_path,
+    capsys,
+    command: str,
+    phase_args: list[str],
+    expected_call: str,
+    expected: dict[str, object],
+) -> None:
+    plan = _migration(_legacy_fixture(sparse=False)).preflight()
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan.to_dict()), encoding="utf-8")
+    hooks_path = tmp_path / "hooks.json"
+    hooks_path.write_text("{}", encoding="utf-8")
+    _CliMigration.instances.clear()
+    monkeypatch.setattr(
+        "scripts.maintenance.qdrant_migrate.QdrantRestClient",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "scripts.maintenance.qdrant_migrate.QdrantMigration",
+        _CliMigration,
+    )
+    monkeypatch.setattr(
+        DeploymentHooks,
+        "from_path",
+        staticmethod(lambda path: _LifecycleHooks()),
+    )
+
+    base = [
+        "--url",
+        "http://qdrant.invalid",
+        "--source-collection",
+        "legacy__context",
+        "--target-collection",
+        "current__context",
+        "--logical-collection",
+        "legacy/context",
+        "--migration-id",
+        "mig-1",
+        "--timeout-seconds",
+        "10",
+        command,
+    ]
+    if command != "rollback":
+        base.extend(["--plan", str(plan_path)])
+    result = main(base + phase_args)
+
+    assert result == 0
+    instance = _CliMigration.instances[-1]
+    name, kwargs = instance.calls[-1]
+    assert name == expected_call
+    for key, value in expected.items():
+        assert kwargs[key] is value
+    assert len(capsys.readouterr().out.splitlines()) == 1
+
+
+def test_cli_rejects_invalid_hook_arrays_before_controller_dispatch(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    hooks_path = tmp_path / "hooks.json"
+    hooks_path.write_text(
+        json.dumps(
+            {
+                "drain_legacy_writes": ["bad\x00command"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "scripts.maintenance.qdrant_migrate.QdrantRestClient",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "scripts.maintenance.qdrant_migrate.QdrantMigration",
+        _CliMigration,
+    )
+    result = main(
+        [
+            "--url",
+            "http://qdrant.invalid",
+            "--source-collection",
+            "legacy__context",
+            "--target-collection",
+            "current__context",
+            "--logical-collection",
+            "legacy/context",
+            "--migration-id",
+            "mig-1",
+            "--timeout-seconds",
+            "10",
+            "rollback",
+            "--confirm",
+            "--lock-held",
+            "--barrier-held",
+            "--no-current-format-writes-accepted",
+            "--deployment-hooks",
+            str(hooks_path),
+        ]
+    )
+
+    assert result == 2
+    assert "deployment hook keys differ" in capsys.readouterr().err
+    assert not _CliMigration.instances[-1].calls

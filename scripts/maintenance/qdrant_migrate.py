@@ -27,6 +27,7 @@ import os
 import re
 import sqlite3
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -78,6 +79,18 @@ _INTEGER_RE = re.compile(r"^[+-]?[0-9]+$")
 _QDRANT_VERSION_FLOOR = (1, 10, 0)
 MIGRATOR_VERSION = "qdrant-blue-green-v1"
 MAX_RECONCILIATION_ROUNDS = 3
+_DEPLOYMENT_HOOK_NAMES = (
+    "drain_legacy_writes",
+    "remove_legacy_from_serving_path",
+    "rollout_current",
+    "wait_current_ready",
+    "smoke_current_read_only",
+    "remove_current_from_serving_path",
+    "restore_legacy",
+    "verify_legacy_read_path",
+    "current_target_has_accepted_writes",
+    "assert_target_not_served",
+)
 MIGRATION_STATES = frozenset(
     {"building", "ready", "cutting_over", "active", "retained", "rolled_back", "failed"}
 )
@@ -1125,6 +1138,121 @@ def _validate_schema_subset(
                 "target current marker schema is missing scalar indexes: "
                 f"{sorted(missing)!r}"
             )
+
+
+class DeploymentHooks:
+    """Run the reviewed, operator-owned lifecycle commands."""
+
+    def __init__(self, commands: Mapping[str, Any]) -> None:
+        if not isinstance(commands, Mapping):
+            raise MigrationError("deployment hooks JSON must be an object")
+        keys = set(commands)
+        expected = set(_DEPLOYMENT_HOOK_NAMES)
+        if keys != expected:
+            missing = sorted(expected - keys)
+            extra = sorted(keys - expected)
+            raise MigrationError(
+                f"deployment hook keys differ: missing={missing!r} extra={extra!r}"
+            )
+        self._commands: dict[str, list[str]] = {}
+        for name in _DEPLOYMENT_HOOK_NAMES:
+            command = commands[name]
+            if (
+                not isinstance(command, list)
+                or not command
+                or any(
+                    not isinstance(argument, str)
+                    or not argument.strip()
+                    or "\x00" in argument
+                    for argument in command
+                )
+            ):
+                raise MigrationError(
+                    f"deployment hook {name!r} must be a non-empty argv list"
+                )
+            self._commands[name] = list(command)
+
+    @classmethod
+    def from_path(cls, path: str) -> "DeploymentHooks":
+        try:
+            value = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise MigrationError(f"cannot read deployment hooks {path}: {exc}") from exc
+        return cls(value)
+
+    def _run(self, name: str, migration: "QdrantMigration") -> str:
+        timeout_seconds = _validate_timeout_seconds(migration.timeout_seconds)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "OV_LOGICAL_COLLECTION": migration.logical_collection,
+                "OV_MIGRATION_ID": migration.migration_id,
+                "OV_SOURCE_COLLECTION": migration.source_collection,
+                "OV_SOURCE_METADATA_COLLECTION": migration.source_metadata_collection,
+                "OV_TARGET_COLLECTION": migration.target_collection,
+                "OV_TARGET_METADATA_COLLECTION": migration.target_metadata_collection,
+                "OV_TIMEOUT_SECONDS": str(timeout_seconds),
+                "OV_MIGRATOR_VERSION": migration.migrator_version,
+            }
+        )
+        try:
+            completed = subprocess.run(
+                self._commands[name],
+                check=True,
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                env=environment,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise MigrationError(f"deployment hook {name!r} timed out") from exc
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise MigrationError(f"deployment hook {name!r} failed") from exc
+        stdout = completed.stdout
+        return stdout if isinstance(stdout, str) else ""
+
+    def _assert_success(self, name: str, migration: "QdrantMigration") -> None:
+        self._run(name, migration)
+
+    def drain_legacy_writes(self, migration: "QdrantMigration") -> None:
+        self._assert_success("drain_legacy_writes", migration)
+
+    def remove_legacy_from_serving_path(self, migration: "QdrantMigration") -> None:
+        self._assert_success("remove_legacy_from_serving_path", migration)
+
+    def rollout_current(self, migration: "QdrantMigration") -> None:
+        self._assert_success("rollout_current", migration)
+
+    def wait_current_ready(self, migration: "QdrantMigration") -> None:
+        self._assert_success("wait_current_ready", migration)
+
+    def smoke_current_read_only(self, migration: "QdrantMigration") -> None:
+        self._assert_success("smoke_current_read_only", migration)
+
+    def remove_current_from_serving_path(self, migration: "QdrantMigration") -> None:
+        self._assert_success("remove_current_from_serving_path", migration)
+
+    def restore_legacy(self, migration: "QdrantMigration") -> None:
+        self._assert_success("restore_legacy", migration)
+
+    def verify_legacy_read_path(self, migration: "QdrantMigration") -> None:
+        self._assert_success("verify_legacy_read_path", migration)
+
+    def current_target_has_accepted_writes(
+        self,
+        migration: "QdrantMigration",
+    ) -> bool:
+        value = self._run("current_target_has_accepted_writes", migration).strip()
+        if value not in {"true", "false"}:
+            raise MigrationError(
+                "deployment hook 'current_target_has_accepted_writes' must print "
+                "only true or false"
+            )
+        return value == "true"
+
+    def assert_target_not_served(self, migration: "QdrantMigration") -> None:
+        self._assert_success("assert_target_not_served", migration)
 
 
 class QdrantMigration:
@@ -2224,6 +2352,7 @@ class QdrantMigration:
         target_state: str,
         *,
         setup_complete: bool | None = None,
+        allow_active_rollback: bool = False,
     ) -> dict[str, Any]:
         """Write and verify a migration state marker owned by this controller."""
 
@@ -2253,10 +2382,15 @@ class QdrantMigration:
             "failed": {"building", "ready", "cutting_over", "failed"},
         }
         if previous_state not in allowed_previous[target_state]:
-            raise MigrationError(
-                f"cannot transition migration state from {previous_state!r} "
-                f"to {target_state!r}"
-            )
+            if not (
+                target_state == "rolled_back"
+                and previous_state == "active"
+                and allow_active_rollback
+            ):
+                raise MigrationError(
+                    f"cannot transition migration state from {previous_state!r} "
+                    f"to {target_state!r}"
+                )
         updated = dict(marker)
         updated["migration_state"] = target_state
         updated["setup_complete"] = setup_complete
@@ -4443,6 +4577,15 @@ class QdrantMigration:
             raise MigrationError(
                 "final verify requires barrier_held=True / --barrier-held"
             )
+        if final and not confirm:
+            raise MigrationError(
+                "final verify requires explicit confirm=True / --confirm"
+            )
+        if final and not lock_held:
+            raise MigrationError(
+                "final verify requires external source lock acknowledgement via "
+                "lock_held=True / --lock-held"
+            )
         self._assert_prepare_plan_identity(plan)
         layout = self._layout_from_plan(plan)
         metadata = self._legacy_metadata()
@@ -4615,15 +4758,6 @@ class QdrantMigration:
             self._write_marker(updated)
             result_state = "ready"
         elif final:
-            if not confirm:
-                raise MigrationError(
-                    "final verify requires explicit confirm=True / --confirm"
-                )
-            if not lock_held:
-                raise MigrationError(
-                    "final verify requires external source lock acknowledgement via "
-                    "lock_held=True / --lock-held"
-                )
             updated = dict(current)
             updated.update(
                 {
@@ -4660,6 +4794,324 @@ class QdrantMigration:
             "verification_complete": True,
             "transformed_source_fingerprint": transformed_source_fingerprint,
             "target_content_fingerprint": target_content_fingerprint,
+        }
+
+    @staticmethod
+    def _validate_deployment_hooks(hooks: Any) -> None:
+        if hooks is None:
+            raise MigrationError(
+                "deployment hooks are required for this lifecycle operation"
+            )
+        missing = [
+            name
+            for name in _DEPLOYMENT_HOOK_NAMES
+            if not callable(getattr(hooks, name, None))
+        ]
+        if missing:
+            raise MigrationError(
+                f"deployment hooks are missing required operations: {missing!r}"
+            )
+
+    @staticmethod
+    def _hook_bool(value: Any, *, operation: str) -> bool:
+        if not isinstance(value, bool):
+            raise MigrationError(
+                f"deployment hook {operation!r} must return a boolean"
+            )
+        return value
+
+    def cutover(
+        self,
+        *,
+        confirm: bool,
+        plan: MigrationPlan,
+        barrier_held: bool = False,
+        hooks: Any,
+        allow_acl_fail_open: bool = False,
+        lock_held: bool = False,
+        resume: bool = False,
+    ) -> dict[str, Any]:
+        """Cut over an owned ready target while the operator holds the barrier."""
+
+        if not confirm:
+            raise MigrationError("cutover requires explicit confirm=True / --confirm")
+        if not barrier_held:
+            raise MigrationError(
+                "cutover requires barrier_held=True / --barrier-held"
+            )
+        if not lock_held:
+            raise MigrationError(
+                "cutover requires external source lock acknowledgement via "
+                "lock_held=True / --lock-held"
+            )
+        if not isinstance(plan, MigrationPlan):
+            raise MigrationError("cutover requires a reviewed migration plan")
+        self._validate_deployment_hooks(hooks)
+        self._assert_prepare_plan_identity(plan)
+
+        marker = self._load_current_marker()
+        if marker is None:
+            raise MigrationError("cutover requires an owned target marker")
+        self._validate_marker_ownership(marker)
+        state = marker["migration_state"]
+        if state == "ready":
+            if resume:
+                raise MigrationError("cutover --resume requires a cutting_over target")
+            self._transition("cutting_over")
+        elif state == "cutting_over":
+            if not resume:
+                raise MigrationError(
+                    "cutover requires --resume for an interrupted cutting_over target"
+                )
+        else:
+            raise MigrationError(
+                "cutover requires a ready target or an interrupted cutting_over target; "
+                f"current state is {state!r}"
+            )
+
+        if resume:
+            accepted = self._hook_bool(
+                hooks.current_target_has_accepted_writes(self),
+                operation="current_target_has_accepted_writes",
+            )
+            if accepted:
+                raise MigrationError(
+                    "resumed cutover refuses to overwrite accepted current-format writes"
+                )
+
+        hooks.drain_legacy_writes(self)
+        hooks.remove_legacy_from_serving_path(self)
+        self.reconcile(
+            confirm=True,
+            plan=plan,
+            barrier_held=True,
+            allow_acl_fail_open=allow_acl_fail_open,
+            lock_held=True,
+        )
+        self.verify(
+            plan=plan,
+            allow_acl_fail_open=allow_acl_fail_open,
+            final=True,
+            barrier_held=True,
+            confirm=True,
+            lock_held=True,
+        )
+        hooks.rollout_current(self)
+        hooks.wait_current_ready(self)
+        hooks.smoke_current_read_only(self)
+        accepted = self._hook_bool(
+            hooks.current_target_has_accepted_writes(self),
+            operation="current_target_has_accepted_writes",
+        )
+        if accepted:
+            raise MigrationError(
+                "cutover refuses to publish active after accepted current-format writes"
+            )
+        active = self._transition("active")
+        return {
+            "migration_state": active["migration_state"],
+            "target_collection": self.target_collection,
+            "barrier_held": True,
+            "writes_resumed": False,
+        }
+
+    def rollback(
+        self,
+        *,
+        confirm: bool,
+        barrier_held: bool = False,
+        no_current_format_writes_accepted: bool = False,
+        hooks: Any,
+        lock_held: bool = False,
+    ) -> dict[str, Any]:
+        """Restore the legacy serving path without deleting either collection."""
+
+        if not confirm:
+            raise MigrationError("rollback requires explicit confirm=True / --confirm")
+        if not barrier_held:
+            raise MigrationError(
+                "rollback requires barrier_held=True / --barrier-held"
+            )
+        if not lock_held:
+            raise MigrationError(
+                "rollback requires external source lock acknowledgement via "
+                "lock_held=True / --lock-held"
+            )
+        if not no_current_format_writes_accepted:
+            raise MigrationError(
+                "rollback requires --no-current-format-writes-accepted"
+            )
+        self._validate_deployment_hooks(hooks)
+
+        marker = self._load_current_marker()
+        if marker is None:
+            raise MigrationError("rollback requires an owned target marker")
+        self._validate_marker_ownership(marker)
+        state = marker["migration_state"]
+        if state not in {"cutting_over", "active"}:
+            raise MigrationError(
+                "rollback requires a cutting_over or active target; "
+                f"current state is {state!r}"
+            )
+        accepted = self._hook_bool(
+            hooks.current_target_has_accepted_writes(self),
+            operation="current_target_has_accepted_writes",
+        )
+        if accepted:
+            raise MigrationError(
+                "rollback refuses after accepted current-format writes"
+            )
+        hooks.remove_current_from_serving_path(self)
+        hooks.assert_target_not_served(self)
+        hooks.restore_legacy(self)
+        hooks.verify_legacy_read_path(self)
+        rolled_back = self._transition(
+            "rolled_back",
+            allow_active_rollback=state == "active",
+        )
+        return {
+            "migration_state": rolled_back["migration_state"],
+            "target_collection": self.target_collection,
+            "source_collection": self.source_collection,
+            "barrier_held": True,
+            "writes_resumed": False,
+        }
+
+    def _validate_retire_pair(
+        self,
+        *,
+        plan: MigrationPlan,
+        expected_state: str,
+        target_exists: bool,
+    ) -> dict[str, Any]:
+        """Recheck ownership and physical identity immediately before deletion."""
+
+        self._assert_prepare_plan_identity(plan)
+        marker = self._load_current_marker()
+        if marker is None:
+            raise MigrationError("retire requires an owned target marker")
+        self._validate_marker_ownership(marker)
+        if marker.get("migration_state") != expected_state:
+            raise MigrationError(
+                f"retire target state changed from {expected_state!r}"
+            )
+        layout = self._layout_from_plan(plan)
+        metadata = self._legacy_metadata()
+        self._validate_source_metadata_layout(metadata.schema, layout)
+        self._validate_metadata_layout(self.target_metadata_collection)
+        self._validate_existing_target(
+            target_info=(
+                self._collection_info(self.target_collection)
+                if target_exists
+                else None
+            ),
+            marker=marker,
+            layout=layout,
+            metadata=metadata,
+        )
+        return marker
+
+    def retire(
+        self,
+        *,
+        confirm: bool,
+        plan: MigrationPlan,
+        lock_held: bool = False,
+        hooks: Any,
+    ) -> dict[str, Any]:
+        """Retain the audit marker, then remove only the non-serving target pair."""
+
+        if not confirm:
+            raise MigrationError("retire requires explicit confirm=True / --confirm")
+        if not lock_held:
+            raise MigrationError(
+                "retire requires external source lock acknowledgement via "
+                "lock_held=True / --lock-held"
+            )
+        if not isinstance(plan, MigrationPlan):
+            raise MigrationError("retire requires a reviewed migration plan")
+        self._validate_deployment_hooks(hooks)
+        self._assert_prepare_plan_identity(plan)
+
+        target_exists = self._exists(self.target_collection)
+        metadata_exists = self._exists(self.target_metadata_collection)
+        marker = self._load_current_marker() if metadata_exists else None
+        if marker is None:
+            if not plan.target_absent:
+                raise MigrationError(
+                    "retire requires an owned marker or a reviewed target_absent=True plan"
+                )
+            hooks.assert_target_not_served(self)
+            self._cleanup_pre_marker_orphan(
+                reviewed_plan=plan,
+                confirm=confirm,
+                lock_held=lock_held,
+            )
+            return {
+                "migration_state": "orphan_cleaned",
+                "target_collection": self.target_collection,
+                "target_metadata_collection": self.target_metadata_collection,
+            }
+
+        self._validate_marker_ownership(marker)
+        state = marker["migration_state"]
+        if state not in {"active", "retained"}:
+            raise MigrationError(
+                "retire supports only active or retained targets; "
+                f"current state is {state!r}"
+            )
+        if plan.target_absent or plan.target_state not in {"active", "retained"}:
+            raise MigrationError(
+                "retire requires a reviewed active or retained target plan"
+            )
+        if state == "active" and not target_exists:
+            raise MigrationError("active retire target collection is missing")
+        self._validate_retire_pair(
+            plan=plan,
+            expected_state=state,
+            target_exists=target_exists,
+        )
+        hooks.assert_target_not_served(self)
+
+        if state == "active":
+            marker = self._transition("retained")
+            self._validate_marker_ownership(marker)
+            state = "retained"
+
+        if self._exists(self.target_collection):
+            self._validate_retire_pair(
+                plan=plan,
+                expected_state="retained",
+                target_exists=True,
+            )
+            hooks.assert_target_not_served(self)
+            self._delete_collection(self.target_collection)
+            if self._exists(self.target_collection):
+                raise MigrationError(
+                    "target data collection remains after a successful delete receipt"
+                )
+        else:
+            self._validate_retire_pair(
+                plan=plan,
+                expected_state="retained",
+                target_exists=False,
+            )
+
+        self._validate_retire_pair(
+            plan=plan,
+            expected_state="retained",
+            target_exists=False,
+        )
+        hooks.assert_target_not_served(self)
+        self._delete_collection(self.target_metadata_collection)
+        if self._exists(self.target_metadata_collection):
+            raise MigrationError(
+                "target metadata collection remains after a successful delete receipt"
+            )
+        return {
+            "migration_state": "retained",
+            "target_collection": self.target_collection,
+            "target_metadata_collection": self.target_metadata_collection,
         }
 
     @staticmethod
@@ -5182,6 +5634,15 @@ def _load_plan(path: str | None) -> MigrationPlan | None:
     )
 
 
+def _warn_acl_risk(plan: MigrationPlan | None, allow_acl_fail_open: bool) -> None:
+    if allow_acl_fail_open and plan is not None and plan.acl_incomplete_count:
+        print(
+            "warning: allowing fail-open ACL fields for "
+            f"{plan.acl_incomplete_count} records",
+            file=sys.stderr,
+        )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default=os.environ.get("QDRANT_URL"))
@@ -5226,6 +5687,56 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="reviewed JSON plan produced by the preflight command",
     )
+    reconcile_parser = subparsers.add_parser(
+        "reconcile",
+        help="reconcile the target from a rolling source snapshot",
+    )
+    reconcile_parser.add_argument("--confirm", action="store_true")
+    reconcile_parser.add_argument("--lock-held", action="store_true")
+    reconcile_parser.add_argument("--barrier-held", action="store_true")
+    reconcile_parser.add_argument("--allow-acl-fail-open", action="store_true")
+    reconcile_parser.add_argument("--plan", required=True)
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help="audit target contents and publish readiness",
+    )
+    verify_parser.add_argument("--confirm", action="store_true")
+    verify_parser.add_argument("--lock-held", action="store_true")
+    verify_parser.add_argument("--barrier-held", action="store_true")
+    verify_parser.add_argument("--final", action="store_true")
+    verify_parser.add_argument("--allow-acl-fail-open", action="store_true")
+    verify_parser.add_argument("--plan", required=True)
+    cutover_parser = subparsers.add_parser(
+        "cutover",
+        help="cut over a ready target while the operator holds the barrier",
+    )
+    cutover_parser.add_argument("--confirm", action="store_true")
+    cutover_parser.add_argument("--lock-held", action="store_true")
+    cutover_parser.add_argument("--barrier-held", action="store_true")
+    cutover_parser.add_argument("--resume", action="store_true")
+    cutover_parser.add_argument("--allow-acl-fail-open", action="store_true")
+    cutover_parser.add_argument("--plan", required=True)
+    cutover_parser.add_argument("--deployment-hooks", required=True)
+    rollback_parser = subparsers.add_parser(
+        "rollback",
+        help="restore the legacy serving path while the barrier is held",
+    )
+    rollback_parser.add_argument("--confirm", action="store_true")
+    rollback_parser.add_argument("--lock-held", action="store_true")
+    rollback_parser.add_argument("--barrier-held", action="store_true")
+    rollback_parser.add_argument(
+        "--no-current-format-writes-accepted",
+        action="store_true",
+    )
+    rollback_parser.add_argument("--deployment-hooks", required=True)
+    retire_parser = subparsers.add_parser(
+        "retire",
+        help="remove a retained, non-serving target pair",
+    )
+    retire_parser.add_argument("--confirm", action="store_true")
+    retire_parser.add_argument("--lock-held", action="store_true")
+    retire_parser.add_argument("--plan", required=True)
+    retire_parser.add_argument("--deployment-hooks", required=True)
     apply_parser = subparsers.add_parser("apply", help="copy records into the target")
     apply_parser.add_argument(
         "--confirm",
@@ -5280,6 +5791,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(migration.preflight().to_dict(), sort_keys=True))
         elif args.command == "prepare":
             reviewed_plan = _load_plan(args.plan)
+            _warn_acl_risk(reviewed_plan, args.allow_acl_fail_open)
             print(
                 json.dumps(
                     migration.prepare(
@@ -5293,6 +5805,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "backfill":
             reviewed_plan = _load_plan(args.plan)
+            _warn_acl_risk(reviewed_plan, args.allow_acl_fail_open)
             print(
                 json.dumps(
                     migration.backfill(
@@ -5304,8 +5817,88 @@ def main(argv: list[str] | None = None) -> int:
                     sort_keys=True,
                 )
             )
+        elif args.command == "reconcile":
+            reviewed_plan = _load_plan(args.plan)
+            _warn_acl_risk(reviewed_plan, args.allow_acl_fail_open)
+            print(
+                json.dumps(
+                    migration.reconcile(
+                        confirm=args.confirm,
+                        plan=reviewed_plan,
+                        barrier_held=args.barrier_held,
+                        allow_acl_fail_open=args.allow_acl_fail_open,
+                        lock_held=args.lock_held,
+                    ),
+                    sort_keys=True,
+                )
+            )
+        elif args.command == "verify":
+            reviewed_plan = _load_plan(args.plan)
+            _warn_acl_risk(reviewed_plan, args.allow_acl_fail_open)
+            print(
+                json.dumps(
+                    migration.verify(
+                        plan=reviewed_plan,
+                        allow_acl_fail_open=args.allow_acl_fail_open,
+                        final=args.final,
+                        barrier_held=args.barrier_held,
+                        confirm=args.confirm,
+                        lock_held=args.lock_held,
+                    ),
+                    sort_keys=True,
+                )
+            )
+        elif args.command == "cutover":
+            reviewed_plan = _load_plan(args.plan)
+            _warn_acl_risk(reviewed_plan, args.allow_acl_fail_open)
+            hooks = DeploymentHooks.from_path(args.deployment_hooks)
+            print(
+                json.dumps(
+                    migration.cutover(
+                        confirm=args.confirm,
+                        plan=reviewed_plan,
+                        barrier_held=args.barrier_held,
+                        hooks=hooks,
+                        allow_acl_fail_open=args.allow_acl_fail_open,
+                        lock_held=args.lock_held,
+                        resume=args.resume,
+                    ),
+                    sort_keys=True,
+                )
+            )
+        elif args.command == "rollback":
+            hooks = DeploymentHooks.from_path(args.deployment_hooks)
+            print(
+                json.dumps(
+                    migration.rollback(
+                        confirm=args.confirm,
+                        barrier_held=args.barrier_held,
+                        no_current_format_writes_accepted=(
+                            args.no_current_format_writes_accepted
+                        ),
+                        hooks=hooks,
+                        lock_held=args.lock_held,
+                    ),
+                    sort_keys=True,
+                )
+            )
+        elif args.command == "retire":
+            reviewed_plan = _load_plan(args.plan)
+            hooks = DeploymentHooks.from_path(args.deployment_hooks)
+            print(
+                json.dumps(
+                    migration.retire(
+                        confirm=args.confirm,
+                        plan=reviewed_plan,
+                        lock_held=args.lock_held,
+                        hooks=hooks,
+                    ),
+                    sort_keys=True,
+                )
+            )
         else:
             reviewed_plan = _load_plan(args.plan)
+            _warn_acl_risk(reviewed_plan, args.allow_acl_fail_open)
             print(
                 json.dumps(
                     migration.apply(
