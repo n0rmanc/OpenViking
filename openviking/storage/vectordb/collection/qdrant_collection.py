@@ -138,29 +138,19 @@ class QdrantCollection(ICollection):
         return {"wait": "true", "ordering": "strong"}
 
     def _wait_payload_index(self, field: str, *, present: bool) -> None:
-        deadline = time.monotonic() + self._client.timeout_seconds
-        while True:
-            response = self._client.request(
-                "GET",
-                self._path(self._collection_name),
-            )
-            result = self._result(response)
-            if not isinstance(result, dict):
-                raise QdrantError("Qdrant collection readiness response is malformed")
-            payload_schema = result.get("payload_schema")
-            if not isinstance(payload_schema, dict):
-                raise QdrantError("Qdrant collection response has no payload_schema")
-            if (field in payload_schema) is present:
-                return
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                state = "visible" if present else "absent"
-                raise QdrantError(
-                    f"Qdrant payload index {field!r} did not become {state}"
-                )
-            time.sleep(min(0.1, remaining))
+        self._wait_collection_ready(
+            self._collection_name,
+            payload_field=field,
+            payload_present=present,
+        )
 
-    def _wait_collection_ready(self, name: str) -> None:
+    def _wait_collection_ready(
+        self,
+        name: str,
+        *,
+        payload_field: str | None = None,
+        payload_present: bool = True,
+    ) -> None:
         deadline = time.monotonic() + self._client.timeout_seconds
         while True:
             response = self._client.request("GET", self._path(name))
@@ -171,22 +161,38 @@ class QdrantCollection(ICollection):
             optimizer_status = result.get("optimizer_status")
             if not isinstance(status, str) or not isinstance(optimizer_status, (str, dict)):
                 raise QdrantError("Qdrant collection readiness response is malformed")
-            if status.lower() in {"red", "error", "failed"} or isinstance(
+            normalized_status = status.strip().lower()
+            if normalized_status in {"red", "error", "failed"} or isinstance(
                 optimizer_status, dict
             ):
                 raise QdrantError(f"Qdrant collection {name!r} is not ready")
+            normalized_optimizer = optimizer_status.strip().lower()
+            if normalized_optimizer in {"red", "error", "failed"}:
+                raise QdrantError(f"Qdrant collection {name!r} is not ready")
+            payload_ready = True
+            if payload_field is not None:
+                payload_schema = result.get("payload_schema")
+                if not isinstance(payload_schema, dict):
+                    raise QdrantError("Qdrant collection response has no payload_schema")
+                payload_ready = (payload_field in payload_schema) is payload_present
             if (
-                status.lower() == "green"
-                and optimizer_status.lower() == "ok"
+                normalized_status == "green"
+                and normalized_optimizer == "ok"
                 and not any(
                     self._pending_work(result[field])
                     for field in ("update_queue", "deferred")
                     if field in result
                 )
+                and payload_ready
             ):
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if payload_field is not None:
+                    state = "visible" if payload_present else "absent"
+                    raise QdrantError(
+                        f"Qdrant payload index {payload_field!r} did not become {state}"
+                    )
                 raise QdrantError(f"Qdrant collection {name!r} did not become ready")
             time.sleep(min(0.1, remaining))
 

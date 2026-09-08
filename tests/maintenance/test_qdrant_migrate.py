@@ -212,9 +212,9 @@ def test_migration_target_mutations_use_strong_ordering_and_timeout() -> None:
     migration = QdrantMigration(
         client=client,
         source_collection="legacy",
-        target_collection="current",
+        target_collection="index-data",
         source_metadata_collection="legacy__meta",
-        target_metadata_collection="current__meta",
+        target_metadata_collection="index-data__meta",
         timeout_seconds=37,
     )
 
@@ -242,15 +242,50 @@ def test_migration_target_mutations_use_strong_ordering_and_timeout() -> None:
         {"field_name": "account_id", "field_schema": "keyword"},
         mutation=True,
     )
+    migration._request(
+        "DELETE",
+        migration._path(migration.target_collection),
+        mutation=True,
+    )
 
     point_params = client.requests[0][3]
     delete_params = client.requests[1][3]
     collection_params = client.requests[2][3]
     index_params = client.requests[3][3]
+    collection_delete_params = client.requests[4][3]
     assert point_params == {"wait": "true", "ordering": "strong"}
     assert delete_params == {"wait": "true", "ordering": "strong"}
     assert collection_params == {"timeout": 37}
     assert index_params == {"wait": "true", "timeout": 37}
+    assert collection_delete_params == {"timeout": 37}
+
+
+def test_migration_collection_named_points_keeps_collection_contract() -> None:
+    client = _RecordingClient()
+    migration = QdrantMigration(
+        client=client,
+        source_collection="legacy",
+        target_collection="points",
+        source_metadata_collection="legacy__meta",
+        target_metadata_collection="points__meta",
+        timeout_seconds=37,
+    )
+
+    migration._request(
+        "PUT",
+        migration._path(migration.target_collection),
+        {"vectors": {"vector": {"size": 2, "distance": "Cosine"}}},
+        mutation=True,
+    )
+    migration._request(
+        "PUT",
+        migration._path(migration.target_collection, "/points"),
+        {"points": [{"id": "one"}]},
+        mutation=True,
+    )
+
+    assert client.requests[0][3] == {"timeout": 37}
+    assert client.requests[1][3] == {"wait": "true", "ordering": "strong"}
 
 
 def test_migration_point_mutation_rejects_acknowledged_result() -> None:
@@ -287,6 +322,36 @@ def test_migration_rejects_qdrant_versions_below_strong_ordering_floor() -> None
 
     with pytest.raises(MigrationError, match="minimum 1.10.0"):
         migration._assert_strong_ordering_support()
+
+
+@pytest.mark.parametrize("version", ["1.10.0-rc1", "1.10.0-rc1+build.1"])
+def test_migration_rejects_qdrant_prerelease_versions(version: str) -> None:
+    client = _ReadinessClient([{"title": "qdrant", "version": version}])
+    migration = QdrantMigration(
+        client=client,
+        source_collection="legacy",
+        target_collection="current",
+        source_metadata_collection="legacy__meta",
+        target_metadata_collection="current__meta",
+        timeout_seconds=1.0,
+    )
+
+    with pytest.raises(MigrationError, match="unparseable"):
+        migration._assert_strong_ordering_support()
+
+
+def test_migration_accepts_qdrant_build_metadata_on_stable_version() -> None:
+    client = _ReadinessClient([{"title": "qdrant", "version": "1.10.0+build.1"}])
+    migration = QdrantMigration(
+        client=client,
+        source_collection="legacy",
+        target_collection="current",
+        source_metadata_collection="legacy__meta",
+        target_metadata_collection="current__meta",
+        timeout_seconds=1.0,
+    )
+
+    migration._assert_strong_ordering_support()
 
 
 def test_migration_readiness_polls_until_green_and_indexes_visible() -> None:

@@ -31,7 +31,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 # Make ``python scripts/maintenance/qdrant_migrate.py`` work from a checkout
 # without requiring an editable install.
@@ -644,19 +644,41 @@ class QdrantMigration:
     ) -> dict[str, Any]:
         method = method.upper()
         request_params = dict(params or {})
-        endpoint = path.rstrip("/")
+        segments = [
+            segment
+            for segment in urlsplit(path).path.rstrip("/").split("/")
+            if segment
+        ]
+        is_collection_endpoint = (
+            len(segments) == 2 and segments[0] == "collections"
+        )
+        is_point_upsert_endpoint = (
+            len(segments) == 3
+            and segments[0] == "collections"
+            and segments[2] == "points"
+        )
+        is_point_delete_endpoint = (
+            len(segments) == 4
+            and segments[0] == "collections"
+            and segments[2:4] == ["points", "delete"]
+        )
+        is_index_endpoint = (
+            len(segments) in {3, 4}
+            and segments[0] == "collections"
+            and segments[2] == "index"
+        )
         requires_completed = False
         if mutation:
             if (
-                (method == "PUT" and endpoint.endswith("/points"))
-                or (method == "POST" and endpoint.endswith("/points/delete"))
+                (method == "PUT" and is_point_upsert_endpoint)
+                or (method == "POST" and is_point_delete_endpoint)
             ):
                 request_params.update({"wait": "true", "ordering": "strong"})
                 requires_completed = True
-            elif "/index" in endpoint:
+            elif is_index_endpoint:
                 request_params.update({"wait": "true", "timeout": self._timeout_param()})
                 requires_completed = True
-            elif endpoint.startswith("/collections/") and endpoint.count("/") == 2:
+            elif is_collection_endpoint:
                 request_params.pop("wait", None)
                 request_params.pop("ordering", None)
                 request_params["timeout"] = self._timeout_param()
@@ -675,7 +697,11 @@ class QdrantMigration:
         version = value.get("version") if isinstance(value, Mapping) else None
         if not isinstance(version, str):
             raise MigrationError("Qdrant version is missing from the root response")
-        match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?", version.strip())
+        match = re.fullmatch(
+            r"v?(\d+)\.(\d+)\.(\d+)"
+            r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
+            version.strip(),
+        )
         if match is None:
             raise MigrationError(f"Qdrant version is unparseable: {version!r}")
         parsed = tuple(int(part) for part in match.groups())

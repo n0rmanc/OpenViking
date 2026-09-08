@@ -83,6 +83,9 @@ def _index_request(requests):
         if method == "GET":
             return {
                 "result": {
+                    "status": "green",
+                    "optimizer_status": "ok",
+                    "update_queue": 0,
                     "payload_schema": {
                         field: {"data_type": "keyword"} for field in remote_indexes
                     }
@@ -1028,6 +1031,78 @@ def test_point_mutations_require_completed_result() -> None:
         )
 
 
+def _readiness_collection(transport, *, timeout_seconds: float = 10.0) -> QdrantCollection:
+    return QdrantCollection(
+        client=QdrantRestClient(
+            "http://qdrant.local",
+            timeout_seconds=timeout_seconds,
+            opener=transport,
+        ),
+        collection_name="docs",
+        metadata_collection_name="docs__meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("readiness", "match"),
+    [
+        ({"status": "red", "optimizer_status": "ok"}, "not ready"),
+        (
+            {
+                "status": "green",
+                "optimizer_status": {"error": "optimizer failed"},
+            },
+            "not ready",
+        ),
+    ],
+)
+def test_payload_index_readiness_rejects_error_states(readiness, match: str) -> None:
+    transport = _ScriptedTransport(
+        (
+            200,
+            {
+                "result": {
+                    **readiness,
+                    "payload_schema": {"account_id": {}},
+                }
+            },
+        )
+    )
+    collection = _readiness_collection(transport)
+
+    with pytest.raises(QdrantError, match=match):
+        collection._wait_payload_index("account_id", present=True)
+
+
+def test_payload_index_readiness_times_out_with_pending_work() -> None:
+    transport = _ScriptedTransport(
+        *(
+            (
+                200,
+                {
+                    "result": {
+                        "status": "green",
+                        "optimizer_status": "ok",
+                        "update_queue": 1,
+                        "payload_schema": {"account_id": {}},
+                    }
+                },
+            )
+            for _ in range(100)
+        )
+    )
+    collection = _readiness_collection(transport, timeout_seconds=0.01)
+
+    with pytest.raises(QdrantError, match="did not become"):
+        collection._wait_payload_index("account_id", present=True)
+
+
 def test_collection_lifecycle_writes_marker_and_payload_indexes() -> None:
     transport = _ScriptedTransport(
         (404, {}),
@@ -1064,6 +1139,9 @@ def test_collection_lifecycle_writes_marker_and_payload_indexes() -> None:
                 200,
                 {
                     "result": {
+                        "status": "green",
+                        "optimizer_status": "ok",
+                        "update_queue": 0,
                         "payload_schema": {
                             "account_id": {},
                             "search_tags": {},
@@ -1078,6 +1156,9 @@ def test_collection_lifecycle_writes_marker_and_payload_indexes() -> None:
                 200,
                 {
                     "result": {
+                        "status": "green",
+                        "optimizer_status": "ok",
+                        "update_queue": 0,
                         "payload_schema": {
                             "account_id": {},
                             "search_tags": {},
@@ -1092,6 +1173,9 @@ def test_collection_lifecycle_writes_marker_and_payload_indexes() -> None:
                 200,
                 {
                     "result": {
+                        "status": "green",
+                        "optimizer_status": "ok",
+                        "update_queue": 0,
                         "payload_schema": {
                             "account_id": {},
                             "search_tags": {},
@@ -1106,6 +1190,9 @@ def test_collection_lifecycle_writes_marker_and_payload_indexes() -> None:
                 200,
                 {
                     "result": {
+                        "status": "green",
+                        "optimizer_status": "ok",
+                        "update_queue": 0,
                         "payload_schema": {
                             "account_id": {},
                             "search_tags": {},
