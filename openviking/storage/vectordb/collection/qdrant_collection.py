@@ -36,6 +36,8 @@ _INTERNAL_PAYLOAD_FIELDS = {
 _ADAPTER_MARKER_FIELDS = {
     "_openviking_meta_version",
     "collection_name",
+    "metadata_collection_name",
+    "logical_collection",
     "schema",
     "dense_vector_name",
     "sparse_vector_name",
@@ -44,6 +46,29 @@ _ADAPTER_MARKER_FIELDS = {
     "sparse_enabled",
     "sparse_weight",
     "indexes",
+}
+_MIGRATION_MARKER_FIELDS = {
+    "migration_id",
+    "migration_state",
+    "migrator_version",
+    "source_collection",
+    "source_metadata_collection",
+    "source_fingerprint",
+    "metadata_fingerprint",
+    "sparse_map_fingerprint",
+    "target_count",
+    "target_collection",
+    "target_metadata_collection",
+    "vector_dimension",
+}
+_MIGRATION_STATE_SETUP = {
+    "building": False,
+    "failed": False,
+    "rolled_back": False,
+    "ready": True,
+    "cutting_over": True,
+    "active": True,
+    "retained": True,
 }
 
 
@@ -68,6 +93,7 @@ class QdrantCollection(ICollection):
         distance: str,
         sparse_enabled: bool,
         sparse_weight: float,
+        logical_collection: str | None = None,
     ) -> None:
         self._client = client
         self._collection_name = collection_name
@@ -82,6 +108,8 @@ class QdrantCollection(ICollection):
         self._indexes: dict[str, dict[str, Any]] = {}
         self._sparse_dictionary: SparseTermDictionary | None = None
         self._migration_marker_fields: dict[str, Any] | None = None
+        self._logical_collection = logical_collection
+        self._marker_loaded_from_remote = False
 
     @staticmethod
     def _normalize_distance(distance: str) -> str:
@@ -163,27 +191,27 @@ class QdrantCollection(ICollection):
         self._create_collection(self._collection_name)
         self._create_collection(self._metadata_collection_name, metadata=True)
         self._migration_marker_fields = {}
+        self._marker_loaded_from_remote = False
         self._write_metadata_marker()
 
     def has_openviking_metadata(self) -> bool:
         payload = self._load_metadata_marker()
-        setup_complete = payload.get("setup_complete", True) if payload else None
-        return bool(
-            payload
-            and isinstance(setup_complete, bool)
-            and setup_complete
-            and payload.get("_openviking_meta_version") == _META_VERSION
-            and payload.get("collection_name") == self._collection_name
-            and isinstance(payload.get("schema"), dict)
-        )
+        if not payload:
+            return False
+        try:
+            self._validate_marker_binding(payload)
+        except RuntimeError:
+            return False
+        return True
 
     def _metadata_payload(self) -> dict[str, Any]:
         if self._migration_marker_fields is None:
             self._load_metadata_marker()
-        return {
+        payload = {
             **(self._migration_marker_fields or {}),
             "_openviking_meta_version": _META_VERSION,
             "collection_name": self._collection_name,
+            "metadata_collection_name": self._metadata_collection_name,
             "schema": self._schema,
             "dense_vector_name": self._dense_vector_name,
             "sparse_vector_name": self._sparse_vector_name,
@@ -193,8 +221,25 @@ class QdrantCollection(ICollection):
             "sparse_weight": self._sparse_weight,
             "indexes": self._indexes,
         }
+        if self._logical_collection is not None:
+            payload["logical_collection"] = self._logical_collection
+        if self._is_migration_marker(payload):
+            payload["vector_dimension"] = self._vector_dim
+        return payload
 
     def _write_metadata_marker(self) -> None:
+        if self._marker_loaded_from_remote:
+            marker = self._load_metadata_marker()
+            if marker is None:
+                raise RuntimeError(
+                    f"Qdrant metadata marker disappeared for {self._collection_name!r}"
+                )
+            self._validate_marker_binding(marker)
+            self._migration_marker_fields = {
+                name: value
+                for name, value in marker.items()
+                if name not in _ADAPTER_MARKER_FIELDS
+            }
         self._upsert_points(
             self._metadata_collection_name,
             [
@@ -207,6 +252,7 @@ class QdrantCollection(ICollection):
         )
 
     def _load_metadata_marker(self) -> dict[str, Any] | None:
+        self._marker_loaded_from_remote = True
         if not self._exists(self._metadata_collection_name):
             self._migration_marker_fields = {}
             return None
@@ -229,6 +275,130 @@ class QdrantCollection(ICollection):
         }
         return payload
 
+    @staticmethod
+    def _is_migration_marker(marker: dict[str, Any]) -> bool:
+        return any(name in marker for name in _MIGRATION_MARKER_FIELDS)
+
+    def _validate_marker_binding(self, marker: dict[str, Any]) -> None:
+        if marker.get("_openviking_meta_version") != _META_VERSION:
+            raise RuntimeError(
+                f"Qdrant collection {self._collection_name!r} has no valid current marker"
+            )
+        migration_marker = self._is_migration_marker(marker)
+        setup_complete = marker.get("setup_complete", True)
+        if migration_marker and "setup_complete" not in marker:
+            raise RuntimeError(
+                f"Qdrant collection {self._collection_name!r} has no setup_complete flag"
+            )
+        if not isinstance(setup_complete, bool):
+            raise RuntimeError(
+                f"Qdrant collection {self._collection_name!r} has an invalid setup_complete flag"
+            )
+        migration_state = marker.get("migration_state")
+        if migration_marker and migration_state is not None:
+            expected_setup = (
+                _MIGRATION_STATE_SETUP.get(migration_state)
+                if isinstance(migration_state, str)
+                else None
+            )
+            if expected_setup is None:
+                raise RuntimeError(
+                    f"Qdrant migration marker has an invalid migration state: {migration_state!r}"
+                )
+            if setup_complete is not expected_setup:
+                raise RuntimeError(
+                    "Qdrant migration marker migration_state and setup_complete disagree"
+                )
+        if not setup_complete:
+            raise RuntimeError(
+                f"Qdrant collection {self._collection_name!r} has an incomplete migration"
+            )
+        if marker.get("migration_state") == "rolled_back":
+            raise RuntimeError(
+                f"Qdrant collection {self._collection_name!r} has been rolled back"
+            )
+        if marker.get("collection_name") != self._collection_name:
+            raise RuntimeError(
+                f"Qdrant metadata collection does not belong to {self._collection_name!r}"
+            )
+        if (
+            "metadata_collection_name" in marker
+            and marker["metadata_collection_name"] != self._metadata_collection_name
+        ):
+            raise RuntimeError(
+                "Qdrant metadata marker is bound to a different metadata collection"
+            )
+        logical_collection = marker.get("logical_collection")
+        if migration_marker and (
+            self._logical_collection is None
+            or logical_collection != self._logical_collection
+        ):
+            raise RuntimeError(
+                "Qdrant migration marker is missing or bound to a different logical collection"
+            )
+        if (
+            logical_collection is not None
+            and self._logical_collection is not None
+            and logical_collection != self._logical_collection
+        ):
+            raise RuntimeError(
+                "Qdrant metadata marker is bound to a different logical collection"
+            )
+        schema = marker.get("schema")
+        if not isinstance(schema, dict):
+            raise RuntimeError(
+                f"Qdrant collection {self._collection_name!r} has no metadata schema"
+            )
+
+        marker_vector_dim = marker.get("vector_dim")
+        if marker_vector_dim is not None and (
+            isinstance(marker_vector_dim, bool)
+            or not isinstance(marker_vector_dim, int)
+            or marker_vector_dim <= 0
+        ):
+            raise RuntimeError("Qdrant metadata marker has an invalid vector dimension")
+        marker_vector_dimension = marker.get("vector_dimension")
+        if marker_vector_dimension is not None and (
+            isinstance(marker_vector_dimension, bool)
+            or not isinstance(marker_vector_dimension, int)
+            or marker_vector_dimension <= 0
+        ):
+            raise RuntimeError("Qdrant metadata marker has an invalid vector_dimension")
+        if marker_vector_dimension is not None and marker_vector_dimension != marker_vector_dim:
+            raise RuntimeError(
+                "Qdrant metadata marker vector_dimension does not match vector_dim"
+            )
+        if not migration_marker:
+            return
+        if marker_vector_dim is not None and self._vector_dim > 0:
+            if marker_vector_dim != self._vector_dim:
+                raise RuntimeError(
+                    "Qdrant migration marker vector dimension differs from configured dimension"
+                )
+        if "dense_vector_name" in marker and marker["dense_vector_name"] != self._dense_vector_name:
+            raise RuntimeError("Qdrant migration marker dense vector name differs")
+        if "sparse_vector_name" in marker and marker["sparse_vector_name"] != self._sparse_vector_name:
+            raise RuntimeError("Qdrant migration marker sparse vector name differs")
+        if "distance" in marker:
+            try:
+                marker_distance = self._normalize_distance(marker["distance"])
+            except ValueError as exc:
+                raise RuntimeError("Qdrant migration marker has an invalid distance") from exc
+            if marker_distance != self._distance:
+                raise RuntimeError("Qdrant migration marker distance differs")
+        if "sparse_enabled" in marker:
+            if not isinstance(marker["sparse_enabled"], bool):
+                raise RuntimeError("Qdrant migration marker sparse policy is invalid")
+            if marker["sparse_enabled"] != self._sparse_enabled:
+                raise RuntimeError("Qdrant migration marker sparse policy differs")
+        if "sparse_weight" in marker:
+            try:
+                marker_weight = float(marker["sparse_weight"])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("Qdrant migration marker sparse weight is invalid") from exc
+            if not math.isclose(marker_weight, self._sparse_weight):
+                raise RuntimeError("Qdrant migration marker sparse weight differs")
+
     def _ensure_loaded(self) -> None:
         if self._schema:
             return
@@ -237,19 +407,7 @@ class QdrantCollection(ICollection):
             raise RuntimeError(
                 f"Qdrant collection {self._collection_name!r} is missing OpenViking metadata"
             )
-        setup_complete = marker.get("setup_complete", True)
-        if not isinstance(setup_complete, bool):
-            raise RuntimeError(
-                f"Qdrant collection {self._collection_name!r} has an invalid setup_complete flag"
-            )
-        if not setup_complete:
-            raise RuntimeError(
-                f"Qdrant collection {self._collection_name!r} has an incomplete migration"
-            )
-        if marker.get("collection_name") != self._collection_name:
-            raise RuntimeError(
-                f"Qdrant metadata collection does not belong to {self._collection_name!r}"
-            )
+        self._validate_marker_binding(marker)
         self._schema = dict(marker["schema"])
         self._vector_dim = int(marker.get("vector_dim") or self._vector_dim)
         self._dense_vector_name = str(
@@ -567,7 +725,7 @@ class QdrantCollection(ICollection):
         payload = dict(point.get("payload") or {})
         original_id = payload.pop("_openviking_original_id", None)
         if original_id is None:
-            original_id = point.get("id")
+            raise ValueError("Qdrant payload is missing _openviking_original_id")
         for field in _INTERNAL_PAYLOAD_FIELDS:
             payload.pop(field, None)
         payload["id"] = original_id

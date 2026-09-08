@@ -1159,6 +1159,145 @@ def test_metadata_marker_round_trips_index_metadata() -> None:
     assert reloaded.get_index_meta_data("default") == {"ScalarIndex": ["account_id"]}
 
 
+def test_migration_marker_binds_physical_and_logical_names() -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="generation-data",
+        metadata_collection_name="generation-meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+        logical_collection="project/docs",
+    )
+    collection._load_metadata_marker = lambda: {  # type: ignore[method-assign]
+        "_openviking_meta_version": 1,
+        "collection_name": "generation-data",
+        "metadata_collection_name": "wrong-meta",
+        "logical_collection": "project/other",
+        "migration_id": "migration-1",
+        "migration_state": "active",
+        "schema": {"CollectionName": "docs", "Fields": []},
+        "dense_vector_name": "dense",
+        "sparse_vector_name": "sparse",
+        "vector_dim": 2,
+        "distance": "Cosine",
+        "sparse_enabled": False,
+        "sparse_weight": 0.0,
+        "indexes": {},
+        "setup_complete": True,
+    }
+
+    with pytest.raises(RuntimeError, match="metadata collection|logical collection"):
+        collection.get_meta_data()
+
+
+def test_migration_marker_requires_consistent_vector_dimension() -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="generation-data",
+        metadata_collection_name="generation-meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+        logical_collection="project/docs",
+    )
+    collection._load_metadata_marker = lambda: {  # type: ignore[method-assign]
+        "_openviking_meta_version": 1,
+        "collection_name": "generation-data",
+        "metadata_collection_name": "generation-meta",
+        "logical_collection": "project/docs",
+        "migration_id": "migration-1",
+        "migration_state": "active",
+        "schema": {"CollectionName": "docs", "Fields": []},
+        "vector_dim": 2,
+        "vector_dimension": 3,
+        "setup_complete": True,
+    }
+
+    with pytest.raises(RuntimeError, match="vector"):
+        collection.get_meta_data()
+
+
+def test_migration_marker_rejects_state_setup_mismatch() -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="generation-data",
+        metadata_collection_name="generation-meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+        logical_collection="project/docs",
+    )
+    collection._load_metadata_marker = lambda: {  # type: ignore[method-assign]
+        "_openviking_meta_version": 1,
+        "collection_name": "generation-data",
+        "metadata_collection_name": "generation-meta",
+        "logical_collection": "project/docs",
+        "migration_id": "migration-1",
+        "migration_state": "building",
+        "schema": {"CollectionName": "docs", "Fields": []},
+        "vector_dim": 2,
+        "setup_complete": True,
+    }
+
+    with pytest.raises(RuntimeError, match="setup|state"):
+        collection.get_meta_data()
+
+
+def test_metadata_rewrite_preserves_latest_migration_provenance() -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="generation-data",
+        metadata_collection_name="generation-meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+        logical_collection="project/docs",
+    )
+    collection._schema = {"CollectionName": "docs", "Fields": []}
+    collection._migration_marker_fields = {
+        "migration_id": "migration-1",
+        "migration_state": "active",
+        "source_fingerprint": "source",
+        "target_count": 1,
+    }
+    collection._marker_loaded_from_remote = True
+    latest_marker = {
+        "_openviking_meta_version": 1,
+        "collection_name": "generation-data",
+        "metadata_collection_name": "generation-meta",
+        "logical_collection": "project/docs",
+        "migration_id": "migration-1",
+        "migration_state": "cutting_over",
+        "source_fingerprint": "source",
+        "target_count": 2,
+        "schema": {"CollectionName": "docs", "Fields": []},
+        "setup_complete": True,
+    }
+    collection._load_metadata_marker = lambda: latest_marker  # type: ignore[method-assign]
+    marker: dict[str, object] = {}
+    collection._upsert_points = (  # type: ignore[method-assign]
+        lambda _name, points: marker.update(points[0]["payload"])
+    )
+
+    collection.update(description="updated")
+
+    assert marker["migration_state"] == "cutting_over"
+    assert marker["target_count"] == 2
+
+
 def test_metadata_updates_preserve_migration_provenance() -> None:
     collection = QdrantCollection(
         client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
@@ -1193,6 +1332,25 @@ def test_metadata_updates_preserve_migration_provenance() -> None:
     for field_name, expected in collection._migration_marker_fields.items():
         assert marker[field_name] == expected
     assert marker["schema"]["Description"] == "updated"
+
+
+def test_payload_to_record_requires_original_id() -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="docs",
+        metadata_collection_name="docs__meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+    )
+
+    with pytest.raises(ValueError, match="_openviking_original_id"):
+        collection._payload_to_record(
+            {"id": to_qdrant_point_id("doc-1"), "payload": {"uri": "/resources/doc.md"}}
+        )
 
 
 def test_incomplete_migration_marker_is_not_loadable() -> None:
@@ -1646,6 +1804,55 @@ def test_adapter_recomputes_physical_collection_name_when_logical_name_changes()
     adapter._collection_name = "created"
 
     assert adapter._new_collection()._collection_name == "project__created"
+
+
+def test_explicit_qdrant_physical_names_override_custom_params() -> None:
+    config = VectorDBBackendConfig(
+        backend="qdrant",
+        project="default",
+        name="context",
+        dimension=2,
+        custom_params={
+            "data_collection_name": "custom-data",
+            "metadata_collection_name": "custom-meta",
+        },
+        qdrant={
+            "url": "http://qdrant.local",
+            "data_collection_name": "generation-data",
+            "metadata_collection_name": "generation-meta",
+        },
+    )
+    adapter = QdrantCollectionAdapter.from_config(config)
+    collection = adapter._new_collection()
+    assert collection._collection_name == "generation-data"
+    assert collection._metadata_collection_name == "generation-meta"
+
+
+def test_data_name_only_derives_metadata_sidecar() -> None:
+    config = VectorDBBackendConfig(
+        backend="qdrant",
+        qdrant={
+            "url": "http://qdrant.local",
+            "data_collection_name": "generation-data",
+        },
+        dimension=2,
+    )
+    adapter = QdrantCollectionAdapter.from_config(config)
+    collection = adapter._new_collection()
+    assert collection._collection_name == "generation-data"
+    assert collection._metadata_collection_name == "generation-data__openviking_meta"
+
+
+def test_omitted_physical_names_keep_project_name_derivation() -> None:
+    config = VectorDBBackendConfig(
+        backend="qdrant",
+        qdrant={"url": "http://qdrant.local"},
+        project="project",
+        name="docs",
+        dimension=2,
+    )
+    adapter = QdrantCollectionAdapter.from_config(config)
+    assert adapter._new_collection()._collection_name == "project__docs"
 
 
 def test_qdrant_config_accepts_nested_url_and_keeps_content_disabled() -> None:
