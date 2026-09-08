@@ -96,6 +96,46 @@ def _index_request(requests):
     return request
 
 
+def _target_marker(**updates):
+    marker = {
+        "_openviking_meta_version": 1,
+        "collection_name": "generation-data",
+        "metadata_collection_name": "generation-meta",
+        "logical_collection": "project/docs",
+        "migration_id": "migration-1",
+        "migration_state": "ready",
+        "migrator_version": "qdrant-blue-green-v1",
+        "source_collection": "legacy-data",
+        "source_metadata_collection": "legacy-meta",
+        "source_fingerprint": "source-fingerprint",
+        "metadata_fingerprint": "metadata-fingerprint",
+        "sparse_map_fingerprint": "sparse-map-fingerprint",
+        "target_count": 1,
+        "target_collection": "generation-data",
+        "target_metadata_collection": "generation-meta",
+        "vector_dimension": 2,
+        "dense_datatype": "float16",
+        "sparse_modifier": "idf",
+        "sparse_datatype": "float16",
+        "acl_incomplete_count": 0,
+        "sparse_term_count": 2,
+        "sparse_term_fingerprint": "sparse-term-fingerprint",
+        "source_count": 1,
+        "setup_complete": True,
+        "schema": {"CollectionName": "docs", "Fields": []},
+        "dense_vector_name": "dense",
+        "sparse_vector_name": "sparse",
+        "vector_dim": 2,
+        "distance": "Cosine",
+        "sparse_enabled": True,
+        "sparse_weight": 0.5,
+        "indexes": {},
+    }
+    marker = dict(marker)
+    marker.update(updates)
+    return marker
+
+
 def test_path_payload_includes_self_and_ancestors() -> None:
     payload = build_qdrant_payload(
         {
@@ -1392,6 +1432,303 @@ def test_metadata_marker_round_trips_index_metadata() -> None:
     assert reloaded.get_meta_data() == {"CollectionName": "docs", "Fields": []}
     assert reloaded.has_index("default")
     assert reloaded.get_index_meta_data("default") == {"ScalarIndex": ["account_id"]}
+
+
+def test_explicit_pair_routes_create_upsert_fetch_delete_to_target_names() -> None:
+    marker = {
+        "_openviking_meta_version": 1,
+        "collection_name": "generation-data",
+        "metadata_collection_name": "generation-meta",
+        "logical_collection": "project/docs",
+        "schema": {"CollectionName": "docs", "Fields": []},
+        "dense_vector_name": "vector",
+        "sparse_vector_name": "sparse_vector",
+        "vector_dim": 2,
+        "distance": "Cosine",
+        "sparse_enabled": True,
+        "sparse_weight": 0.5,
+        "indexes": {},
+        "setup_complete": True,
+    }
+    config = VectorDBBackendConfig(
+        backend="qdrant",
+        qdrant={
+            "url": "http://qdrant.local",
+            "data_collection_name": "generation-data",
+            "metadata_collection_name": "generation-meta",
+        },
+        project="project",
+        name="docs",
+        dimension=2,
+        sparse_weight=0.5,
+    )
+    adapter = QdrantCollectionAdapter.from_config(config)
+    transport = _ScriptedTransport(
+        (404, {}),
+        (404, {}),
+        (404, {}),
+        (200, {"result": True}),
+        (200, {"result": {"status": "green", "optimizer_status": "ok"}}),
+        (200, {"result": True}),
+        (200, {"result": {"status": "green", "optimizer_status": "ok"}}),
+        (200, {"result": {"status": "completed"}}),
+        (200, {"result": {"status": "completed"}}),
+        (
+            200,
+            {
+                "result": {
+                    "status": "green",
+                    "optimizer_status": "ok",
+                    "payload_schema": {"uri_depth": {}},
+                }
+            },
+        ),
+        (200, {"result": {"status": "completed"}}),
+        (
+            200,
+            {
+                "result": {
+                    "status": "green",
+                    "optimizer_status": "ok",
+                    "payload_schema": {"uri_depth": {}, "scope_roots": {}},
+                }
+            },
+        ),
+        (200, {"result": True}),
+        (
+            200,
+            {
+                "result": [
+                    {
+                        "id": to_qdrant_point_id("openviking:metadata"),
+                        "payload": marker,
+                    }
+                ]
+            },
+        ),
+        (200, {"result": {"status": "completed"}}),
+        (200, {"result": {"status": "completed"}}),
+        (
+            200,
+            {
+                "result": [
+                    {
+                        "id": to_qdrant_point_id("doc-1"),
+                        "payload": {"_openviking_original_id": "doc-1"},
+                    }
+                ]
+            },
+        ),
+        (200, {"result": {"status": "completed"}}),
+    )
+    adapter._client = QdrantRestClient("http://qdrant.local", opener=transport)
+
+    assert adapter.create_collection(
+        "docs",
+        {"CollectionName": "docs", "Fields": []},
+        distance="cosine",
+        sparse_weight=0.5,
+        index_name="default",
+    )
+    assert adapter.upsert({"id": "doc-1", "vector": [0.1, 0.2]}) == ["doc-1"]
+    assert adapter.get(["doc-1"]) == [{"id": "doc-1"}]
+    assert adapter.delete(ids=["doc-1"]) == 1
+
+    paths = [(request["method"], urlsplit(request["url"]).path) for request in transport.requests]
+    assert paths[3:8] == [
+        ("PUT", "/collections/generation-data"),
+        ("GET", "/collections/generation-data"),
+        ("PUT", "/collections/generation-meta"),
+        ("GET", "/collections/generation-meta"),
+        ("PUT", "/collections/generation-meta/points"),
+    ]
+    assert ("PUT", "/collections/generation-data/points") in paths
+    assert ("POST", "/collections/generation-data/points") in paths
+    assert ("POST", "/collections/generation-data/points/delete") in paths
+    assert not any("project__docs" in path for _, path in paths)
+
+
+def test_target_marker_round_trips_logical_and_physical_identity() -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="generation-data",
+        metadata_collection_name="generation-meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=True,
+        sparse_weight=0.5,
+        logical_collection="project/docs",
+    )
+    collection._schema = {"CollectionName": "docs", "Fields": []}
+    collection._migration_marker_fields = {
+        name: value
+        for name, value in _target_marker().items()
+        if name
+        not in {
+            "_openviking_meta_version",
+            "collection_name",
+            "metadata_collection_name",
+            "logical_collection",
+            "schema",
+            "dense_vector_name",
+            "sparse_vector_name",
+            "vector_dim",
+            "distance",
+            "sparse_enabled",
+            "sparse_weight",
+            "indexes",
+        }
+    }
+    marker = collection._metadata_payload()
+
+    reloaded = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="generation-data",
+        metadata_collection_name="generation-meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=True,
+        sparse_weight=0.5,
+        logical_collection="project/docs",
+    )
+    reloaded._load_metadata_marker = lambda: marker  # type: ignore[method-assign]
+
+    assert reloaded.has_openviking_metadata()
+    assert reloaded.get_meta_data() == {"CollectionName": "docs", "Fields": []}
+    assert marker["collection_name"] == "generation-data"
+    assert marker["metadata_collection_name"] == "generation-meta"
+    assert marker["logical_collection"] == "project/docs"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("dense_vector_name", "other-dense"),
+        ("sparse_vector_name", "other-sparse"),
+        ("distance", "Dot"),
+        ("sparse_enabled", False),
+        ("sparse_weight", 0.25),
+    ],
+)
+def test_vector_layout_and_sparse_policy_mismatch_is_rejected(
+    field: str,
+    value: object,
+) -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="generation-data",
+        metadata_collection_name="generation-meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=True,
+        sparse_weight=0.5,
+        logical_collection="project/docs",
+    )
+    marker = _target_marker(**{field: value})
+    collection._load_metadata_marker = lambda: marker  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="differs"):
+        collection.get_meta_data()
+
+
+def test_migration_fields_survive_normal_marker_rewrites() -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="generation-data",
+        metadata_collection_name="generation-meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=True,
+        sparse_weight=0.5,
+        logical_collection="project/docs",
+    )
+    marker_fields = {
+        name: value
+        for name, value in _target_marker().items()
+        if name
+        not in {
+            "_openviking_meta_version",
+            "collection_name",
+            "metadata_collection_name",
+            "logical_collection",
+            "schema",
+            "dense_vector_name",
+            "sparse_vector_name",
+            "vector_dim",
+            "distance",
+            "sparse_enabled",
+            "sparse_weight",
+            "indexes",
+        }
+    }
+    collection._schema = {"CollectionName": "docs", "Fields": []}
+    collection._migration_marker_fields = marker_fields
+    marker = {}
+    collection._upsert_points = (  # type: ignore[method-assign]
+        lambda _name, points: marker.update(points[0]["payload"])
+    )
+
+    collection.update(description="rewritten")
+
+    for field_name, expected in marker_fields.items():
+        assert marker[field_name] == expected
+    assert marker["schema"]["Description"] == "rewritten"
+
+
+def test_legacy_marker_is_not_loadable_by_current_adapter() -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="generation-data",
+        metadata_collection_name="generation-meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+        logical_collection="project/docs",
+    )
+    collection._load_metadata_marker = lambda: {  # type: ignore[method-assign]
+        "kind": "collection",
+        "collection_key": "legacy__context",
+        "logical_collection_name": "context",
+        "project_name": "legacy",
+        "meta": {"CollectionName": "context", "Fields": []},
+    }
+
+    assert collection.has_openviking_metadata() is False
+    with pytest.raises(RuntimeError, match="valid current marker"):
+        collection.get_meta_data()
+
+
+def test_missing_original_id_does_not_fabricate_a_record_id() -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="docs",
+        metadata_collection_name="docs__meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+    )
+
+    with pytest.raises(ValueError, match="_openviking_original_id"):
+        collection._payload_to_record(
+            {
+                "id": to_qdrant_point_id("fabricated"),
+                "payload": {"uri": "/resources/doc.md"},
+            }
+        )
 
 
 def test_migration_marker_binds_physical_and_logical_names() -> None:

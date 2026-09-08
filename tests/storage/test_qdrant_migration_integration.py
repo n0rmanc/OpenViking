@@ -85,6 +85,7 @@ def test_pre3872_migration_round_trips_through_current_adapter() -> None:
     client = QdrantRestClient(
         QDRANT_URL,
         api_key=os.environ.get("QDRANT_API_KEY"),
+        timeout_seconds=30,
     )
     migration = QdrantMigration(
         client=client,
@@ -94,8 +95,9 @@ def test_pre3872_migration_round_trips_through_current_adapter() -> None:
         target_metadata_collection=target_metadata,
         batch_size=1,
         sparse_map={111: "hello", 222: "world"},
-        logical_collection="legacy/context",
+        logical_collection=f"{project}/context",
         migration_id=suffix,
+        timeout_seconds=30,
     )
     fields = [
         {"FieldName": "id", "FieldType": "string", "IsPrimaryKey": True},
@@ -209,7 +211,12 @@ def test_pre3872_migration_round_trips_through_current_adapter() -> None:
             f"/collections/{source}",
             {
                 "vectors": {"size": 2, "distance": "Cosine", "datatype": "float32"},
-                "sparse_vectors": {"sparse_vector": {"modifier": "idf"}},
+                "sparse_vectors": {
+                    "sparse_vector": {
+                        "modifier": "idf",
+                        "index": {"datatype": "float16"},
+                    }
+                },
             },
             params={"wait": "true"},
         )
@@ -241,13 +248,36 @@ def test_pre3872_migration_round_trips_through_current_adapter() -> None:
         assert plan.vector_dimension == 2
         assert plan.dense_datatype == "float32"
         assert plan.sparse_modifier == "idf"
+        assert plan.sparse_datatype == "float16"
         assert plan.sparse_term_count == 2
 
-        result = migration.apply(confirm=True, plan=plan, lock_held=True)
-        assert result.source_count == 3
-        assert result.migrated_count == 3
-        assert result.skipped_count == 0
-        assert result.target_count == 3
+        prepared = migration.prepare(
+            confirm=True,
+            plan=plan,
+            lock_held=True,
+        )
+        assert prepared["migration_state"] == "building"
+        backfilled = migration.backfill(
+            confirm=True,
+            plan=plan,
+            lock_held=True,
+        )
+        assert backfilled["backfill_complete"] is True
+        assert backfilled["target_count"] == 3
+        reconciled = migration.reconcile(
+            confirm=True,
+            plan=plan,
+            lock_held=True,
+        )
+        assert reconciled["migration_state"] == "building"
+        verified = migration.verify(
+            plan=plan,
+            confirm=True,
+            lock_held=True,
+        )
+        assert verified["migration_state"] == "ready"
+        assert verified["source_count"] == 3
+        assert verified["target_count"] == 3
 
         target_info = _result(client.request("GET", f"/collections/{target}"))
         assert isinstance(target_info, Mapping)
@@ -259,6 +289,7 @@ def test_pre3872_migration_round_trips_through_current_adapter() -> None:
         assert str(vectors["vector"].get("datatype")).lower() == "float32"
         sparse_vectors = target_params["sparse_vectors"]
         assert sparse_vectors["sparse_vector"]["modifier"] == "idf"
+        assert sparse_vectors["sparse_vector"]["index"]["datatype"] == "float16"
         payload_schema = target_info["payload_schema"]
         assert isinstance(payload_schema, Mapping)
         assert payload_schema["account_id"]["data_type"] == "keyword"
@@ -300,6 +331,34 @@ def test_pre3872_migration_round_trips_through_current_adapter() -> None:
             if point["id"] == to_qdrant_point_id("openviking:metadata")
         )
         assert marker["setup_complete"] is True
+        assert marker["migration_state"] == "ready"
+        assert marker["migrator_version"] == "qdrant-blue-green-v1"
+        assert marker["collection_name"] == target
+        assert marker["metadata_collection_name"] == target_metadata
+        assert marker["logical_collection"] == f"{project}/context"
+        assert marker["source_collection"] == source
+        assert marker["source_metadata_collection"] == source_metadata
+        assert marker["source_fingerprint"] == plan.source_fingerprint
+        assert marker["metadata_fingerprint"] == plan.metadata_fingerprint
+        assert marker["sparse_map_fingerprint"] == plan.sparse_map_fingerprint
+        assert marker["source_count"] == 3
+        assert marker["target_count"] == 3
+        assert marker["vector_dimension"] == 2
+        assert marker["dense_vector_name"] == "vector"
+        assert marker["sparse_vector_name"] == "sparse_vector"
+        assert marker["dense_datatype"] == "float32"
+        assert marker["sparse_modifier"] == "idf"
+        assert marker["sparse_datatype"] == "float16"
+        assert marker["transformed_source_fingerprint"] == verified[
+            "transformed_source_fingerprint"
+        ]
+        assert marker["target_content_fingerprint"] == verified[
+            "target_content_fingerprint"
+        ]
+        assert (
+            verified["transformed_source_fingerprint"]
+            == verified["target_content_fingerprint"]
+        )
 
         assert _scroll_all(client, source) == source_before
         assert _scroll_all(client, source_metadata) == metadata_before
@@ -310,6 +369,9 @@ def test_pre3872_migration_round_trips_through_current_adapter() -> None:
                 qdrant={
                     "url": QDRANT_URL,
                     "api_key": os.environ.get("QDRANT_API_KEY"),
+                    "timeout_seconds": 30,
+                    "data_collection_name": target,
+                    "metadata_collection_name": target_metadata,
                 },
                 project=project,
                 name="context",
@@ -363,6 +425,29 @@ def test_pre3872_migration_round_trips_through_current_adapter() -> None:
             limit=3,
             filters=path_filter,
         ).data
+
+        target_only_id = f"task9-target-only-{suffix}"
+        assert adapter.upsert(
+            {
+                "id": target_only_id,
+                "uri": "viking://resources/task9-target-only.md",
+                "vector": [0.3, 0.7],
+                "account_id": "acct-target",
+                "owner_user_id": "target",
+            }
+        ) == [target_only_id]
+        assert adapter.get([target_only_id]) == [
+            {
+                "id": target_only_id,
+                "uri": "viking://resources/task9-target-only.md",
+                "account_id": "acct-target",
+                "owner_user_id": "target",
+            }
+        ]
+        assert adapter.delete(ids=[target_only_id]) == 1
+        assert adapter.get([target_only_id]) == []
+        assert _scroll_all(client, source) == source_before
+        assert _scroll_all(client, source_metadata) == metadata_before
     finally:
         for collection_name in reversed(collection_names):
             _delete_collection(client, collection_name)
