@@ -19,6 +19,9 @@ Run from the repository root with the project virtual environment:
   --source-collection legacy__context \
   --target-collection current__context \
   --source-metadata-collection __openviking_meta \
+  --logical-collection legacy/context \
+  --migration-id migration-2026-09-08 \
+  --timeout-seconds 30 \
   --sparse-map /path/to/legacy-sparse-map.json \
   preflight
 ```
@@ -55,7 +58,8 @@ multiple named sparse vectors also requires `--sparse-vector-name`.
    legacy metadata sidecar. Keep both freezes in place for the whole
    preflight, apply, and verification window.
 2. Run `preflight` and save its JSON output. Confirm the source/target names,
-   exact counts, vector layout, sparse terms, and fingerprints.
+   exact counts, vector layout, sparse term count/fingerprint, and other
+   fingerprints.
 3. Review ownership normalization. For a user-scoped URI such as
    `/user/alice/memories/a.md`, a missing `owner_user_id` is derived as
    `alice`; the target payload can therefore intentionally differ from the
@@ -63,8 +67,8 @@ multiple named sparse vectors also requires `--sparse-vector-name`.
    an owner when their source value is null or absent. A malformed owner or an
    owner that does not match the URI fails preflight/apply closed. Verify a
    representative target payload against its URI before cutover. A
-   migration-owned target from an older script is backfilled only for this
-   missing/null-owner normalization; other target payload changes are preserved.
+   migration-owned target data is reconciled from the source-authoritative
+   transform; a newer divergent target payload is not silently preserved.
 4. Review the ACL gate. Records missing or containing malformed
    `acl_enabled`, `acl_direct_grants`, or `acl_inherited_grants` remain
    fail-open after the copy. Grant values must be encoded ACL tokens. Do not
@@ -78,8 +82,11 @@ multiple named sparse vectors also requires `--sparse-vector-name`.
      --source-collection legacy__context \
      --target-collection current__context \
      --source-metadata-collection __openviking_meta \
+     --logical-collection legacy/context \
+     --migration-id migration-2026-09-08 \
+     --timeout-seconds 30 \
      --sparse-map /path/to/legacy-sparse-map.json \
-     apply --plan /path/to/preflight.json --confirm --allow-acl-fail-open
+     apply --plan /path/to/preflight.json --confirm --lock-held --allow-acl-fail-open
    ```
 
    Set `QDRANT_API_KEY` in the environment when authentication is required;

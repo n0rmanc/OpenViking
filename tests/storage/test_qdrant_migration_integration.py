@@ -243,7 +243,7 @@ def test_pre3872_migration_round_trips_through_current_adapter() -> None:
         assert plan.sparse_modifier == "idf"
         assert plan.sparse_term_count == 2
 
-        result = migration.apply(confirm=True, plan=plan)
+        result = migration.apply(confirm=True, plan=plan, lock_held=True)
         assert result.source_count == 3
         assert result.migrated_count == 3
         assert result.skipped_count == 0

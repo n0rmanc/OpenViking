@@ -341,6 +341,70 @@ class _ScanManifest:
             first = False
         return digest.hexdigest()
 
+
+class _SparseDictionaryManifest:
+    """Disk-backed target sparse term/index bindings for one bounded scan."""
+
+    def __init__(self) -> None:
+        self._manifest = _ScanManifest()
+        self._connection = self._manifest.connection
+        self._connection.execute(
+            """
+            CREATE TABLE sparse_dictionary (
+                term TEXT PRIMARY KEY,
+                sparse_index INTEGER UNIQUE NOT NULL
+            )
+            """
+        )
+
+    def close(self) -> None:
+        self._manifest.close()
+
+    def __enter__(self) -> "_SparseDictionaryManifest":
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc_value: Any, _traceback: Any) -> None:
+        self.close()
+
+    def add(self, term: str, index: int) -> None:
+        existing_index = self.index_for_term(term)
+        if existing_index is not None and existing_index != index:
+            raise SparseMigrationError(
+                "target sparse dictionary maps source term to a different index: "
+                f"term={term!r} existing={existing_index} expected={index}"
+            )
+        existing_term = self.term_for_index(index)
+        if existing_term is not None and existing_term != term:
+            raise SparseMigrationError(
+                "target sparse dictionary collision: "
+                f"index={index} existing_term={existing_term!r} source_term={term!r}"
+            )
+        self._connection.execute(
+            "INSERT OR IGNORE INTO sparse_dictionary(term, sparse_index) VALUES (?, ?)",
+            (term, index),
+        )
+
+    def index_for_term(self, term: str) -> int | None:
+        row = self._connection.execute(
+            "SELECT sparse_index FROM sparse_dictionary WHERE term = ?",
+            (term,),
+        ).fetchone()
+        return int(row[0]) if row is not None else None
+
+    def term_for_index(self, index: int) -> str | None:
+        row = self._connection.execute(
+            "SELECT term FROM sparse_dictionary WHERE sparse_index = ?",
+            (index,),
+        ).fetchone()
+        return str(row[0]) if row is not None else None
+
+    def has_term(self, term: str) -> bool:
+        return self.index_for_term(term) is not None
+
+    def has_index(self, index: int) -> bool:
+        return self.term_for_index(index) is not None
+
+
 class _ScrollOffsets:
     """Disk-backed cycle detection for one Qdrant scroll."""
 
@@ -1754,11 +1818,14 @@ class QdrantMigration:
 
     def _validate_marker_ownership(self, marker: Mapping[str, Any]) -> None:
         expected_fields = {
+            "_openviking_meta_version": _META_VERSION,
             "collection_name": self.target_collection,
             "metadata_collection_name": self.target_metadata_collection,
             "logical_collection": self.logical_collection,
             "migration_id": self.migration_id,
             "migrator_version": self.migrator_version,
+            "source_collection": self.source_collection,
+            "source_metadata_collection": self.source_metadata_collection,
         }
         for field_name, expected in expected_fields.items():
             if marker.get(field_name) != expected:
@@ -1785,6 +1852,20 @@ class QdrantMigration:
         if setup_complete is not _MIGRATION_STATE_SETUP[state]:
             raise MigrationError(
                 "target current marker migration_state and setup_complete disagree"
+            )
+        vector_dim = marker.get("vector_dim")
+        vector_dimension = marker.get("vector_dimension")
+        if (
+            isinstance(vector_dim, bool)
+            or not isinstance(vector_dim, int)
+            or vector_dim <= 0
+            or isinstance(vector_dimension, bool)
+            or not isinstance(vector_dimension, int)
+            or vector_dimension <= 0
+            or vector_dim != vector_dimension
+        ):
+            raise MigrationError(
+                "target current marker has inconsistent vector dimensions"
             )
 
     def _transition(
@@ -2203,138 +2284,134 @@ class QdrantMigration:
                     f"expected={expected_type!r} target={actual_type!r}"
                 )
 
-    def _existing_sparse_dictionary(self) -> tuple[dict[str, int], dict[int, str]]:
-        if not self._exists(self.target_metadata_collection):
-            return {}, {}
-        by_term: dict[str, int] = {}
-        by_index: dict[int, str] = {}
-        for point in self._scroll(self.target_metadata_collection, with_vectors=False):
-            point_id = point.get("id")
-            if point_id is not None and str(point_id) == _META_MARKER_ID:
-                continue
-            payload = point.get("payload")
-            if not isinstance(payload, Mapping) or payload.get(_SPARSE_TERM_MARKER) is not True:
-                raise SparseMigrationError(
-                    "target metadata collection contains an unexpected point "
-                    f"{point_id!r}"
+    def _existing_sparse_dictionary(self) -> _SparseDictionaryManifest:
+        dictionary = _SparseDictionaryManifest()
+        try:
+            if not self._exists(self.target_metadata_collection):
+                return dictionary
+            for point in self._scroll(self.target_metadata_collection, with_vectors=False):
+                point_id = point.get("id")
+                if point_id is not None and str(point_id) == _META_MARKER_ID:
+                    continue
+                payload = point.get("payload")
+                if (
+                    not isinstance(payload, Mapping)
+                    or payload.get(_SPARSE_TERM_MARKER) is not True
+                ):
+                    raise SparseMigrationError(
+                        "target metadata collection contains an unexpected point "
+                        f"{point_id!r}"
+                    )
+                term = payload.get("term")
+                raw_index = payload.get("index")
+                if not isinstance(term, str) or not term.strip():
+                    raise SparseMigrationError("target sparse dictionary has an invalid term")
+                expected_point_id = to_qdrant_point_id(f"openviking:sparse:{term}")
+                if point_id is None or str(point_id) != expected_point_id:
+                    raise SparseMigrationError(
+                        "target sparse dictionary point-id collision for term "
+                        f"{term!r}: expected={expected_point_id!r} found={point_id!r}"
+                    )
+                index = _sparse_index(
+                    raw_index,
+                    field_name=f"target sparse dictionary index for {term!r}",
+                    minimum=1,
                 )
-            term = payload.get("term")
-            raw_index = payload.get("index")
-            if not isinstance(term, str) or not term.strip():
-                raise SparseMigrationError("target sparse dictionary has an invalid term")
-            expected_point_id = to_qdrant_point_id(f"openviking:sparse:{term}")
-            if point_id is None or str(point_id) != expected_point_id:
-                raise SparseMigrationError(
-                    "target sparse dictionary point-id collision for term "
-                    f"{term!r}: expected={expected_point_id!r} found={point_id!r}"
-                )
-            index = _sparse_index(
-                raw_index,
-                field_name=f"target sparse dictionary index for {term!r}",
-                minimum=1,
-            )
-            expected_index = stable_sparse_index(term)
-            if index != expected_index:
-                raise SparseMigrationError(
-                    "target sparse dictionary has an index that does not match "
-                    f"the stable term mapping for {term!r}: "
-                    f"expected={expected_index} found={index}"
-                )
-            previous_index = by_term.get(term)
-            if previous_index is not None and previous_index != index:
-                raise SparseMigrationError(
-                    f"target sparse dictionary maps {term!r} to multiple indexes"
-                )
-            previous_term = by_index.get(index)
-            if previous_term is not None and previous_term != term:
-                raise SparseMigrationError(
-                    "target sparse dictionary collision: "
-                    f"index={index} terms={previous_term!r},{term!r}"
-                )
-            by_term[term] = index
-            by_index[index] = term
-        return by_term, by_index
+                expected_index = stable_sparse_index(term)
+                if index != expected_index:
+                    raise SparseMigrationError(
+                        "target sparse dictionary has an index that does not match "
+                        f"the stable term mapping for {term!r}: "
+                        f"expected={expected_index} found={index}"
+                    )
+                dictionary.add(term, index)
+        except Exception:
+            dictionary.close()
+            raise
+        return dictionary
 
     def _assert_sparse_dictionary_complete(self, terms: Iterable[str]) -> None:
         term_set = set(terms)
         if not term_set:
             return
-        by_term, _ = self._existing_sparse_dictionary()
-        missing = sorted(term_set - set(by_term))
-        if missing:
-            raise SparseMigrationError(
-                "target sparse dictionary is missing terms after write: "
-                f"{missing!r}"
-            )
-        for term in terms:
-            expected_index = stable_sparse_index(term)
-            if by_term[term] != expected_index:
+        with self._existing_sparse_dictionary() as dictionary:
+            missing = sorted(term for term in term_set if not dictionary.has_term(term))
+            if missing:
                 raise SparseMigrationError(
-                    "target sparse dictionary has an incompatible index for "
-                    f"{term!r}: expected={expected_index} found={by_term[term]}"
+                    "target sparse dictionary is missing terms after write: "
+                    f"{missing!r}"
                 )
+            for term in term_set:
+                expected_index = stable_sparse_index(term)
+                actual_index = dictionary.index_for_term(term)
+                if actual_index != expected_index:
+                    raise SparseMigrationError(
+                        "target sparse dictionary has an incompatible index for "
+                        f"{term!r}: expected={expected_index} found={actual_index}"
+                    )
 
     def _validate_sparse_terms(self, terms: Iterable[str]) -> None:
-        by_term, by_index = self._existing_sparse_dictionary()
-        with _ScanManifest() as planned_manifest:
-            planned = planned_manifest.connection
-            planned.execute(
-                "CREATE TABLE planned_sparse_terms (term TEXT PRIMARY KEY, sparse_index INTEGER UNIQUE)"
-            )
-            for term in terms:
-                if not isinstance(term, str) or not term.strip():
-                    raise SparseMigrationError("source sparse dictionary has an invalid term")
-                index = stable_sparse_index(term)
-                try:
-                    planned.execute(
-                        "INSERT INTO planned_sparse_terms(term, sparse_index) VALUES (?, ?)",
-                        (term, index),
-                    )
-                except sqlite3.IntegrityError as exc:
-                    existing = planned.execute(
-                        "SELECT term FROM planned_sparse_terms WHERE sparse_index = ?",
-                        (index,),
-                    ).fetchone()
-                    existing_term = existing[0] if existing else "<unknown>"
-                    if existing_term != term:
-                        raise SparseMigrationError(
-                            "sparse term collision after migration: "
-                            f"index={index} terms={existing_term!r},{term!r}"
-                        ) from exc
-                    continue
-                existing_term = by_index.get(index)
-                if existing_term is not None and existing_term != term:
-                    raise SparseMigrationError(
-                        "target sparse dictionary collision: "
-                        f"index={index} existing_term={existing_term!r} source_term={term!r}"
-                    )
-                existing_index = by_term.get(term)
-                if existing_index is not None and existing_index != index:
-                    raise SparseMigrationError(
-                        "target sparse dictionary maps source term to a different index: "
-                        f"term={term!r} existing={existing_index} expected={index}"
-                    )
-                if not self._exists(self.target_metadata_collection):
-                    continue
-                expected_id = to_qdrant_point_id(f"openviking:sparse:{term}")
-                points = self._retrieve(
-                    self.target_metadata_collection,
-                    [expected_id],
-                    with_vectors=False,
+        target_metadata_exists = self._exists(self.target_metadata_collection)
+        with self._existing_sparse_dictionary() as existing:
+            with _ScanManifest() as planned_manifest:
+                planned = planned_manifest.connection
+                planned.execute(
+                    "CREATE TABLE planned_sparse_terms (term TEXT PRIMARY KEY, sparse_index INTEGER UNIQUE)"
                 )
-                if not points:
-                    continue
-                payload = points[0].get("payload")
-                if (
-                    not isinstance(payload, Mapping)
-                    or payload.get(_SPARSE_TERM_MARKER) is not True
-                    or payload.get("term") != term
-                    or payload.get("index") != index
-                ):
-                    raise SparseMigrationError(
-                        "target sparse dictionary point-id collision for term "
-                        f"{term!r}: point={expected_id!r}"
+                for term in terms:
+                    if not isinstance(term, str) or not term.strip():
+                        raise SparseMigrationError("source sparse dictionary has an invalid term")
+                    index = stable_sparse_index(term)
+                    try:
+                        planned.execute(
+                            "INSERT INTO planned_sparse_terms(term, sparse_index) VALUES (?, ?)",
+                            (term, index),
+                        )
+                    except sqlite3.IntegrityError as exc:
+                        existing_row = planned.execute(
+                            "SELECT term FROM planned_sparse_terms WHERE sparse_index = ?",
+                            (index,),
+                        ).fetchone()
+                        existing_term = existing_row[0] if existing_row else "<unknown>"
+                        if existing_term != term:
+                            raise SparseMigrationError(
+                                "sparse term collision after migration: "
+                                f"index={index} terms={existing_term!r},{term!r}"
+                            ) from exc
+                        continue
+                    existing_term = existing.term_for_index(index)
+                    if existing_term is not None and existing_term != term:
+                        raise SparseMigrationError(
+                            "target sparse dictionary collision: "
+                            f"index={index} existing_term={existing_term!r} source_term={term!r}"
+                        )
+                    existing_index = existing.index_for_term(term)
+                    if existing_index is not None and existing_index != index:
+                        raise SparseMigrationError(
+                            "target sparse dictionary maps source term to a different index: "
+                            f"term={term!r} existing={existing_index} expected={index}"
+                        )
+                    if not target_metadata_exists:
+                        continue
+                    expected_id = to_qdrant_point_id(f"openviking:sparse:{term}")
+                    points = self._retrieve(
+                        self.target_metadata_collection,
+                        [expected_id],
+                        with_vectors=False,
                     )
+                    if not points:
+                        continue
+                    payload = points[0].get("payload")
+                    if (
+                        not isinstance(payload, Mapping)
+                        or payload.get(_SPARSE_TERM_MARKER) is not True
+                        or payload.get("term") != term
+                        or payload.get("index") != index
+                    ):
+                        raise SparseMigrationError(
+                            "target sparse dictionary point-id collision for term "
+                            f"{term!r}: point={expected_id!r}"
+                        )
 
     def _validate_source_metadata_layout(
         self,
@@ -2449,6 +2526,10 @@ class QdrantMigration:
                 layout=layout,
                 metadata=metadata,
             )
+            if not target_exists and marker.get("setup_complete") is not False:
+                raise MigrationError(
+                    "target collection is missing for a completed migration marker"
+                )
             if target_exists:
                 target_count = self._count(self.target_collection)
                 if marker.get("setup_complete") is False and target_count:
@@ -2469,21 +2550,28 @@ class QdrantMigration:
                         "target count mismatch: "
                         f"exact count={target_count} paginated count={target_scanned}"
                     )
-                for target_id, logical_id in scan.connection.execute(
-                    "SELECT target_id, logical_id FROM source_targets"
+                for target_id, existing_original in scan.connection.execute(
+                    "SELECT target_id, original_id FROM target_points"
                 ):
-                    if not scan.has_target(str(target_id)):
-                        continue
-                    existing_original = scan.target_original(str(target_id))
-                    if existing_original is None:
+                    source_row = scan.connection.execute(
+                        "SELECT logical_id FROM source_targets WHERE target_id = ?",
+                        (target_id,),
+                    ).fetchone()
+                    if existing_original is None or not str(existing_original):
                         raise MigrationError(
                             f"target point {target_id} is missing {_ORIGINAL_ID_FIELD}; "
                             "refusing to overwrite it"
                         )
-                    if str(existing_original) != str(logical_id):
+                    expected_target_id = str(to_qdrant_point_id(str(existing_original)))
+                    if expected_target_id != str(target_id):
+                        raise MigrationError(
+                            f"target point-id {target_id} does not match deterministic "
+                            f"encoding for {existing_original!r}"
+                        )
+                    if source_row is not None and str(existing_original) != str(source_row[0]):
                         raise MigrationError(
                             f"target point-id collision for {target_id}: "
-                            f"existing={existing_original!r} source={logical_id!r}"
+                            f"existing={existing_original!r} source={source_row[0]!r}"
                         )
 
         if marker is not None:
@@ -2600,8 +2688,8 @@ class QdrantMigration:
         if not term_set:
             return
         self._validate_sparse_terms(term_set)
-        existing, _ = self._existing_sparse_dictionary()
-        missing = term_set - set(existing)
+        with self._existing_sparse_dictionary() as existing:
+            missing = {term for term in term_set if not existing.has_term(term)}
         points = []
         for term in sorted(missing):
             points.append(
@@ -2653,7 +2741,7 @@ class QdrantMigration:
         expected: Mapping[str, Any],
         *,
         exact: bool = True,
-        sparse_dictionary: Mapping[int, str] | None = None,
+        sparse_dictionary: _SparseDictionaryManifest | None = None,
     ) -> None:
         actual_vectors = point.get("vector")
         if actual_vectors is None:
@@ -2729,7 +2817,9 @@ class QdrantMigration:
             ]
             if sparse_dictionary is not None:
                 missing_dictionary_indexes = sorted(
-                    set(actual_index_values) - set(sparse_dictionary)
+                    index
+                    for index in set(actual_index_values)
+                    if not sparse_dictionary.has_index(index)
                 )
                 if missing_dictionary_indexes:
                     raise MigrationError(
@@ -2768,91 +2858,91 @@ class QdrantMigration:
         allow_acl_fail_open: bool,
     ) -> int:
         target_count = self._count(self.target_collection)
-        _, sparse_by_index = self._existing_sparse_dictionary()
-        with _ScanManifest() as manifest:
-            target_scanned = self._scan_target_ids(manifest)
-            if target_scanned != target_count:
-                raise MigrationError(
-                    "target count mismatch after copy: "
-                    f"exact count={target_count} paginated count={target_scanned}"
+        with self._existing_sparse_dictionary() as sparse_by_index:
+            with _ScanManifest() as manifest:
+                target_scanned = self._scan_target_ids(manifest)
+                if target_scanned != target_count:
+                    raise MigrationError(
+                        "target count mismatch after copy: "
+                        f"exact count={target_count} paginated count={target_scanned}"
+                    )
+                pending: list[dict[str, Any]] = []
+
+                def validate_batch(points: list[dict[str, Any]]) -> None:
+                    actual_points = {
+                        str(point.get("id")): point
+                        for point in self._retrieve(
+                            self.target_collection,
+                            [str(point["id"]) for point in points],
+                            with_vectors=True,
+                        )
+                        if point.get("id") is not None
+                    }
+                    for expected in points:
+                        target_id = str(expected["id"])
+                        actual = actual_points.get(target_id)
+                        if actual is None:
+                            raise MigrationError(
+                                f"target records differ after copy: missing={target_id!r}"
+                            )
+                        payload = actual.get("payload")
+                        expected_payload = expected.get("payload")
+                        if not isinstance(payload, Mapping) or not isinstance(
+                            expected_payload, Mapping
+                        ):
+                            raise MigrationError(
+                                f"target point {target_id!r} has an invalid payload"
+                            )
+                        if str(payload.get(_ORIGINAL_ID_FIELD)) != str(
+                            expected_payload.get(_ORIGINAL_ID_FIELD)
+                        ):
+                            raise MigrationError(
+                                f"target point {target_id!r} has the wrong original id"
+                            )
+                        self._validate_target_payload(
+                            payload,
+                            expected_payload,
+                            schema=schema,
+                            allow_acl_fail_open=allow_acl_fail_open,
+                            point_id=target_id,
+                        )
+                        if payload != expected_payload:
+                            raise MigrationError(
+                                f"target point {target_id!r} payload differs from copied source"
+                            )
+                        self._assert_target_vectors(
+                            actual,
+                            expected,
+                            exact=True,
+                            sparse_dictionary=sparse_by_index,
+                        )
+                        manifest.delete_target(target_id)
+
+                def validate_point(expected: dict[str, Any]) -> None:
+                    pending.append(expected)
+                    if len(pending) >= self.batch_size:
+                        validate_batch(pending)
+                        pending.clear()
+
+                actual_source = self._scan_source(
+                    layout=layout,
+                    schema=schema,
+                    point_callback=validate_point,
                 )
-            pending: list[dict[str, Any]] = []
-
-            def validate_batch(points: list[dict[str, Any]]) -> None:
-                actual_points = {
-                    str(point.get("id")): point
-                    for point in self._retrieve(
-                        self.target_collection,
-                        [str(point["id"]) for point in points],
-                        with_vectors=True,
-                    )
-                    if point.get("id") is not None
-                }
-                for expected in points:
-                    target_id = str(expected["id"])
-                    actual = actual_points.get(target_id)
-                    if actual is None:
-                        raise MigrationError(
-                            f"target records differ after copy: missing={target_id!r}"
-                        )
-                    payload = actual.get("payload")
-                    expected_payload = expected.get("payload")
-                    if not isinstance(payload, Mapping) or not isinstance(
-                        expected_payload, Mapping
-                    ):
-                        raise MigrationError(
-                            f"target point {target_id!r} has an invalid payload"
-                        )
-                    if str(payload.get(_ORIGINAL_ID_FIELD)) != str(
-                        expected_payload.get(_ORIGINAL_ID_FIELD)
-                    ):
-                        raise MigrationError(
-                            f"target point {target_id!r} has the wrong original id"
-                        )
-                    self._validate_target_payload(
-                        payload,
-                        expected_payload,
-                        schema=schema,
-                        allow_acl_fail_open=allow_acl_fail_open,
-                        point_id=target_id,
-                    )
-                    if payload != expected_payload:
-                        raise MigrationError(
-                            f"target point {target_id!r} payload differs from copied source"
-                        )
-                    self._assert_target_vectors(
-                        actual,
-                        expected,
-                        exact=True,
-                        sparse_dictionary=sparse_by_index,
-                    )
-                    manifest.delete_target(target_id)
-
-            def validate_point(expected: dict[str, Any]) -> None:
-                pending.append(expected)
-                if len(pending) >= self.batch_size:
+                # The caller already validated the physical layout; this summary
+                # is only used to guard the stream against source drift.
+                if (
+                    actual_source.source_count != source.source_count
+                    or actual_source.fingerprint != source.fingerprint
+                ):
+                    raise MigrationError("source changed final verification")
+                if pending:
                     validate_batch(pending)
-                    pending.clear()
-
-            actual_source = self._scan_source(
-                layout=layout,
-                schema=schema,
-                point_callback=validate_point,
-            )
-            # The caller already validated the physical layout; this summary
-            # is only used to guard the stream against source drift.
-            if (
-                actual_source.source_count != source.source_count
-                or actual_source.fingerprint != source.fingerprint
-            ):
-                raise MigrationError("source changed final verification")
-            if pending:
-                validate_batch(pending)
-            extra = manifest.first_extra_target()
-            if extra is not None:
-                raise MigrationError(
-                    f"target records differ after copy: extras={extra!r}"
-                )
+                extra = manifest.first_extra_target()
+                if extra is not None:
+                    raise MigrationError(
+                        f"target records differ after copy: extras={extra!r}"
+                    )
         self._assert_sparse_dictionary_complete(self._sparse_map.values())
         return target_count
 
@@ -2933,13 +3023,19 @@ class QdrantMigration:
         confirm: bool = False,
         plan: MigrationPlan | None = None,
         allow_acl_fail_open: bool = False,
+        lock_held: bool = False,
     ) -> MigrationResult:
-        """Apply a plan; mutation is refused unless ``confirm=True``."""
+        """Apply a plan; mutation requires confirmation and an external lock."""
 
         if not confirm:
             raise MigrationError("apply requires explicit confirm=True / --confirm")
         if plan is None:
             raise MigrationError("apply requires a reviewed migration plan")
+        if not lock_held:
+            raise MigrationError(
+                "apply requires external source lock acknowledgement via "
+                "lock_held=True / --lock-held"
+            )
         current_plan = self.preflight()
         if self._reviewed_plan_fields(plan) != self._reviewed_plan_fields(current_plan):
             raise MigrationError(
@@ -2990,7 +3086,7 @@ class QdrantMigration:
                 raise MigrationError(
                     "target state changed after preflight; rerun preflight before apply"
                 )
-        if plan.target_state in {"active", "retained", "rolled_back"}:
+        if plan.target_state in {"active", "retained", "rolled_back", "cutting_over"}:
             raise MigrationError(
                 f"cannot apply against target in migration state {plan.target_state!r}"
             )
@@ -3427,6 +3523,11 @@ def _parser() -> argparse.ArgumentParser:
         help="required acknowledgement that target Qdrant collections will be written",
     )
     apply_parser.add_argument(
+        "--lock-held",
+        action="store_true",
+        help="acknowledge that the external per-source write lock is held",
+    )
+    apply_parser.add_argument(
         "--allow-acl-fail-open",
         action="store_true",
         help="acknowledge that records missing ACL fields remain fail-open",
@@ -3475,6 +3576,7 @@ def main(argv: list[str] | None = None) -> int:
                         confirm=args.confirm,
                         plan=reviewed_plan,
                         allow_acl_fail_open=args.allow_acl_fail_open,
+                        lock_held=args.lock_held,
                     ).to_dict(),
                     sort_keys=True,
                 )

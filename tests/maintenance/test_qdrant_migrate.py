@@ -651,6 +651,27 @@ def test_state_transition_preserves_setup_gate() -> None:
     assert migration._transition("ready")["setup_complete"] is True
 
 
+def test_state_transition_rejects_tampered_marker_layout() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _add_current_marker(qdrant)
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    marker["vector_dim"] = 999
+
+    with pytest.raises(MigrationError, match="dimension"):
+        migration._transition("ready")
+
+
+def test_preflight_rejects_complete_marker_without_target_collection() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    _add_current_marker(qdrant, migration_state="ready")
+
+    with pytest.raises(MigrationError, match="target collection"):
+        _migration(qdrant).preflight()
+
+
 def test_cli_phase_arguments_require_identity_and_timeout() -> None:
     with pytest.raises(SystemExit):
         _parser().parse_args(
@@ -711,6 +732,7 @@ def test_cli_apply_requires_a_reviewed_plan() -> None:
 
 def _apply(migration: QdrantMigration, **kwargs: object):
     kwargs.setdefault("plan", migration.preflight())
+    kwargs.setdefault("lock_held", True)
     return migration.apply(**kwargs)
 
 
@@ -847,6 +869,7 @@ def test_incomplete_marker_resumes_after_data_setup_crash(monkeypatch) -> None:
             confirm=True,
             plan=plan,
             allow_acl_fail_open=True,
+            lock_held=True,
         )
 
     marker = qdrant.collections[migration.target_metadata_collection]["points"][
@@ -860,6 +883,7 @@ def test_incomplete_marker_resumes_after_data_setup_crash(monkeypatch) -> None:
         confirm=True,
         plan=plan,
         allow_acl_fail_open=True,
+        lock_held=True,
     )
 
     assert result.migrated_count == 2
@@ -1316,6 +1340,7 @@ def test_owner_normalization_resumes_legacy_target(monkeypatch) -> None:
         confirm=True,
         plan=plan,
         allow_acl_fail_open=True,
+        lock_held=True,
     )
 
     assert result.migrated_count == 1
@@ -1331,6 +1356,46 @@ def test_apply_requires_explicit_confirmation() -> None:
         _migration(qdrant).apply()
 
     assert "current__context" not in qdrant.collections
+
+
+def test_apply_requires_external_lock_before_requests() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    plan = migration.preflight()
+    qdrant.requests.clear()
+
+    with pytest.raises(MigrationError, match="lock"):
+        migration.apply(
+            confirm=True,
+            plan=plan,
+            allow_acl_fail_open=True,
+        )
+
+    assert qdrant.requests == []
+    assert "current__context" not in qdrant.collections
+
+
+def test_apply_rejects_cutting_over_target_state() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    marker["migration_state"] = "cutting_over"
+    marker["setup_complete"] = True
+    target_before = copy.deepcopy(qdrant.collections[migration.target_collection])
+
+    plan = _migration(qdrant).preflight()
+    with pytest.raises(MigrationError, match="cutting_over"):
+        _migration(qdrant).apply(
+            confirm=True,
+            plan=plan,
+            allow_acl_fail_open=True,
+            lock_held=True,
+        )
+
+    assert qdrant.collections[migration.target_collection] == target_before
 
 
 def test_target_metadata_collection_collision_is_rejected() -> None:
@@ -1477,6 +1542,7 @@ def test_source_mutation_between_preflight_and_apply_is_rejected(monkeypatch) ->
             confirm=True,
             plan=plan,
             allow_acl_fail_open=True,
+            lock_held=True,
         )
 
     assert "current__context" not in qdrant.collections
@@ -1493,6 +1559,7 @@ def test_apply_rejects_a_stale_plan() -> None:
             confirm=True,
             plan=plan,
             allow_acl_fail_open=True,
+            lock_held=True,
         )
 
     assert "current__context" not in qdrant.collections
@@ -1583,8 +1650,9 @@ def test_existing_target_records_absent_from_source_remain_for_reconcile() -> No
     qdrant = _legacy_fixture(sparse=False)
     migration = _migration(qdrant)
     _apply(migration, confirm=True, allow_acl_fail_open=True)
-    qdrant.collections["current__context"]["points"]["extra"] = _point(
-        "extra",
+    extra_id = to_qdrant_point_id("extra")
+    qdrant.collections["current__context"]["points"][extra_id] = _point(
+        extra_id,
         "extra",
         uri="/resources/extra.md",
     )
@@ -1597,7 +1665,22 @@ def test_existing_target_records_absent_from_source_remain_for_reconcile() -> No
             confirm=True,
             plan=plan,
             allow_acl_fail_open=True,
+            lock_held=True,
         )
+
+
+def test_existing_target_extra_requires_deterministic_original_id() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    qdrant.collections["current__context"]["points"]["extra"] = _point(
+        "extra",
+        "extra",
+        uri="/resources/extra.md",
+    )
+
+    with pytest.raises(MigrationError, match="deterministic"):
+        _migration(qdrant).preflight()
 
 
 def test_sparse_only_source_record_is_preserved() -> None:
@@ -1777,6 +1860,7 @@ def test_marker_fingerprint_change_after_preflight_is_rejected(monkeypatch) -> N
             confirm=True,
             plan=plan,
             allow_acl_fail_open=True,
+            lock_held=True,
         )
 
 
