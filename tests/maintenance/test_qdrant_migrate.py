@@ -517,10 +517,24 @@ def _point(
     }
 
 
-def _legacy_fixture(*, sparse: bool = True) -> FakeQdrant:
+def _legacy_fixture(
+    *,
+    sparse: bool = True,
+    sparse_datatype: str | None = None,
+) -> FakeQdrant:
     qdrant = FakeQdrant()
     vectors: dict[str, object] = {"vector": {"size": 2, "distance": "Cosine"}}
-    sparse_vectors = {"sparse_vector": {}} if sparse else None
+    sparse_vectors = (
+        {
+            "sparse_vector": (
+                {"index": {"datatype": sparse_datatype}}
+                if sparse_datatype is not None
+                else {}
+            )
+        }
+        if sparse
+        else None
+    )
     fields = [
         {"FieldName": "id", "FieldType": "string", "IsPrimaryKey": True},
         {"FieldName": "uri", "FieldType": "path"},
@@ -3591,6 +3605,7 @@ def test_final_verify_does_not_reset_cutting_over_to_ready() -> None:
         plan=plan,
         allow_acl_fail_open=True,
         final=True,
+        barrier_held=True,
         confirm=True,
         lock_held=True,
     )
@@ -3601,6 +3616,205 @@ def test_final_verify_does_not_reset_cutting_over_to_ready() -> None:
     ]["payload"]
     assert marker["migration_state"] == "cutting_over"
     assert marker["setup_complete"] is True
+
+
+def test_final_verify_requires_an_explicit_barrier() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_reconcile(qdrant)
+    _set_marker_state(qdrant, migration, "cutting_over")
+    marker_before = copy.deepcopy(
+        qdrant.collections[migration.target_metadata_collection]["points"][
+            to_qdrant_point_id("openviking:metadata")
+        ]["payload"]
+    )
+
+    with pytest.raises(MigrationError, match="barrier"):
+        migration.verify(
+            plan=plan,
+            allow_acl_fail_open=True,
+            final=True,
+            confirm=True,
+            lock_held=True,
+        )
+
+    marker_after = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    assert marker_after == marker_before
+
+
+def test_verify_persists_independent_canonical_content_receipts() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_reconcile(qdrant)
+
+    result = migration.verify(
+        plan=plan,
+        allow_acl_fail_open=True,
+        confirm=True,
+        lock_held=True,
+    )
+
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    source_receipt = result["transformed_source_fingerprint"]
+    target_receipt = result["target_content_fingerprint"]
+    assert source_receipt == target_receipt
+    assert source_receipt == marker["transformed_source_fingerprint"]
+    assert target_receipt == marker["target_content_fingerprint"]
+    assert source_receipt != plan.source_fingerprint
+    assert marker["transformed_source_fingerprint"] != marker["source_fingerprint"]
+
+
+@pytest.mark.parametrize("drift", ["metadata", "sparse_map", "layout", "indexes"])
+def test_verify_revalidates_pinned_inputs_after_exact_audit(
+    monkeypatch,
+    drift: str,
+) -> None:
+    sparse = drift == "sparse_map"
+    qdrant = _legacy_fixture(sparse=sparse)
+    migration = _migration(
+        qdrant,
+        sparse_map={111: "hello", 222: "world"} if sparse else None,
+    )
+    plan = migration.preflight()
+    migration.prepare(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+    migration.backfill(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+    original_validate = migration._validate_final_target
+
+    def mutate_after_audit(**kwargs):
+        target_count = original_validate(**kwargs)
+        if drift == "metadata":
+            metadata_point = qdrant.collections[
+                migration.source_metadata_collection
+            ]["points"][_legacy_collection_metadata_id("legacy__context")]
+            metadata_point["payload"]["meta"]["CollectionName"] = "changed"
+        elif drift == "sparse_map":
+            migration._sparse_map[7] = "changed"
+        elif drift == "layout":
+            qdrant.collections[migration.target_collection]["config"]["vectors"][
+                "vector"
+            ]["distance"] = "Dot"
+        else:
+            qdrant.collections[migration.target_collection]["payload_schema"].pop(
+                "account_id"
+            )
+        return target_count
+
+    monkeypatch.setattr(migration, "_validate_final_target", mutate_after_audit)
+    marker_before = copy.deepcopy(
+        qdrant.collections[migration.target_metadata_collection]["points"][
+            to_qdrant_point_id("openviking:metadata")
+        ]["payload"]
+    )
+    writes_before = len(
+        [
+            request
+            for request in qdrant.requests
+            if request[0] == "PUT" and request[1].endswith("/points")
+        ]
+    )
+
+    with pytest.raises(MigrationError, match="metadata|sparse map|layout|index"):
+        migration.verify(
+            plan=plan,
+            allow_acl_fail_open=True,
+            confirm=True,
+            lock_held=True,
+        )
+
+    marker_after = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    writes_after = len(
+        [
+            request
+            for request in qdrant.requests
+            if request[0] == "PUT" and request[1].endswith("/points")
+        ]
+    )
+    assert marker_after == marker_before
+    assert writes_after == writes_before
+
+
+def test_verify_revalidates_readiness_after_exact_audit(monkeypatch) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_reconcile(qdrant)
+    original_wait = migration._wait_collection_ready
+    calls = 0
+
+    def fail_on_post_audit(collection, *, payload_fields=None):
+        nonlocal calls
+        calls += 1
+        if calls > 2:
+            raise MigrationError("readiness drift after exact audit")
+        return original_wait(collection, payload_fields=payload_fields)
+
+    monkeypatch.setattr(migration, "_wait_collection_ready", fail_on_post_audit)
+    marker_before = copy.deepcopy(
+        qdrant.collections[migration.target_metadata_collection]["points"][
+            to_qdrant_point_id("openviking:metadata")
+        ]["payload"]
+    )
+
+    with pytest.raises(MigrationError, match="readiness"):
+        migration.verify(
+            plan=plan,
+            allow_acl_fail_open=True,
+            confirm=True,
+            lock_held=True,
+        )
+
+    marker_after = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    assert marker_after == marker_before
+
+
+def test_sparse_index_datatype_is_persisted_and_verified() -> None:
+    qdrant = _legacy_fixture(sparse=True, sparse_datatype="float16")
+    migration = _migration(
+        qdrant,
+        sparse_map={111: "hello", 222: "world"},
+    )
+    plan = migration.preflight()
+    assert plan.sparse_datatype == "float16"
+
+    migration.prepare(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+    sparse_config = qdrant.collections[migration.target_collection]["config"][
+        "sparse_vectors"
+    ]["sparse_vector"]
+    assert sparse_config["index"]["datatype"] == "float16"
+    migration.backfill(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+    sparse_config["index"]["datatype"] = "float32"
+
+    with pytest.raises(MigrationError, match="layout|datatype"):
+        migration.verify(
+            plan=plan,
+            allow_acl_fail_open=True,
+            confirm=True,
+            lock_held=True,
+        )
 
 
 @pytest.mark.parametrize("state", ["active", "retained", "rolled_back"])
@@ -3623,3 +3837,118 @@ def test_active_retained_and_rolled_back_targets_reject_mutating_reruns(state: s
         to_qdrant_point_id("openviking:metadata")
     ]["payload"]
     assert marker_after == marker_before
+
+
+@pytest.mark.parametrize("state", ["active", "retained", "rolled_back"])
+def test_read_only_state_target_count_mismatch_does_not_write(state: str) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    _set_marker_state(qdrant, migration, state)
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    marker["target_count"] = 1
+    plan = migration.preflight()
+    marker_before = copy.deepcopy(marker)
+    writes_before = len(
+        [
+            request
+            for request in qdrant.requests
+            if request[0] == "PUT" and request[1].endswith("/points")
+        ]
+    )
+
+    with pytest.raises(MigrationError, match="target count"):
+        migration.verify(plan=plan, allow_acl_fail_open=True)
+
+    assert marker == marker_before
+    writes_after = len(
+        [
+            request
+            for request in qdrant.requests
+            if request[0] == "PUT" and request[1].endswith("/points")
+        ]
+    )
+    assert writes_after == writes_before
+
+
+def test_ready_verify_rerun_with_same_fingerprint_does_not_write_marker() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    plan = migration.preflight()
+    writes_before = len(
+        [
+            request
+            for request in qdrant.requests
+            if request[0] == "PUT" and request[1].endswith("/points")
+        ]
+    )
+
+    result = migration.verify(plan=plan, allow_acl_fail_open=True)
+
+    assert result["migration_state"] == "ready"
+    writes_after = len(
+        [
+            request
+            for request in qdrant.requests
+            if request[0] == "PUT" and request[1].endswith("/points")
+        ]
+    )
+    assert writes_after == writes_before
+
+
+@pytest.mark.parametrize("state", ["active", "retained", "rolled_back"])
+def test_read_only_state_mismatch_does_not_write_marker(state: str) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    _set_marker_state(qdrant, migration, state)
+    plan = migration.preflight()
+    target = qdrant.collections[migration.target_collection]["points"][
+        to_qdrant_point_id("1")
+    ]
+    target["payload"]["name"] = "tampered"
+    marker_before = copy.deepcopy(
+        qdrant.collections[migration.target_metadata_collection]["points"][
+            to_qdrant_point_id("openviking:metadata")
+        ]["payload"]
+    )
+    writes_before = len(
+        [
+            request
+            for request in qdrant.requests
+            if request[0] == "PUT" and request[1].endswith("/points")
+        ]
+    )
+
+    with pytest.raises(MigrationError, match="payload"):
+        migration.verify(plan=plan, allow_acl_fail_open=True)
+
+    marker_after = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    assert marker_after == marker_before
+    writes_after = len(
+        [
+            request
+            for request in qdrant.requests
+            if request[0] == "PUT" and request[1].endswith("/points")
+        ]
+    )
+    assert writes_after == writes_before
+
+
+def test_verify_rejects_non_string_physical_target_id() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    plan = migration.preflight()
+    target = qdrant.collections[migration.target_collection]["points"][
+        to_qdrant_point_id("1")
+    ]
+    target["id"] = 1
+
+    with pytest.raises(MigrationError, match="canonical UUID"):
+        migration.verify(plan=plan, allow_acl_fail_open=True)
