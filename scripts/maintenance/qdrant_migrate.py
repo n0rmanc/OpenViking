@@ -356,6 +356,14 @@ class _SparseDictionaryManifest:
             )
             """
         )
+        self._connection.execute(
+            """
+            CREATE TABLE sparse_dictionary_points (
+                point_id TEXT PRIMARY KEY,
+                term TEXT NOT NULL
+            )
+            """
+        )
 
     def close(self) -> None:
         self._manifest.close()
@@ -366,7 +374,17 @@ class _SparseDictionaryManifest:
     def __exit__(self, _exc_type: Any, _exc_value: Any, _traceback: Any) -> None:
         self.close()
 
-    def add(self, term: str, index: int) -> None:
+    def add(self, term: str, index: int, *, point_id: str | None = None) -> None:
+        if point_id is not None:
+            try:
+                self._connection.execute(
+                    "INSERT INTO sparse_dictionary_points(point_id, term) VALUES (?, ?)",
+                    (point_id, term),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise SparseMigrationError(
+                    f"target sparse dictionary contains duplicate point {point_id!r}"
+                ) from exc
         existing_index = self.index_for_term(term)
         if existing_index is not None and existing_index != index:
             raise SparseMigrationError(
@@ -979,6 +997,7 @@ class QdrantMigration:
             and segments[2] == "index"
         )
         requires_completed = False
+        requires_true_result = False
         if mutation:
             if (
                 (method == "PUT" and is_point_upsert_endpoint)
@@ -993,6 +1012,7 @@ class QdrantMigration:
                 request_params.pop("wait", None)
                 request_params.pop("ordering", None)
                 request_params["timeout"] = self._timeout_param()
+                requires_true_result = True
         response = self._client.request(method, path, body, params=request_params or None)
         if not isinstance(response, dict):
             raise MigrationError(f"Qdrant returned a non-object response for {method} {path}")
@@ -1000,6 +1020,8 @@ class QdrantMigration:
             result = response.get("result")
             if not isinstance(result, Mapping) or result.get("status") != "completed":
                 raise MigrationError(f"Qdrant {method} {path} did not complete")
+        if requires_true_result and response.get("result") is not True:
+            raise MigrationError(f"Qdrant {method} {path} did not complete")
         return response
 
     def _assert_strong_ordering_support(self) -> None:
@@ -2302,6 +2324,14 @@ class QdrantMigration:
                         "target metadata collection contains an unexpected point "
                         f"{point_id!r}"
                     )
+                if (
+                    payload.get("logical_collection") != self.logical_collection
+                    or payload.get("migration_id") != self.migration_id
+                ):
+                    raise SparseMigrationError(
+                        "target sparse dictionary point belongs to another migration; "
+                        "stable term mapping cannot be trusted"
+                    )
                 term = payload.get("term")
                 raw_index = payload.get("index")
                 if not isinstance(term, str) or not term.strip():
@@ -2324,7 +2354,7 @@ class QdrantMigration:
                         f"the stable term mapping for {term!r}: "
                         f"expected={expected_index} found={index}"
                     )
-                dictionary.add(term, index)
+                dictionary.add(term, index, point_id=str(point_id))
         except Exception:
             dictionary.close()
             raise
@@ -2407,6 +2437,8 @@ class QdrantMigration:
                         or payload.get(_SPARSE_TERM_MARKER) is not True
                         or payload.get("term") != term
                         or payload.get("index") != index
+                        or payload.get("logical_collection") != self.logical_collection
+                        or payload.get("migration_id") != self.migration_id
                     ):
                         raise SparseMigrationError(
                             "target sparse dictionary point-id collision for term "
@@ -2614,9 +2646,15 @@ class QdrantMigration:
             timeout_seconds=self.timeout_seconds,
         )
 
-    def _create_collection(self, name: str, body: dict[str, Any]) -> None:
+    def _create_collection(
+        self,
+        name: str,
+        body: dict[str, Any],
+        *,
+        allow_conflict: bool = False,
+    ) -> bool:
         try:
-            self._request(
+            response = self._request(
                 "PUT",
                 self._path(name),
                 body,
@@ -2624,14 +2662,23 @@ class QdrantMigration:
             )
         except Exception as exc:
             if _status(exc) == 409:
-                raise MigrationError(
+                if allow_conflict:
+                    return False
+                error = MigrationError(
                     f"target collection appeared during migration: {name}"
-                ) from exc
+                )
+                error.status = 409  # type: ignore[attr-defined]
+                raise error from exc
             raise
+        if response.get("result") is not True:
+            raise MigrationError(
+                f"Qdrant collection creation did not complete for {name}"
+            )
+        return True
 
     def _delete_collection(self, name: str) -> None:
         try:
-            self._request(
+            response = self._request(
                 "DELETE",
                 self._path(name),
                 mutation=True,
@@ -2639,6 +2686,11 @@ class QdrantMigration:
         except Exception as exc:
             if _status(exc) != 404:
                 raise
+            return
+        if response.get("result") is not True:
+            raise MigrationError(
+                f"Qdrant collection deletion did not complete for {name}"
+            )
 
     def _write_points(self, collection: str, points: list[dict[str, Any]]) -> None:
         if not points:
@@ -2684,15 +2736,14 @@ class QdrantMigration:
         self._validate_payload_indexes(schema, indexes)
 
     def _write_sparse_dictionary(self, terms: Iterable[str]) -> None:
-        term_set = set(terms)
-        if not term_set:
+        term_list = sorted(set(terms))
+        if not term_list:
             return
-        self._validate_sparse_terms(term_set)
+        self._validate_sparse_terms(term_list)
         with self._existing_sparse_dictionary() as existing:
-            missing = {term for term in term_set if not existing.has_term(term)}
-        points = []
-        for term in sorted(missing):
-            points.append(
+            missing = [term for term in term_list if not existing.has_term(term)]
+        for offset in range(0, len(missing), self.batch_size):
+            points = [
                 {
                     "id": to_qdrant_point_id(f"openviking:sparse:{term}"),
                     "vector": {_META_VECTOR_NAME: [0.0]},
@@ -2700,11 +2751,511 @@ class QdrantMigration:
                         _SPARSE_TERM_MARKER: True,
                         "term": term,
                         "index": stable_sparse_index(term),
+                        "logical_collection": self.logical_collection,
+                        "migration_id": self.migration_id,
                     },
                 }
+                for term in missing[offset : offset + self.batch_size]
+            ]
+            self._write_points(self.target_metadata_collection, points)
+        self._assert_sparse_dictionary_complete(term_list)
+
+    @staticmethod
+    def _layout_from_plan(plan: MigrationPlan) -> CollectionLayout:
+        return CollectionLayout(
+            dense_vector_name=plan.dense_vector_name,
+            sparse_vector_name=plan.sparse_vector_name,
+            vector_dimension=plan.vector_dimension,
+            distance=plan.distance,
+            dense_datatype=plan.dense_datatype,
+            sparse_enabled=plan.sparse_enabled,
+            sparse_modifier=plan.sparse_modifier,
+        )
+
+    @staticmethod
+    def _prepare_reviewed_plan_fields(plan: MigrationPlan) -> dict[str, Any]:
+        """Return only inputs that an online prepare must keep pinned."""
+
+        fields = QdrantMigration._reviewed_plan_fields(plan)
+        for name in (
+            "source_count",
+            "source_fingerprint",
+            "acl_incomplete_count",
+            "sparse_term_count",
+            "sparse_term_fingerprint",
+        ):
+            fields.pop(name, None)
+        return fields
+
+    def _target_collection_body(self, layout: CollectionLayout) -> dict[str, Any]:
+        return {
+            "vectors": {
+                layout.dense_vector_name: {
+                    "size": layout.vector_dimension,
+                    "distance": layout.distance,
+                    **(
+                        {"datatype": layout.dense_datatype}
+                        if layout.dense_datatype is not None
+                        else {}
+                    ),
+                }
+            },
+            **(
+                {
+                    "sparse_vectors": {
+                        layout.sparse_vector_name: {
+                            **(
+                                {"modifier": layout.sparse_modifier}
+                                if layout.sparse_modifier is not None
+                                else {}
+                            )
+                        }
+                    }
+                }
+                if layout.sparse_enabled
+                else {}
+            ),
+        }
+
+    @staticmethod
+    def _metadata_collection_body() -> dict[str, Any]:
+        return {"vectors": {_META_VECTOR_NAME: {"size": 1, "distance": "Dot"}}}
+
+    def _assert_empty_collection(self, collection: str) -> None:
+        if self._count(collection) != 0:
+            raise MigrationError(
+                f"unmarked target collection {collection} is not empty"
             )
-        self._write_points(self.target_metadata_collection, points)
-        self._assert_sparse_dictionary_complete(terms)
+        if any(self._scroll(collection, with_vectors=False)):
+            raise MigrationError(
+                f"unmarked target collection {collection} is not empty"
+            )
+
+    def _assert_collection_layout(
+        self,
+        collection: str,
+        *,
+        layout: CollectionLayout,
+        metadata: bool = False,
+    ) -> None:
+        if metadata:
+            self._validate_metadata_layout(collection)
+            return
+        actual = self._layout(
+            self._collection_info(collection),
+            honor_overrides=False,
+        )
+        if actual != layout:
+            raise MigrationError(
+                f"target collection layout differs for {collection}: "
+                f"expected={layout!r} target={actual!r}"
+            )
+
+    def _assert_pre_marker_collection(
+        self,
+        collection: str,
+        *,
+        layout: CollectionLayout,
+        metadata: bool,
+    ) -> None:
+        self._assert_collection_layout(
+            collection,
+            layout=layout,
+            metadata=metadata,
+        )
+        self._assert_empty_collection(collection)
+        if metadata and self._load_current_marker() is not None:
+            raise MigrationError(
+                "target metadata collection already contains a migration marker"
+            )
+
+    def _assert_prepare_plan_identity(self, plan: MigrationPlan) -> None:
+        expected_identity = {
+            "source_collection": self.source_collection,
+            "target_collection": self.target_collection,
+            "source_metadata_collection": self.source_metadata_collection,
+            "target_metadata_collection": self.target_metadata_collection,
+            "logical_collection": self.logical_collection,
+            "migration_id": self.migration_id,
+            "migrator_version": self.migrator_version,
+        }
+        for field_name, expected in expected_identity.items():
+            if getattr(plan, field_name) != expected:
+                raise MigrationError(
+                    f"reviewed plan {field_name} does not match this migration"
+                )
+        if plan.batch_size != self.batch_size or not math.isclose(
+            plan.timeout_seconds,
+            self.timeout_seconds,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise MigrationError(
+                "reviewed plan batch_size or timeout_seconds does not match this migration"
+            )
+        if plan.sparse_map_fingerprint != _sparse_map_fingerprint(self._sparse_map):
+            raise MigrationError(
+                "reviewed plan sparse-map fingerprint does not match this migration"
+            )
+
+        layout = self._layout(self._collection_info(self.source_collection))
+        metadata = self._legacy_metadata()
+        self._validate_source_metadata_layout(metadata.schema, layout)
+        if layout != self._layout_from_plan(plan):
+            raise MigrationError("reviewed plan vector layout does not match the source")
+        if _metadata_fingerprint(metadata) != plan.metadata_fingerprint:
+            raise MigrationError(
+                "reviewed plan metadata fingerprint does not match the source"
+            )
+        if self._sparse_weight(metadata, sparse_enabled=layout.sparse_enabled) != (
+            plan.sparse_weight
+        ):
+            raise MigrationError(
+                "reviewed plan sparse search policy does not match the source"
+            )
+
+    def _validate_owned_prepare_marker(
+        self,
+        *,
+        marker: Mapping[str, Any],
+        layout: CollectionLayout,
+        metadata: LegacyMetadata,
+    ) -> None:
+        self._validate_marker_ownership(marker)
+        state = marker.get("migration_state")
+        if state not in {"building", "failed"}:
+            raise MigrationError(
+                "prepare may resume only a building or failed migration target; "
+                f"current state is {state!r}"
+            )
+        self._validate_metadata_layout(self.target_metadata_collection)
+        self._validate_existing_target(
+            target_info=(
+                self._collection_info(self.target_collection)
+                if self._exists(self.target_collection)
+                else None
+            ),
+            marker=marker,
+            layout=layout,
+            metadata=metadata,
+        )
+
+    def _cleanup_pre_marker_orphan(
+        self,
+        *,
+        reviewed_plan: MigrationPlan,
+        confirm: bool,
+        lock_held: bool,
+    ) -> None:
+        """Delete only an explicitly reviewed, empty, unmarked target pair."""
+
+        if not confirm:
+            raise MigrationError(
+                "pre-marker orphan cleanup requires explicit confirm=True / --confirm"
+            )
+        if not lock_held:
+            raise MigrationError(
+                "pre-marker orphan cleanup requires external source lock "
+                "acknowledgement via lock_held=True / --lock-held"
+            )
+        if not isinstance(reviewed_plan, MigrationPlan):
+            raise MigrationError("pre-marker orphan cleanup requires a reviewed plan")
+        if reviewed_plan.target_absent is not True:
+            raise MigrationError(
+                "pre-marker orphan cleanup requires a reviewed target_absent=True plan"
+            )
+        self._assert_prepare_plan_identity(reviewed_plan)
+        if (
+            reviewed_plan.target_collection != self.target_collection
+            or reviewed_plan.target_metadata_collection != self.target_metadata_collection
+        ):
+            raise MigrationError("reviewed plan target names do not match this migration")
+
+        layout = self._layout_from_plan(reviewed_plan)
+        names = (
+            (self.target_collection, False),
+            (self.target_metadata_collection, True),
+        )
+
+        def recheck_pair() -> None:
+            for collection, is_metadata in names:
+                if not self._exists(collection):
+                    continue
+                self._assert_pre_marker_collection(
+                    collection,
+                    layout=layout,
+                    metadata=is_metadata,
+                )
+
+        recheck_pair()
+        for collection, _is_metadata in names:
+            if not self._exists(collection):
+                continue
+            # Recheck immediately before each delete; a marker or point that
+            # appears after the first check is never adopted or removed.
+            recheck_pair()
+            if not self._exists(collection):
+                continue
+            self._delete_collection(collection)
+
+    def _create_target_pair(
+        self,
+        layout: CollectionLayout,
+        metadata: LegacyMetadata,
+    ) -> None:
+        """Create or safely resume the two empty physical target collections."""
+
+        marker_before = self._load_current_marker()
+        if marker_before is not None:
+            self._validate_owned_prepare_marker(
+                marker=marker_before,
+                layout=layout,
+                metadata=metadata,
+            )
+        created_by_attempt: list[tuple[str, bool]] = []
+        try:
+            definitions = (
+                (
+                    self.target_collection,
+                    self._target_collection_body(layout),
+                    False,
+                ),
+                (
+                    self.target_metadata_collection,
+                    self._metadata_collection_body(),
+                    True,
+                ),
+            )
+            for collection, body, is_metadata in definitions:
+                if self._exists(collection):
+                    if marker_before is None:
+                        raise MigrationError(
+                            f"unmarked target collection already exists: {collection}"
+                        )
+                    continue
+                try:
+                    created = self._create_collection(collection, body)
+                except Exception as exc:
+                    if _status(exc) == 409 or _status(exc.__cause__) == 409:
+                        created = False
+                    else:
+                        raise
+                if not created:
+                    marker = self._load_current_marker()
+                    if marker is None:
+                        raise MigrationError(
+                            f"target collection appeared without an owned migration "
+                            f"marker: {collection}"
+                        )
+                    self._validate_owned_prepare_marker(
+                        marker=marker,
+                        layout=layout,
+                        metadata=metadata,
+                    )
+                    marker_before = marker
+                    continue
+                self._wait_collection_ready(collection)
+                self._assert_pre_marker_collection(
+                    collection,
+                    layout=layout,
+                    metadata=is_metadata,
+                )
+                created_by_attempt.append((collection, is_metadata))
+
+            self._wait_collection_ready(self.target_collection)
+            self._wait_collection_ready(self.target_metadata_collection)
+            self._assert_collection_layout(
+                self.target_collection,
+                layout=layout,
+            )
+            self._assert_collection_layout(
+                self.target_metadata_collection,
+                layout=layout,
+                metadata=True,
+            )
+            if marker_before is None:
+                self._assert_empty_collection(self.target_collection)
+                self._assert_empty_collection(self.target_metadata_collection)
+        except BaseException:
+            if marker_before is None:
+                try:
+                    if self._load_current_marker() is None:
+                        for collection, is_metadata in reversed(created_by_attempt):
+                            if not self._exists(collection):
+                                continue
+                            try:
+                                self._assert_pre_marker_collection(
+                                    collection,
+                                    layout=layout,
+                                    metadata=is_metadata,
+                                )
+                                self._delete_collection(collection)
+                            except BaseException:
+                                # The pair is no longer provably ours.
+                                pass
+                except BaseException:
+                    pass
+            raise
+
+    def prepare(
+        self,
+        *,
+        confirm: bool,
+        plan: MigrationPlan,
+        allow_acl_fail_open: bool = False,
+        lock_held: bool = False,
+    ) -> dict[str, Any]:
+        """Safely create/resume an owned building target without copying data."""
+
+        if not confirm:
+            raise MigrationError("prepare requires explicit confirm=True / --confirm")
+        if not lock_held:
+            raise MigrationError(
+                "prepare requires external source lock acknowledgement via "
+                "lock_held=True / --lock-held"
+            )
+        if not isinstance(plan, MigrationPlan):
+            raise MigrationError("prepare requires a reviewed migration plan")
+
+        target_exists = self._exists(self.target_collection)
+        target_metadata_exists = self._exists(self.target_metadata_collection)
+        existing_marker = (
+            self._load_current_marker() if target_metadata_exists else None
+        )
+        if (target_exists or target_metadata_exists) and existing_marker is None:
+            if not plan.target_absent:
+                raise MigrationError(
+                    "unmarked target exists without a reviewed target_absent=True plan"
+                )
+            self._cleanup_pre_marker_orphan(
+                reviewed_plan=plan,
+                confirm=confirm,
+                lock_held=lock_held,
+            )
+
+        current_plan = self.preflight()
+        if self._prepare_reviewed_plan_fields(plan) != self._prepare_reviewed_plan_fields(
+            current_plan
+        ):
+            raise MigrationError(
+                "provided migration plan is stale; rerun preflight before prepare"
+            )
+        if not plan.target_absent and current_plan.target_absent:
+            raise MigrationError(
+                "reviewed target disappeared; rerun preflight before prepare"
+            )
+        if current_plan.acl_incomplete_count and not allow_acl_fail_open:
+            raise MigrationError(
+                f"{current_plan.acl_incomplete_count} records lack ACL fields; "
+                "refusing prepare without --allow-acl-fail-open"
+            )
+
+        layout = self._layout_from_plan(current_plan)
+        metadata = self._legacy_metadata()
+        self._validate_source_metadata_layout(metadata.schema, layout)
+        existing_marker = self._load_current_marker()
+        if existing_marker is not None and existing_marker.get("migration_state") == "ready":
+            self._validate_marker_ownership(existing_marker)
+            self._validate_metadata_layout(self.target_metadata_collection)
+            self._validate_existing_target(
+                target_info=self._collection_info(self.target_collection),
+                marker=existing_marker,
+                layout=layout,
+                metadata=metadata,
+            )
+            self._assert_sparse_dictionary_complete(self._sparse_map.values())
+            return existing_marker
+        self._create_target_pair(layout, metadata)
+
+        marker = self._load_current_marker()
+        if marker is None:
+            # This is the only path that writes the first marker.  The exact
+            # empty/layout checks are repeated after collection creation so an
+            # unmarked race cannot be adopted.
+            self._assert_collection_layout(
+                self.target_collection,
+                layout=layout,
+            )
+            self._assert_collection_layout(
+                self.target_metadata_collection,
+                layout=layout,
+                metadata=True,
+            )
+            self._assert_empty_collection(self.target_collection)
+            self._assert_empty_collection(self.target_metadata_collection)
+            marker = self._marker_payload(
+                layout=layout,
+                metadata=metadata,
+                sparse_weight=current_plan.sparse_weight,
+                source_fingerprint=current_plan.source_fingerprint,
+                metadata_fingerprint=current_plan.metadata_fingerprint,
+                sparse_map_fingerprint=current_plan.sparse_map_fingerprint,
+                setup_complete=False,
+                acl_incomplete_count=current_plan.acl_incomplete_count,
+                source_count=current_plan.source_count,
+                target_count=current_plan.target_count,
+            )
+            try:
+                self._write_marker(marker)
+            except BaseException:
+                try:
+                    self._cleanup_pre_marker_orphan(
+                        reviewed_plan=plan,
+                        confirm=confirm,
+                        lock_held=lock_held,
+                    )
+                except BaseException:
+                    pass
+                raise
+        else:
+            self._validate_owned_prepare_marker(
+                marker=marker,
+                layout=layout,
+                metadata=metadata,
+            )
+            updated = dict(marker)
+            updated.update(
+                {
+                    "migration_state": "building",
+                    "setup_complete": False,
+                    "source_fingerprint": current_plan.source_fingerprint,
+                    "source_count": current_plan.source_count,
+                    "acl_incomplete_count": current_plan.acl_incomplete_count,
+                    "target_count": current_plan.target_count,
+                    "last_source_cursor": None,
+                    "backfill_complete": False,
+                }
+            )
+            if updated != marker:
+                self._write_marker(updated)
+
+        marker = self._load_current_marker()
+        if marker is None:
+            raise MigrationError("target marker disappeared after prepare")
+        self._validate_owned_prepare_marker(
+            marker=marker,
+            layout=layout,
+            metadata=metadata,
+        )
+        marker_schema = marker.get("schema")
+        marker_indexes = marker.get("indexes")
+        if not isinstance(marker_schema, Mapping) or not isinstance(
+            marker_indexes, Mapping
+        ):
+            raise MigrationError("target marker has invalid index metadata")
+        self._write_indexes(marker_schema, marker_indexes)
+        self._write_sparse_dictionary(self._sparse_map.values())
+        self._wait_collection_ready(self.target_collection)
+        self._wait_collection_ready(self.target_metadata_collection)
+        final_marker = self._load_current_marker()
+        if final_marker is None:
+            raise MigrationError("target marker disappeared during prepare")
+        self._validate_owned_prepare_marker(
+            marker=final_marker,
+            layout=layout,
+            metadata=metadata,
+        )
+        return final_marker
 
     @staticmethod
     def _assert_source_snapshot(
@@ -3036,6 +3587,21 @@ class QdrantMigration:
                 "apply requires external source lock acknowledgement via "
                 "lock_held=True / --lock-held"
             )
+        if plan.target_absent:
+            target_exists = self._exists(self.target_collection)
+            target_metadata_exists = self._exists(self.target_metadata_collection)
+            if target_exists or target_metadata_exists:
+                if (
+                    target_metadata_exists
+                    and self._load_current_marker() is not None
+                ):
+                    pass
+                else:
+                    self._cleanup_pre_marker_orphan(
+                        reviewed_plan=plan,
+                        confirm=confirm,
+                        lock_held=lock_held,
+                    )
         current_plan = self.preflight()
         if self._reviewed_plan_fields(plan) != self._reviewed_plan_fields(current_plan):
             raise MigrationError(
@@ -3068,163 +3634,20 @@ class QdrantMigration:
                 f"{plan.acl_incomplete_count} records lack ACL fields; "
                 "refusing cutover without --allow-acl-fail-open"
             )
-
-        target_exists = self._exists(self.target_collection)
-        target_metadata_exists = self._exists(self.target_metadata_collection)
-        if target_exists and not target_metadata_exists:
-            raise MigrationError(
-                "target state changed after preflight; rerun preflight before apply"
-            )
-        if plan.target_absent and (target_exists or target_metadata_exists):
-            if not (
-                target_metadata_exists
-                and not target_exists
-                and (
-                    self._load_current_marker() or {}
-                ).get("setup_complete") is False
-            ):
-                raise MigrationError(
-                    "target state changed after preflight; rerun preflight before apply"
-                )
-        if plan.target_state in {"active", "retained", "rolled_back", "cutting_over"}:
-            raise MigrationError(
-                f"cannot apply against target in migration state {plan.target_state!r}"
-            )
-
-        existing_marker: dict[str, Any] | None = None
-        if target_metadata_exists:
-            existing_marker = self._load_current_marker()
-            if existing_marker is None:
-                raise MigrationError("target marker disappeared after preflight")
-            self._validate_metadata_layout(self.target_metadata_collection)
-            self._validate_existing_target(
-                target_info=(
-                    self._collection_info(self.target_collection)
-                    if target_exists
-                    else None
-                ),
-                marker=existing_marker,
-                layout=layout,
-                metadata=metadata,
-            )
-            self._assert_marker_fingerprints(existing_marker, plan)
-            if plan.target_absent and existing_marker.get("setup_complete") is not False:
-                raise MigrationError(
-                    "target metadata appeared after preflight without an incomplete "
-                    "migration marker"
-                )
-
-        index_schema: Mapping[str, Any] = metadata.schema
-        index_metadata: Mapping[str, Mapping[str, Any]] = metadata.indexes
-        if existing_marker is not None:
-            marker_schema = existing_marker["schema"]
-            marker_indexes = existing_marker["indexes"]
-            assert isinstance(marker_schema, Mapping)
-            assert isinstance(marker_indexes, Mapping)
-            index_schema = marker_schema
-            index_metadata = marker_indexes
-
         self._assert_source_layout(layout, phase="target setup")
-
-        if existing_marker is None:
-            marker_incomplete = self._marker_payload(
-                layout=layout,
-                metadata=metadata,
-                sparse_weight=plan.sparse_weight,
-                source_fingerprint=plan.source_fingerprint,
-                metadata_fingerprint=plan.metadata_fingerprint,
-                sparse_map_fingerprint=plan.sparse_map_fingerprint,
-                setup_complete=False,
-                acl_incomplete_count=plan.acl_incomplete_count,
-                source_count=plan.source_count,
-                target_count=plan.target_count,
-            )
-        else:
-            # Preserve target-side schema/policy extensions accepted during
-            # preflight while toggling only the migration gate.
-            marker_incomplete = dict(existing_marker)
-            marker_incomplete["setup_complete"] = False
-            marker_incomplete["migration_state"] = "building"
-            marker_incomplete["acl_incomplete_count"] = plan.acl_incomplete_count
-            marker_incomplete["source_count"] = plan.source_count
-            marker_incomplete["target_count"] = plan.target_count
-            marker_incomplete["last_source_cursor"] = None
-            marker_incomplete["backfill_complete"] = False
+        marker_incomplete = self.prepare(
+            confirm=confirm,
+            plan=plan,
+            allow_acl_fail_open=allow_acl_fail_open,
+            lock_held=lock_held,
+        )
+        self._assert_marker_fingerprints(marker_incomplete, plan)
         marker_complete = dict(marker_incomplete)
         marker_complete["setup_complete"] = True
         marker_complete["migration_state"] = "ready"
         marker_complete["target_count"] = plan.source_count
 
-        target_created = False
-        metadata_created = False
-        marker_written = False
         try:
-            if not target_metadata_exists:
-                self._create_collection(
-                    self.target_metadata_collection,
-                    {"vectors": {_META_VECTOR_NAME: {"size": 1, "distance": "Dot"}}},
-                )
-                metadata_created = True
-                self._wait_collection_ready(self.target_metadata_collection)
-                # Reserve the target before creating its data collection. If
-                # setup stops here, a later apply can resume from this
-                # migration-owned incomplete marker.
-                self._write_marker(marker_incomplete)
-                marker_written = True
-
-            if target_exists:
-                # Keep an interrupted or repaired target unavailable until
-                # the complete copy and final readback have succeeded.
-                self._write_marker(marker_incomplete)
-                marker_written = True
-                self._write_indexes(index_schema, index_metadata)
-                self._write_sparse_dictionary(self._sparse_map.values())
-            else:
-                # Claim the data collection before writing its marker.  This
-                # prevents a concurrent collection creator from inheriting a
-                # migration marker after a 409 race.
-                self._create_collection(
-                    self.target_collection,
-                    {
-                        "vectors": {
-                            layout.dense_vector_name: {
-                                "size": layout.vector_dimension,
-                                "distance": layout.distance,
-                                **(
-                                    {"datatype": layout.dense_datatype}
-                                    if layout.dense_datatype is not None
-                                    else {}
-                                ),
-                            }
-                        },
-                        **(
-                            {
-                                "sparse_vectors": {
-                                    layout.sparse_vector_name: {
-                                        **(
-                                            {"modifier": layout.sparse_modifier}
-                                            if layout.sparse_modifier is not None
-                                            else {}
-                                        )
-                                    }
-                                }
-                            }
-                            if layout.sparse_enabled
-                            else {}
-                        ),
-                    },
-                )
-                target_created = True
-                self._wait_collection_ready(self.target_collection)
-                if not marker_written:
-                    self._write_marker(marker_incomplete)
-                    marker_written = True
-                self._write_indexes(index_schema, index_metadata)
-                self._write_sparse_dictionary(self._sparse_map.values())
-
-            self._wait_collection_ready(self.target_collection)
-            self._wait_collection_ready(self.target_metadata_collection)
-
             migrated = 0
             skipped = 0
             pending: list[dict[str, Any]] = []
@@ -3282,16 +3705,6 @@ class QdrantMigration:
                 raise MigrationError("target completion marker was not persisted")
             self._assert_marker_fingerprints(completed_marker, plan)
         except Exception:
-            if not marker_written:
-                for collection in (
-                    self.target_collection if target_created else None,
-                    self.target_metadata_collection if metadata_created else None,
-                ):
-                    if collection is not None:
-                        try:
-                            self._delete_collection(collection)
-                        except Exception:
-                            pass
             raise
 
         return MigrationResult(
@@ -3516,6 +3929,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("preflight", help="validate and print a read-only plan")
+    prepare_parser = subparsers.add_parser(
+        "prepare",
+        help="create or resume an owned building target",
+    )
+    prepare_parser.add_argument("--confirm", action="store_true")
+    prepare_parser.add_argument("--lock-held", action="store_true")
+    prepare_parser.add_argument("--allow-acl-fail-open", action="store_true")
+    prepare_parser.add_argument(
+        "--plan",
+        required=True,
+        help="reviewed JSON plan produced by the preflight command",
+    )
     apply_parser = subparsers.add_parser("apply", help="copy records into the target")
     apply_parser.add_argument(
         "--confirm",
@@ -3568,6 +3993,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.command == "preflight":
             print(json.dumps(migration.preflight().to_dict(), sort_keys=True))
+        elif args.command == "prepare":
+            reviewed_plan = _load_plan(args.plan)
+            print(
+                json.dumps(
+                    migration.prepare(
+                        confirm=args.confirm,
+                        plan=reviewed_plan,
+                        allow_acl_fail_open=args.allow_acl_fail_open,
+                        lock_held=args.lock_held,
+                    ),
+                    sort_keys=True,
+                )
+            )
         else:
             reviewed_plan = _load_plan(args.plan)
             print(
