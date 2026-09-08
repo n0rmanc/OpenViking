@@ -4,7 +4,7 @@
 
 **Goal:** Implement the approved one-way migration from a pre-`#3872` legacy Qdrant source to an explicitly named current-format target pair, with bounded resumable copy, exact reconciliation, barrier-held cutover, and recoverable failure states.
 
-**Architecture:** Keep the migration controller in `scripts/maintenance/qdrant_migrate.py` and keep the adapter responsible only for loading and serving a current-format physical pair. The controller reads the legacy pair through raw REST, writes the target with acknowledged strong ordering, persists progress in the target marker, and uses a temporary standard-library SQLite manifest for exact reconciliation. Application cutover is injected through a small deployment-hook protocol so the Qdrant code does not grow a Kubernetes or platform-specific client.
+**Architecture:** Keep the migration controller in `scripts/maintenance/qdrant_migrate.py` and keep the adapter responsible only for loading and serving a current-format physical pair. The controller reads the legacy pair through raw REST, writes the target with acknowledged strong ordering, persists progress in the target marker, and uses a temporary standard-library SQLite manifest for exact reconciliation. Application cutover uses one concrete validated argv runner, not a platform-specific client or a one-implementation hook protocol. The operator owns both barrier acquisition and release.
 
 **Tech Stack:** Python standard library (`argparse`, `hashlib`, `json`, `sqlite3`, `tempfile`, `subprocess`, `urllib`), Pydantic configuration models, OpenViking `Collection`/`ICollection`, Qdrant REST API, pytest, GitHub Actions.
 
@@ -22,7 +22,10 @@
 - A target already owned by another migration ID is never adopted or overwritten.
 - Reconciliation uses exactly three maximum rounds and a temporary SQLite manifest containing IDs and fingerprints only.
 - Final equality compares canonical IDs, payloads, dense vectors, and sparse vectors directly; a fingerprint is only a bounded candidate filter.
+- Final verification stores independently computed `transformed_source_fingerprint` and `target_content_fingerprint`; raw `source_fingerprint` and `verified_source_fingerprint` remain separate drift receipts.
+- Dense and sparse datatypes are part of the pinned layout; the approved sparse index datatype is `float16` and has no new runtime tuning flag.
 - ACL-incomplete records require `--allow-acl-fail-open`; the marker records the incomplete count and the command prints the risk.
+- The operator acquires and releases the write barrier; the controller never invokes a release operation or claims that writes have resumed.
 - No new third-party dependency is added; client-side weighted rank fusion remains unchanged.
 - Every implementation change starts with a failing focused test and ends with a focused test run, `ruff`, and `git diff --check`.
 
@@ -45,6 +48,8 @@
 **CI and documentation**
 
 - Modify `.github/workflows/pr.yml`: add a conditional Qdrant test job and include all required fake-REST tests.
+- Modify `.github/workflows/_test_lite.yml` only to accept optional
+  `test_paths_json`; its default remains the existing cuVS suite.
 - Modify `scripts/maintenance/README.md`: document online phases, barrier ownership, reviewed plans, recovery, and retire.
 - Modify `openviking/storage/vectordb_adapters/README.md`: document explicit physical-name configuration and the current-format marker gate.
 - Modify `docs/en/guides/01-configuration.md` and `docs/zh/guides/01-configuration.md`: add the new fields, phase commands, ACL acknowledgement, timeout, rollback boundary, and manifest disk budget.
@@ -278,7 +283,7 @@ MIGRATION_STATES = frozenset(
 
 - `QdrantMigration.__init__(client: Any, source_collection: str, target_collection: str, source_metadata_collection: str | None, target_metadata_collection: str | None, batch_size: int, dense_vector_name: str | None, sparse_vector_name: str | None, sparse_map: Mapping[Any, Any] | None, logical_collection: str, migration_id: str, timeout_seconds: float = 10.0, migrator_version: str = MIGRATOR_VERSION)`.
 - `QdrantMigration.preflight() -> MigrationPlan`.
-- `MigrationPlan.to_dict()` emits names, identity, layout, counts, fingerprints, ACL count, `batch_size`, `timeout_seconds`, `migration_id`, `migrator_version`, `target_absent`, and current target state, but never `id_map`, `existing_target_ids`, full vectors, payloads, or the Qdrant URL/API key.
+- `MigrationPlan.to_dict()` emits names, identity, layout (including dense and sparse datatype), counts, raw-source/metadata/sparse fingerprints, ACL count, `batch_size`, `timeout_seconds`, `migration_id`, `migrator_version`, `target_absent`, and current target state, but never `id_map`, `existing_target_ids`, full vectors, payloads, or the Qdrant URL/API key.
 - `QdrantMigration._transition(target_state: str, *, setup_complete: bool | None = None) -> dict[str, Any]` validates allowed states and writes/read-verifies the target marker.
 - CLI subcommands are `preflight`, `prepare`, `backfill`, `reconcile`, `verify`, `cutover`, `rollback`, and `retire`; `apply` remains an offline wrapper for `prepare + backfill + verify`.
 
@@ -342,6 +347,10 @@ Add marker fields:
   "migrator_version": "qdrant-blue-green-v1",
   "migration_state": "building",
   "last_source_cursor": null,
+  "backfill_complete": false,
+  "source_fingerprint": "<raw-source drift receipt>",
+  "transformed_source_fingerprint": "",
+  "target_content_fingerprint": "",
   "source_count": 0,
   "target_count": 0,
   "setup_complete": false
@@ -355,10 +364,12 @@ Use the stable transform-schema version in `migrator_version`; a change requires
 Add shared arguments (`--url`, `--api-key`, source/target names, `--logical-collection`, `--migration-id`, `--batch-size`, `--timeout-seconds`, vector overrides, sparse map) and phase-specific flags. `--lock-held` is required for `prepare`, `backfill`, `reconcile`, `cutover`, `rollback`, and `retire`; `preflight` remains read-only and may be run before the external lock is acquired.
 
 ```text
-prepare/backfill/reconcile/verify: --plan PATH [--confirm] [--allow-acl-fail-open] [--lock-held]
-cutover: --plan PATH --confirm --barrier-held --lock-held [--allow-acl-fail-open] --deployment-hooks PATH
-rollback: --confirm --barrier-held --lock-held --no-current-format-writes-accepted
-retire: --plan PATH --confirm --lock-held
+prepare/backfill: --plan PATH --confirm --lock-held [--allow-acl-fail-open]
+reconcile: --plan PATH --confirm --lock-held [--barrier-held] [--allow-acl-fail-open]
+verify: --plan PATH [--final --barrier-held --confirm --lock-held] [--allow-acl-fail-open]
+cutover: --plan PATH --confirm --barrier-held --lock-held [--resume] [--allow-acl-fail-open] --deployment-hooks PATH
+rollback: --confirm --barrier-held --lock-held --no-current-format-writes-accepted --deployment-hooks PATH
+retire: --plan PATH --confirm --lock-held --deployment-hooks PATH
 ```
 
 `apply` invokes the offline sequence with its existing full-window source-write freeze semantics, never changes application routing, and refuses `active`, `retained`, or `rolled_back` targets.
@@ -462,11 +473,11 @@ Expected: the current generator consumes the full source snapshot and `apply()` 
 
 - [ ] **Step 3: Replace generator-only scrolling with page-at-a-time scrolling**
 
-Implement `_scroll_page` with the opaque Qdrant `next_page_offset`. Validate that an offset is `None`, an integer, or a string; reject booleans, mappings, lists, and a repeated serialized offset. Transform only the current page, flush target writes in `batch_size` chunks, then write the new `last_source_cursor` to the marker with `migration_state=building` and `setup_complete=false`.
+Implement `_scroll_page` with the opaque Qdrant `next_page_offset`. Validate that an offset is `None`, an integer, or a string; reject booleans, mappings, lists, and a repeated serialized offset. Transform only the current page, flush target writes in `batch_size` chunks, then write the new `last_source_cursor` and `backfill_complete` bit to the marker with `migration_state=building` and `setup_complete=false`. A null cursor is completion only when the bit is true; it never aliases an unstarted page.
 
 - [ ] **Step 4: Preserve idempotence and source immutability**
 
-For each transformed point, require `_openviking_original_id`, validate the legacy uint64/UUID physical-ID encoding, preserve the normalized logical ID and URI/owner/ACL payload, reject duplicate logical IDs and target-ID collisions, reject missing/non-finite vectors and missing sparse-map terms, then retrieve the target ID, compare the logical ID and canonical payload/vector, and upsert only a missing or changed point. Never call a source `PUT`, `POST /points/delete`, or partial-update route. A failed target batch is retried from the persisted cursor page; no cursor is advanced before the acknowledged target write completes.
+For each transformed point, require `_openviking_original_id`, validate the legacy uint64/UUID physical-ID encoding, preserve the normalized logical ID and URI/owner/ACL payload, reject duplicate logical IDs and target-ID collisions, reject missing/non-finite vectors and missing sparse-map terms, then retrieve the target ID, compare the logical ID and canonical payload/vector, and upsert only a missing or changed point. Never call a source `PUT`, `POST /points/delete`, or partial-update route. A failed target batch is retried from the persisted cursor page; no cursor is advanced before the acknowledged target write completes. Marker source/ACL/distinct-term summaries remain the latest full-source scan observations, not page-progress substitutes.
 
 - [ ] **Step 5: Run maintenance regression and resume tests**
 
@@ -497,14 +508,10 @@ git commit -m "feat: add cursor-based qdrant backfill"
 - `QdrantMigration._reconcile_round(*, layout: CollectionLayout, schema: Mapping[str, Any], metadata: LegacyMetadata, state: str) -> SourceSnapshot`.
 - `QdrantMigration.reconcile(*, confirm: bool, plan: MigrationPlan, barrier_held: bool = False, allow_acl_fail_open: bool = False) -> dict[str, Any]`.
 
-The temporary manifest schema is fixed:
-
-```sql
-CREATE TABLE points (
-    target_id TEXT PRIMARY KEY,
-    fingerprint TEXT NOT NULL
-);
-```
+The temporary `_ScanManifest` reuses the controller's disk-backed tables for
+source IDs, logical IDs, target IDs, canonical content fingerprints, and sparse
+terms. Their private SQLite names are an implementation detail; there is no
+required public physical table name and no duplicate full-points store.
 
 - [ ] **Step 1: Add failing reconciliation tests**
 
@@ -529,7 +536,10 @@ Expected: the current code has no SQLite manifest, target-extra deletion, or bou
 
 - [ ] **Step 3: Implement a disk-backed source manifest**
 
-Open a `tempfile.NamedTemporaryFile` in the configured temporary directory, create the fixed table, and insert `(target_id, transformed_fingerprint)` per source point in batches. Keep only one source page, one transform batch, and one SQLite transaction in memory. Delete the manifest in `finally`; do not serialize it into plan JSON or the target marker.
+Open a temporary SQLite file, insert the bounded ID/fingerprint rows in
+batches, and keep only one source page, one transform batch, and one SQLite
+transaction in memory. Delete the manifest in `finally`; do not serialize it
+into plan JSON or the target marker.
 
 - [ ] **Step 4: Apply source changes and remove target extras**
 
@@ -537,7 +547,7 @@ Scan the source from the beginning each round, transform records, and upsert mis
 
 - [ ] **Step 5: Add pinned metadata/sparse drift and fixed convergence rules**
 
-Recompute the selected legacy metadata and authoritative sparse-map fingerprints before and after every round. If either changes, write `migration_state=failed` and raise `MigrationError`. Run at most `MAX_RECONCILIATION_ROUNDS == 3`; if the rolling source fingerprint and counts do not converge, fail closed with the round number and source/target counts. When `barrier_held=True`, preserve `migration_state=cutting_over` and `setup_complete=true` throughout the final pass.
+Recompute the selected legacy metadata and authoritative sparse-map fingerprints before and after every round. If either changes, write `migration_state=failed` and raise `MigrationError`. Run at most `MAX_RECONCILIATION_ROUNDS == 3`; if the rolling raw-source fingerprint and counts do not converge, fail closed with the round number and source/target counts. Independently persist canonical `transformed_source_fingerprint` and `target_content_fingerprint` receipts. When `barrier_held=True`, preserve `migration_state=cutting_over` and `setup_complete=true` throughout the final pass.
 
 - [ ] **Step 6: Run focused and full maintenance tests**
 
@@ -564,7 +574,7 @@ git commit -m "feat: reconcile qdrant migration with sqlite manifest"
 - Test: `tests/maintenance/test_qdrant_migrate.py`
 
 **Interfaces:**
-- `QdrantMigration.verify(*, plan: MigrationPlan, allow_acl_fail_open: bool = False, final: bool = False) -> dict[str, Any]`.
+- `QdrantMigration.verify(*, plan: MigrationPlan, allow_acl_fail_open: bool = False, final: bool = False, barrier_held: bool = False, confirm: bool = False, lock_held: bool = False) -> dict[str, Any]`.
 - `QdrantMigration._verify_point_pair(source_point: Mapping[str, Any], target_point: Mapping[str, Any], schema: Mapping[str, Any], layout: CollectionLayout, allow_acl_fail_open: bool) -> None`.
 - `QdrantMigration._verify_target_marker(marker: Mapping[str, Any], *, expected_state: str | None = None) -> None`.
 
@@ -589,13 +599,25 @@ Expected: current `_validate_final_target()` is tied to the frozen `apply()` sna
 
 - [ ] **Step 3: Implement streamed exact comparison**
 
-Use a temporary manifest for source target IDs when needed, compare source/target counts, logical IDs, normalized payloads, URI sidecars (`uri_depth`, `scope_roots`), ACL fields, dense vector names/dimensions/values, sparse indices/values, and target payload indexes. Validate the marker’s source/metadata/sparse fingerprints, migration ID, migrator version, logical/physical names, vector layout, sparse policy, and ACL-incomplete count.
+Use the invocation-local SQLite manifest for source target IDs when needed,
+compare source/target counts, logical IDs, normalized payloads, URI sidecars
+(`uri_depth`, `scope_roots`), ACL fields, dense vector names/dimensions/values,
+sparse indices/values, and target payload indexes. Validate the marker's raw
+source/metadata/sparse fingerprints, migration ID, migrator version,
+logical/physical names, vector layout (including sparse datatype), sparse
+policy, ACL-incomplete count, and independent transformed-source and
+target-content receipts.
 
 Never treat a hash match as final equality. A missing `_openviking_original_id`, duplicate logical ID, target-ID collision, invalid/non-finite vector, malformed payload, missing sparse term, or incomplete ACL without the explicit acknowledgement raises `MigrationError`.
 
 - [ ] **Step 4: Implement state-safe completion**
 
-`verify(final=False)` transitions only `building -> ready`; it leaves `active`, `retained`, and `rolled_back` unchanged. `verify(final=True)` requires `cutting_over` and records success without writing `ready`. A same-fingerprint read-only rerun never resets `setup_complete=true`, while mutating phases reject `active`, `retained`, and `rolled_back`.
+`verify(final=False)` transitions only `building -> ready`; it leaves `active`,
+`retained`, and `rolled_back` unchanged. `verify(final=True)` requires
+`cutting_over`, `barrier_held=True`, `confirm=True`, and `lock_held=True`, and
+records success without writing `ready`. A same-fingerprint read-only rerun
+never resets `setup_complete=true`, while mutating phases reject `active`,
+`retained`, and `rolled_back`.
 
 - [ ] **Step 5: Run all maintenance verification tests**
 
@@ -618,20 +640,21 @@ git commit -m "feat: verify qdrant migration state and data exactly"
 
 **Interfaces:**
 
-```python
-class DeploymentHooks(Protocol):
-    def drain_legacy_writes(self, migration: "QdrantMigration") -> None: pass
-    def remove_legacy_from_serving_path(self, migration: "QdrantMigration") -> None: pass
-    def rollout_current(self, migration: "QdrantMigration") -> None: pass
-    def wait_current_ready(self, migration: "QdrantMigration") -> None: pass
-    def smoke_current_read_only(self, migration: "QdrantMigration") -> None: pass
-    def restore_legacy(self, migration: "QdrantMigration") -> None: pass
-    def current_target_has_accepted_writes(self, migration: "QdrantMigration") -> bool: pass
-```
-
-- `QdrantMigration.cutover(*, confirm: bool, plan: MigrationPlan, barrier_held: bool, hooks: DeploymentHooks, allow_acl_fail_open: bool = False) -> dict[str, Any]`.
-- `QdrantMigration.rollback(*, confirm: bool, barrier_held: bool, no_current_format_writes_accepted: bool, hooks: DeploymentHooks) -> dict[str, Any]`.
-- `QdrantMigration.retire(*, confirm: bool, plan: MigrationPlan, lock_held: bool) -> dict[str, Any]`.
+- `DeploymentHooks(commands: Mapping[str, Any])` validates one exact JSON
+  document and runs the ten required operations with `shell=False`, captured
+  output, and the migration timeout. It is one concrete runner, not a
+  `Protocol` or an implicit no-op.
+- Required keys are
+  `drain_legacy_writes`, `remove_legacy_from_serving_path`,
+  `rollout_current`, `wait_current_ready`, `smoke_current_read_only`,
+  `remove_current_from_serving_path`, `restore_legacy`,
+  `verify_legacy_read_path`, `current_target_has_accepted_writes`, and
+  `assert_target_not_served`. Only the accepted-writes hook consumes stdout,
+  and it must be exact lowercase `true` or `false`; all other hooks assert
+  exit status zero.
+- `QdrantMigration.cutover(*, confirm: bool, plan: MigrationPlan, barrier_held: bool = False, hooks: Any, allow_acl_fail_open: bool = False, lock_held: bool = False, resume: bool = False) -> dict[str, Any]`.
+- `QdrantMigration.rollback(*, confirm: bool, barrier_held: bool = False, no_current_format_writes_accepted: bool = False, hooks: Any, lock_held: bool = False) -> dict[str, Any]`.
+- `QdrantMigration.retire(*, confirm: bool, plan: MigrationPlan, lock_held: bool = False, hooks: Any) -> dict[str, Any]`.
 
 - [ ] **Step 1: Add failing cutover/rollback/retire tests**
 
@@ -659,16 +682,30 @@ Expected: the current script has no deployment hook, barrier acknowledgement, ro
 
 - [ ] **Step 3: Implement cutover ordering and barrier semantics**
 
-Require `migration_state=ready`, `--confirm`, and `--barrier-held`. Write `cutting_over` before invoking hooks, drain in-flight legacy writes, remove the legacy deployment from the serving path, run `reconcile(barrier_held=True)` and `verify(final=True)`, invoke the current rollout/readiness/read-only smoke hooks, then write and re-read `active`. Never release the barrier from the controller until all hooks succeed and the old serving path is gone. On any exception, leave `cutting_over` or `failed` and re-raise without an automatic barrier release.
+Require `migration_state=ready`, `--confirm`, `--lock-held`, and
+`--barrier-held`. Validate all ten hooks, write `cutting_over`, drain
+in-flight legacy writes, remove the legacy deployment from the serving path,
+run `reconcile(barrier_held=True)` and
+`verify(final=True, barrier_held=True, confirm=True, lock_held=True)`, invoke
+the current rollout/readiness/read-only smoke hooks, inspect accepted writes,
+then write and re-read `active`. The operator, not the controller, releases
+the barrier. On any exception, leave `cutting_over` or `failed` and re-raise
+without an automatic release.
 
-The CLI loads a JSON deployment-hook specification containing command arrays for the seven `DeploymentHooks` methods. Execute each argv array with `subprocess.run(argv, check=True, shell=False, env=env)` and these non-secret environment variables:
+The CLI loads a JSON deployment-hook specification containing command arrays for
+the ten required operations. Execute each argv array with
+`subprocess.run(argv, check=True, shell=False, capture_output=True, text=True,
+timeout=timeout_seconds, env=env)` and these non-secret environment variables:
 
 ```text
 OV_LOGICAL_COLLECTION
 OV_MIGRATION_ID
 OV_SOURCE_COLLECTION
+OV_SOURCE_METADATA_COLLECTION
 OV_TARGET_COLLECTION
 OV_TARGET_METADATA_COLLECTION
+OV_TIMEOUT_SECONDS
+OV_MIGRATOR_VERSION
 ```
 
 The file shape is exact; each value is an argv array, and the write-acceptance
@@ -681,20 +718,39 @@ hook must print only `true` or `false` on stdout:
   "rollout_current": ["./ops/rollout-current.sh"],
   "wait_current_ready": ["./ops/wait-current-ready.sh"],
   "smoke_current_read_only": ["./ops/smoke-current-readonly.sh"],
+  "remove_current_from_serving_path": ["./ops/remove-current.sh"],
   "restore_legacy": ["./ops/restore-legacy.sh"],
-  "current_target_has_accepted_writes": ["./ops/current-writes-accepted.sh"]
+  "verify_legacy_read_path": ["./ops/verify-legacy-read.sh"],
+  "current_target_has_accepted_writes": ["./ops/current-writes-accepted.sh"],
+  "assert_target_not_served": ["./ops/assert-target-not-served.sh"]
 }
 ```
 
-An absent hook specification is a hard error for `cutover`, not an implicit no-op.
+An absent or malformed hook specification is a hard error for `cutover`,
+`rollback`, and `retire`, not an implicit no-op.
 
 - [ ] **Step 4: Implement barrier-held rollback**
 
-Accept only `cutting_over` or barrier-held `active`, require `--barrier-held`, `--confirm`, and `--no-current-format-writes-accepted`, and ask the hook whether a current-format write was accepted. Stop/remove current serving before restoring the legacy path, verify the legacy source read path, write `migration_state=rolled_back` with `setup_complete=false`, and retain both collections. After barrier release or any accepted target write, refuse automatic rollback.
+Accept only `cutting_over` or barrier-held `active`, require
+`--barrier-held`, `--lock-held`, `--confirm`, and
+`--no-current-format-writes-accepted`, and ask the strict hook whether a
+current-format write was accepted. Remove current serving, assert the target is
+not served, restore the legacy path, verify its read path, write
+`migration_state=rolled_back` with `setup_complete=false`, and retain both
+collections. After barrier release or any accepted target write, refuse
+automatic rollback.
 
 - [ ] **Step 5: Implement explicit retire**
 
-Require migration ID, exact target pair, external per-source lock acknowledgement, a reviewed plan, and `--confirm`. Refuse deletion while a deployment serves the target. For a completed migration, write `retained`, read it back, then delete only the target data and target metadata collections. For a pre-marker process-death orphan, permit deletion only when the reviewed plan had `target_absent=true` and an exact-name recheck finds both names still unmarked; never delete the legacy source.
+Require migration ID, exact target pair, external per-source lock acknowledgement,
+a reviewed plan, `--confirm`, and the concrete hooks runner. Refuse deletion
+while a deployment serves the target. For `active`, write `retained`, read it
+back, delete target data first, verify absence, and delete target metadata last.
+Support owned retained-pair and retained metadata-only retries. For a
+pre-marker process-death orphan, permit deletion only when the reviewed plan
+had `target_absent=true`, exact-name recheck finds both names still unmarked,
+and the pair is empty; never delete the legacy source. Do not widen ordinary
+retire to `ready`, `building`, `failed`, `cutting_over`, or `rolled_back`.
 
 - [ ] **Step 6: Run focused orchestration tests**
 
@@ -722,7 +778,13 @@ git commit -m "feat: add barrier-held qdrant cutover and recovery"
 
 **Interfaces:**
 - The adapter tests use `VectorDBBackendConfig(qdrant={"data_collection_name": "generation-data", "metadata_collection_name": "generation-meta"})`.
-- The integration test constructs `QdrantMigration(client=client, source_collection=source, target_collection=target, logical_collection="legacy/context", migration_id=suffix, timeout_seconds=30)`, runs `preflight`, `prepare`, `backfill`, `reconcile`, and `verify`, then creates `QdrantCollectionAdapter` with the target physical names.
+- The integration test constructs `QdrantMigration` with the current adapter's
+  `logical_collection=f"{project}/context"`, explicit source/target physical
+  pairs, `migration_id=suffix`, and matching `timeout_seconds=30`; it runs
+  `preflight`, `prepare`, `backfill`, `reconcile`, and `verify` with the real
+  reviewed-plan/confirm/lock arguments, then creates
+  `QdrantCollectionAdapter` with the target physical names. The fixture
+  preserves dense `float32` and sparse index datatype `float16`.
 
 - [ ] **Step 1: Add failing adapter marker and routing coverage**
 
@@ -771,6 +833,8 @@ git commit -m "test: cover qdrant migration target binding and phases"
 
 **Files:**
 - Modify: `.github/workflows/pr.yml`
+- Modify: `.github/workflows/_test_lite.yml` (only the minimal
+  `test_paths_json` input extension; preserve cuVS defaults and callers)
 - Modify: `scripts/maintenance/README.md`
 - Modify: `openviking/storage/vectordb_adapters/README.md`
 - Modify: `docs/en/guides/01-configuration.md`
@@ -779,7 +843,13 @@ git commit -m "test: cover qdrant migration target binding and phases"
 
 - [ ] **Step 1: Add the failing CI/configuration assertions**
 
-Add `test_qdrant_ci_workflow_lists_required_suites` to the maintenance tests. It reads `.github/workflows/pr.yml` as text from `Path(__file__).resolve().parents[2]` and asserts that the Qdrant CI command includes exactly:
+Add `test_qdrant_ci_workflow_lists_required_suites` to the maintenance tests.
+Parse both workflow files with PyYAML from
+`Path(__file__).resolve().parents[2]`, then assert the actual
+`check-deps.outputs.qdrant_changed` mapping, change-detector shell assignment
+and matching paths, `qdrant-tests.needs`/`if`/`uses`/inputs, reusable-workflow
+pytest command, and the empty `QDRANT_URL`/`QDRANT_API_KEY` environment. The
+Qdrant CI input contains exactly:
 
 ```text
 tests/maintenance/test_qdrant_migrate.py
@@ -789,7 +859,8 @@ tests/storage/test_qdrant_integration.py
 tests/storage/test_collection_schemas.py
 ```
 
-The assertion also checks that the workflow has a `qdrant_changed` output and a conditional `qdrant-tests` job, while live integration remains environment-gated by `QDRANT_URL`:
+The parsed assertions also check that live integration remains environment-gated
+by `QDRANT_URL`:
 
 ```python
 REQUIRED_QDRANT_TESTS = (
@@ -815,7 +886,15 @@ Expected: `.github/workflows/pr.yml` currently has no Qdrant change detector or 
 
 - [ ] **Step 3: Implement the conditional Qdrant job**
 
-Extend `check-deps` with a `qdrant_changed` output whose pattern covers the REST client, collection, adapter, config, migration script, maintenance/storage tests, and the workflow itself. Add a `qdrant-tests` job that runs the five required test paths with `uv run pytest -q -o addopts=''`; the live tests skip when `QDRANT_URL` is unset and never receive production credentials from CI.
+Extend `check-deps` with a `qdrant_changed` output whose pattern covers the
+REST client, collection, sparse helpers, adapter, config, migration script,
+maintenance/storage tests, `pyproject.toml`/`uv.lock`, and both workflow files.
+Add a `qdrant-tests` job conditioned on that output. Reuse `_test_lite.yml` only
+through its minimal `test_paths_json` input extension, preserving the default
+cuVS paths and all existing callers; run the five required paths with
+`uv run pytest -q -o addopts=''`. The test step explicitly clears
+`QDRANT_URL` and `QDRANT_API_KEY`, so fake-REST tests are mandatory and live
+tests skip without production credentials.
 
 - [ ] **Step 4: Update English and Chinese runbooks**
 
@@ -854,9 +933,12 @@ git diff --check
 - [ ] **Step 6: Commit CI and documentation**
 
 ```bash
-git add .github/workflows/pr.yml scripts/maintenance/README.md \
+git add .github/workflows/pr.yml .github/workflows/_test_lite.yml \
+  scripts/maintenance/README.md \
   openviking/storage/vectordb_adapters/README.md \
   docs/en/guides/01-configuration.md docs/zh/guides/01-configuration.md
+git add -f docs/superpowers/specs/2026-09-08-qdrant-online-blue-green-migration-design.md \
+  docs/superpowers/plans/2026-09-08-qdrant-online-blue-green-migration-plan.md
 git commit -m "docs: document online qdrant migration operations"
 ```
 
@@ -959,9 +1041,18 @@ and the following safety clarifications:
 - Missing original IDs fail in the shared adapter decoder (Task 1), covering
   every fetch/query/update path rather than only adding a Task 9 test.
 - Runtime migration markers require logical/physical binding and consistent
-  vector dimension fields; non-migration direct-name markers remain compatible.
-- Deployment hook checks must provide stop-current, legacy-read validation,
-  serving-state verification, and explicit interrupted-cutover resume. No
+  vector dimension fields; sparse index datatype is also pinned; non-migration
+  direct-name markers remain compatible.
+- Runtime receipts keep raw `source_fingerprint` /
+  `verified_source_fingerprint` separate from canonical
+  `transformed_source_fingerprint` / `target_content_fingerprint`; final
+  verification requires the latter pair to match.
+- Deployment hook checks use one concrete runner with exactly ten argv keys:
+  drain/remove legacy, rollout/readiness/read-only smoke, remove current,
+  restore/verify legacy, accepted-write inspection, and target-not-served
+  assertion. The operator owns barrier acquisition and release; no release
+  hook exists. Explicit interrupted-cutover resume checks accepted writes
+  before source-authoritative repair and before active publication. No
   production hook is invoked by implementation or local tests.
 - Existing baseline on this worktree: 215 passed, 3 live tests skipped, five
   existing Python/Pydantic warnings. No live server was used.

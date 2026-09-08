@@ -149,9 +149,13 @@ target physical data name and adds:
   "sparse_vector_name": "sparse_vector",
   "vector_dimension": 1536,
   "distance": "Cosine",
+  "dense_datatype": "float32",
   "sparse_enabled": true,
+  "sparse_datatype": "float16",
   "sparse_weight": 0.5,
   "source_fingerprint": "...",
+  "transformed_source_fingerprint": "...",
+  "target_content_fingerprint": "...",
   "source_count": 0,
   "target_count": 0,
   "metadata_fingerprint": "...",
@@ -160,6 +164,7 @@ target physical data name and adds:
   "migrator_version": "...",
   "migration_state": "building",
   "last_source_cursor": null,
+  "backfill_complete": false,
   "setup_complete": false
 }
 ```
@@ -167,12 +172,15 @@ target physical data name and adds:
 The adapter validates the physical names and logical identity from this marker.
 It does not accept a legacy marker as a current-format marker.
 
-`source_fingerprint` and the source count in the reviewed plan are the initial
-observations, not immutable online-copy inputs. Each successful reconciliation
-round replaces them with the fingerprint and count of the source snapshot that
-round transformed. The metadata and sparse-map fingerprints are pinned inputs:
-the controller recomputes them before and after every round and fails closed if
-either changes.
+`source_fingerprint` and the source count in the reviewed plan are the most
+recent raw-source observations, not immutable online-copy inputs. Each
+successful reconciliation round replaces them with the fingerprint and count
+of the source scan that round transformed. `verified_source_fingerprint` is the
+raw-source receipt captured by exact verification. The independent
+`transformed_source_fingerprint` and `target_content_fingerprint` are the
+canonical content receipts and must match after a successful audit. The
+metadata and sparse-map fingerprints are pinned inputs: the controller
+recomputes them before and after every round and fails closed if either changes.
 
 The legacy metadata sidecar may be the pre-`#3872` global sidecar shared by
 several logical collections. The controller selects and fingerprints only the
@@ -250,7 +258,8 @@ All commands accept `--timeout-seconds`, pass it to every
 `QdrantRestClient` request, and record it in the plan. `cutover` and automatic
 `rollback` additionally require `--barrier-held`; this is an operator
 acknowledgement, not a claim that the controller can detect stopped application
-writers.
+writers. The operator acquires and releases the barrier; the controller has no
+release method.
 Every target point upsert/delete and marker write uses Qdrant's
 acknowledged/waited write mode (`wait=true` on REST) with `ordering=strong`; if
 the endpoint cannot honor strong ordering, preflight fails instead of silently
@@ -293,13 +302,20 @@ a foreign collection.
 #### `backfill`
 
 Scrolls the legacy source in bounded batches, transforms each page, and
-upserts the target. After every successful batch it persists the opaque
-Qdrant `next_page_offset` in `last_source_cursor`. The cursor may be an
-integer or string; a malformed or repeated cursor fails closed.
+upserts the target. After each successful page write it persists the opaque
+Qdrant `next_page_offset` in `last_source_cursor` and sets
+`backfill_complete` only when that cursor is `null`. The cursor may be an
+integer or string; a malformed or repeated cursor fails closed. A failed or
+unconfirmed page write never advances the cursor.
 
 Only one source page, one target write batch, and bounded transform state are
 held in memory. A failed batch is retried by rerunning that batch; the source
 is never written.
+
+Backfill's `source_count`, ACL/distinct-term counts, and fingerprints remain
+the most recent full-source scan observations. Its durable progress fields are
+the cursor, completion bit, and target count; per-page progress is not
+substituted for canonical whole-source observations.
 
 #### `reconcile`
 
@@ -315,7 +331,8 @@ Each reconciliation round:
 4. verifies sparse dictionary membership and writes missing terms in chunks;
 5. recomputes the pinned legacy metadata and sparse-map fingerprints before and
    after the round, failing if either changed;
-6. records the round's source/target fingerprints and counts in the target
+6. records the round's raw-source fingerprint/count and independent canonical
+   transformed-source/target-content fingerprints and counts in the target
    marker.
 
 When invoked by `cutover`, reconciliation preserves `migration_state=cutting_over`
@@ -331,16 +348,19 @@ round, the controller fails closed and reports non-convergence or source
 metadata drift. The implementation uses a fixed maximum of three rounds; it
 does not add another operator tuning knob.
 
-Fingerprints are only a bounded candidate filter. Final point verification
+Fingerprints are only bounded candidate filters. Final point verification
 compares canonical IDs, payloads, and dense/sparse vector values directly; a
-hash match alone never proves equality.
+hash match alone never proves equality. The manifest remains an invocation-
+local SQLite file keyed by IDs/fingerprints, not a second public points store.
 
 #### `verify`
 
 Verification is streamed and exact:
 
 - source and target counts;
-- transformed source fingerprint and target fingerprint;
+- raw source and verified-source fingerprints;
+- independently computed `transformed_source_fingerprint` and
+  `target_content_fingerprint` receipts, which must be equal;
 - target ID coverage and absence of extras;
 - logical-ID, physical-ID, and payload identity;
 - dense vector values, sparse vectors, vector names, dimensions, and distance;
@@ -361,22 +381,46 @@ The controller:
 
 1. requires `migration_state=ready`, `--barrier-held`, and a held write
    barrier;
-2. changes the target marker to `cutting_over`;
+2. validates all ten required deployment-hook argv arrays before changing
+   state, then changes the target marker to `cutting_over`;
 3. drains in-flight legacy writes and waits for their Qdrant requests to
    complete before taking the final source snapshot;
-4. drains and removes the legacy deployment from the serving path so old and
+4. removes the legacy deployment from the serving path so old and
    current-format replicas cannot serve mixed generations;
-5. runs final `reconcile` and `verify`;
+5. runs final `reconcile` and explicit-barrier `verify`;
 6. rolls out the current-format application with both explicit target physical
    names and the configured Qdrant request timeout;
 7. waits for every new replica to pass readiness and a read-only marker,
    count, and representative dense/sparse query smoke test;
-8. changes the target marker to `active`;
-9. releases the write barrier only after the old deployment is stopped and the new
-   deployment is serving the target pair.
+8. checks that no current-format data write was accepted unexpectedly and
+   changes the target marker to `active`.
 
 The read-only smoke gate must not upsert, delete, or partially update data.
 Source and target remain available for audit; the source is not rewritten.
+The operator owns barrier acquisition and release; there is no release hook.
+The operator releases the barrier only after the active receipt and rollout
+checks are accepted.
+
+The concrete deployment-hook JSON has exactly these required keys, each a
+non-empty argv list of validated strings:
+
+```text
+drain_legacy_writes
+remove_legacy_from_serving_path
+rollout_current
+wait_current_ready
+smoke_current_read_only
+remove_current_from_serving_path
+restore_legacy
+verify_legacy_read_path
+current_target_has_accepted_writes
+assert_target_not_served
+```
+
+Only `current_target_has_accepted_writes` consumes captured stdout, and it
+accepts only exact lowercase `true` or `false`. All other hooks require exit
+status zero. Hooks run with `shell=False`, a finite timeout, and non-secret
+`OV_*` bindings; inherited operator environment is never logged.
 
 If any step fails while the barrier is held, the controller leaves the target
 in `cutting_over` or `failed` and requires `rollback` or an explicit resume.
@@ -386,17 +430,16 @@ proof that writers have stopped.
 
 #### `rollback`
 
-Automatic rollback is allowed only while the write barrier is held. It:
+Automatic rollback is allowed only while the write barrier is held. It accepts
+only a `cutting_over` or barrier-held `active` target and requires
+`--confirm`, `--lock-held`, `--barrier-held`,
+`--no-current-format-writes-accepted`, and the strict accepted-write hook.
 
-It accepts only a `cutting_over` or barrier-held `active` target and requires
-the operator to attest that no current-format data write has been accepted.
-
-1. stops/removes the current-format rollout before any post-cutover target
-   write can be accepted;
+1. removes the current-format serving path and asserts the target is not served;
 2. restores the legacy deployment's direct source configuration and serving
    path;
 3. verifies the legacy marker and source read path;
-4. marks the target `rolled_back` and retains it.
+4. marks the target `rolled_back` with `setup_complete=false` and retains it.
 
 After the barrier is released, the target may contain writes that do not exist
 in the legacy source. The controller therefore refuses automatic rollback and
@@ -404,15 +447,19 @@ requires a separately designed reverse migration.
 
 #### `retire`
 
-Deletion is explicit and requires the operator to name the migration ID and
-target pair, verify that no deployment serves the pair, print the exact
-collections, and pass `--confirm`. After the retention window, it first writes
-`migration_state=retained`, re-reads that marker, and only then deletes the
-pair. If a process died before its first marker write, the reviewed plan's
-`target_absent=true` plus the external per-source lock permits cleanup of that
-migration-owned orphan only after both names are rechecked as unmarked; an
-unmarked collection that was not absent in the reviewed plan is never deleted
-by the tool. Normal migration and rollback never delete the legacy source.
+Deletion is explicit and requires the migration ID, exact target pair,
+external lock, `--confirm`, a reviewed plan, and the concrete deployment-hook
+runner proving that the target is not served. Only `active -> retained`,
+owned retained-pair retries, and owned retained metadata-only retries are
+ordinary retire states; `ready`, `building`, `failed`, `cutting_over`, and
+`rolled_back` are rejected. After the retention window, it first writes
+`migration_state=retained`, re-reads that marker, deletes target data, verifies
+absence, and only then deletes target metadata. If a process died before its
+first marker write, the reviewed plan's `target_absent=true` plus the external
+per-source lock permits a separate orphan cleanup only after both names are
+rechecked as unmarked and empty. An unmarked collection that was not absent in
+the reviewed plan is never deleted by the tool. Normal migration and rollback
+never delete the legacy source.
 
 ### 4. Legacy-to-current transform contract
 
@@ -451,8 +498,8 @@ The transform must:
   same-fingerprint read-only rerun; an active, retained, or rolled-back target
   rejects mutating reruns.
 - Pinned metadata/sparse-map fingerprints, names, counts, ACL, and vector
-  mismatches fail before cutover; the rolling source fingerprint must equal the
-  target fingerprint at the barrier.
+  mismatches fail before cutover; final verification requires the independent
+  `transformed_source_fingerprint` and `target_content_fingerprint` to match.
 - A process death during `cutting_over` leaves the barrier held. Recovery
   inspects the marker and deployment state, then resumes or rolls back; it
   never assumes that a partial application rollout succeeded.
@@ -570,16 +617,18 @@ must retain its documented full-window freeze semantics.
 3. Run `prepare`, `backfill`, `reconcile`, and point-in-time `verify` while
    the legacy deployment serves the source.
 4. Acquire the write barrier. Stop legacy upserts, deletes, partial updates,
-   and metadata writes; drain/remove the legacy deployment from the serving
-   path; keep the barrier held.
-5. Run final `reconcile` and `verify` with `--allow-acl-fail-open` only if the
-   recorded ACL risk is explicitly accepted.
-6. Run `cutover`; keep the barrier held until every current-format replica
-   passes read-only smoke. The representative sparse query uses already
-   migrated dictionary terms (or pre-encoded indices), so the smoke gate cannot
-   create metadata points as a side effect.
-7. Release the barrier and perform the first normal write/read acceptance
-   check.
+   and metadata writes; drain in-flight requests and keep the barrier held.
+5. Run final `reconcile --barrier-held` and
+   `verify --final --barrier-held --confirm --lock-held`, using
+   `--allow-acl-fail-open` only if the recorded ACL risk is explicitly
+   accepted.
+6. Run `cutover --confirm --lock-held --barrier-held --deployment-hooks`; keep
+   the barrier held until every current-format replica passes read-only smoke.
+   The representative sparse query uses already migrated dictionary terms (or
+   pre-encoded indices), so the smoke gate cannot create metadata points as a
+   side effect.
+7. The operator releases the barrier after the controller returns `active`, and
+   performs the first normal write/read acceptance check.
 8. Retain the legacy source and target marker for the agreed audit window.
 9. Run `retire` only after the retention window and explicit confirmation.
 

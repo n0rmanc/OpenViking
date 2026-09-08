@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import unquote, urlsplit
 
 import pytest
+import yaml
 
 from openviking.storage.vectordb.qdrant_sparse import stable_sparse_index
 from openviking.storage.vectordb.qdrant_utils import to_qdrant_point_id
@@ -22,6 +24,14 @@ from scripts.maintenance.qdrant_migrate import (
     _parser,
     _ScanManifest,
     main,
+)
+
+REQUIRED_QDRANT_TESTS = (
+    "tests/maintenance/test_qdrant_migrate.py",
+    "tests/storage/test_qdrant_adapter.py",
+    "tests/storage/test_qdrant_migration_integration.py",
+    "tests/storage/test_qdrant_integration.py",
+    "tests/storage/test_collection_schemas.py",
 )
 
 
@@ -4928,3 +4938,65 @@ def test_cli_rejects_invalid_hook_arrays_before_controller_dispatch(
     assert result == 2
     assert "deployment hook keys differ" in capsys.readouterr().err
     assert not _CliMigration.instances[-1].calls
+
+
+def test_qdrant_ci_workflow_lists_required_suites() -> None:
+    root = Path(__file__).resolve().parents[2]
+    workflow = yaml.safe_load((root / ".github/workflows/pr.yml").read_text())
+    lite_workflow = yaml.safe_load(
+        (root / ".github/workflows/_test_lite.yml").read_text()
+    )
+
+    check_deps = workflow["jobs"]["check-deps"]
+    assert (
+        check_deps["outputs"]["qdrant_changed"]
+        == "${{ steps.check.outputs.qdrant_changed }}"
+    )
+    check_step = next(step for step in check_deps["steps"] if step.get("id") == "check")
+    check_script = check_step["run"]
+    qdrant_pattern_line = next(
+        line.strip()
+        for line in check_script.splitlines()
+        if line.strip().startswith("QDRANT_PATTERN=")
+    )
+    qdrant_pattern = qdrant_pattern_line.split("=", 1)[1].strip().strip('"')
+    for path in (
+        *REQUIRED_QDRANT_TESTS,
+        "openviking/storage/vectordb/collection/qdrant_rest.py",
+        "openviking/storage/vectordb/collection/qdrant_collection.py",
+        "openviking/storage/vectordb/qdrant_sparse.py",
+        "openviking/storage/vectordb/qdrant_utils.py",
+        "openviking/storage/vectordb_adapters/qdrant_adapter.py",
+        "openviking_cli/utils/config/vectordb_config.py",
+        "scripts/maintenance/qdrant_migrate.py",
+        "pyproject.toml",
+        "uv.lock",
+        ".github/workflows/pr.yml",
+        ".github/workflows/_test_lite.yml",
+    ):
+        assert re.search(qdrant_pattern, path), path
+    assert not re.search(qdrant_pattern, "docs/en/guides/01-configuration.md")
+    assert 'echo "qdrant_changed=true" >> "$GITHUB_OUTPUT"' in check_script
+    assert 'echo "qdrant_changed=false" >> "$GITHUB_OUTPUT"' in check_script
+
+    qdrant_job = workflow["jobs"]["qdrant-tests"]
+    assert qdrant_job["needs"] == "check-deps"
+    assert (
+        qdrant_job["if"]
+        == "${{ needs.check-deps.outputs.qdrant_changed == 'true' }}"
+    )
+    assert qdrant_job["uses"] == "./.github/workflows/_test_lite.yml"
+    assert qdrant_job["with"]["os_json"] == '["ubuntu-24.04"]'
+    assert qdrant_job["with"]["python_json"] == '["3.10"]'
+    assert json.loads(qdrant_job["with"]["test_paths_json"]) == list(
+        REQUIRED_QDRANT_TESTS
+    )
+    assert "secrets" not in qdrant_job
+
+    lite_on = lite_workflow.get("on", lite_workflow.get(True))
+    lite_inputs = lite_on["workflow_call"]["inputs"]
+    assert "test_paths_json" in lite_inputs
+    lite_steps = lite_workflow["jobs"]["test-lite"]["steps"]
+    test_step = next(step for step in lite_steps if "pytest" in step.get("run", ""))
+    assert test_step["env"] == {"QDRANT_URL": "", "QDRANT_API_KEY": ""}
+    assert "${{ join(fromJson(inputs.test_paths_json), ' ') }}" in test_step["run"]

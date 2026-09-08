@@ -2,16 +2,25 @@
 
 ## Migrate a pre-`#3872` collection
 
-`qdrant_migrate.py` copies one legacy Qdrant collection into a new
-current-format collection. The source collection and its metadata sidecar are
-never modified or deleted. The target names must be new names unless a
-previous migration-owned target is being resumed.
+`qdrant_migrate.py` copies a legacy Qdrant data collection and its legacy
+metadata sidecar into a new current-format target pair. The legacy source is
+read-only and remains available for audit and the barrier-held rollback
+boundary. The target data and metadata names are physical names and must be
+new, pairwise distinct names unless the same `migration_id` is being resumed.
 
-The current Qdrant adapter cannot load pre-`#3872` metadata markers directly;
-legacy collections must be migrated (or re-ingested) before configuration is
-cut over to the current backend.
+The controller is deliberately one-way:
 
-Run from the repository root with the project virtual environment:
+```text
+preflight -> prepare -> backfill -> reconcile -> verify
+```
+
+The long online copy does **not** freeze the entire window. It requires an
+external per-source lock and leaves legacy serving available while `backfill`
+and rolling `reconcile` run. `apply` is the compatibility **offline** wrapper;
+it retains the older full-window source and legacy-metadata freeze semantics
+for `prepare + backfill + verify`.
+
+Run from the repository root:
 
 ```bash
 ./.venv/bin/python scripts/maintenance/qdrant_migrate.py \
@@ -19,25 +28,47 @@ Run from the repository root with the project virtual environment:
   --source-collection legacy__context \
   --target-collection current__context \
   --source-metadata-collection __openviking_meta \
-  --logical-collection legacy/context \
+  --logical-collection default/context \
   --migration-id migration-2026-09-08 \
   --timeout-seconds 30 \
   --sparse-map /path/to/legacy-sparse-map.json \
   preflight
 ```
 
+Every command requires the explicit `--logical-collection`, `--migration-id`,
+and `--timeout-seconds` arguments. The reviewed plan records the target pair,
+source metadata name, logical identity, `batch_size`, timeout, vector layout,
+metadata/sparse fingerprints, ACL-incomplete count, and migration identity.
+It never contains the Qdrant URL, API key, vectors, payloads, or a full ID map.
+
+### Configuration and sparse map
+
+The current-format application must be configured with the target physical
+pair. For example:
+
+```yaml
+qdrant:
+  data_collection_name: current__context__migration_20260908
+  metadata_collection_name: current__context__migration_20260908__openviking_meta
+  timeout_seconds: 30
+```
+
+`data_collection_name` and `metadata_collection_name` are physical Qdrant
+names, not aliases. The target marker also binds `logical_collection` and
+`migration_id`; a marker owned by another migration or missing the current
+identity is never adopted. The migrator version is code-owned. Required new
+marker fields are validated fail-closed; this unpublished branch has no
+intermediate marker-schema upgrader.
+
 `--source-metadata-collection` defaults to the pre-`#3872` global
 `__openviking_meta`. The target sidecar defaults to
 `{target_collection}__openviking_meta`; pass
-`--target-metadata-collection` only when that name is explicitly reserved for
-this migration. Sharing a target metadata sidecar between collections is not
-supported.
-
-### Sparse index map
+`--target-metadata-collection` only when that physical name is explicitly
+reserved for this migration. A target metadata sidecar is never shared by two
+logical collections.
 
 Pre-`#3872` sparse vectors contain numeric indexes without a reliable term
-dictionary. Do not guess the mapping. Supply an authoritative JSON object in
-either direction:
+dictionary. Supply an authoritative JSON object in either direction:
 
 ```json
 {"111": "hello", "222": "world"}
@@ -49,72 +80,142 @@ or:
 {"hello": 111, "world": 222}
 ```
 
-If any source sparse index is absent, preflight fails closed. A source with
-multiple named sparse vectors also requires `--sparse-vector-name`.
+If an index or term is missing, or a stable-index collision is found,
+preflight fails closed. A source with multiple named sparse vectors also needs
+`--sparse-vector-name`. The target layout records both dense and sparse
+datatypes (the approved sparse index policy is currently `float16`); there is
+no extra datatype tuning flag.
 
-### Procedure
+### Online procedure
 
-1. Stop or otherwise freeze all writes to both the source collection and its
-   legacy metadata sidecar. Keep both freezes in place for the whole
-   preflight, apply, and verification window.
-2. Run `preflight` and save its JSON output. Confirm the source/target names,
-   exact counts, vector layout, sparse term count/fingerprint, and other
-   fingerprints.
-3. Review ownership normalization. For a user-scoped URI such as
-   `/user/alice/memories/a.md`, a missing `owner_user_id` is derived as
-   `alice`; the target payload can therefore intentionally differ from the
-   source payload. The ownerless roots `/user` and `/resources` remain without
-   an owner when their source value is null or absent. A malformed owner or an
-   owner that does not match the URI fails preflight/apply closed. Verify a
-   representative target payload against its URI before cutover. A
-   migration-owned target data is reconciled from the source-authoritative
-   transform; a newer divergent target payload is not silently preserved.
-4. Review the ACL gate. Records missing or containing malformed
-   `acl_enabled`, `acl_direct_grants`, or `acl_inherited_grants` remain
-   fail-open after the copy. Grant values must be encoded ACL tokens. Do not
-   expose the target until those records are rewritten or an operator
-   explicitly accepts the risk with `--allow-acl-fail-open`.
-5. Apply only after the plan is reviewed:
+1. Confirm the source and target physical pair, legacy metadata sidecar,
+   `logical_collection`, `migration_id`, sparse map, timeout, and ACL risk.
+   Acquire the external per-source migration lock.
+2. Run read-only `preflight`; review and retain its compact JSON plan.
+3. With legacy serving the source, run the reviewed `prepare`, then
+   `backfill`, `reconcile`, and point-in-time `verify`. Each mutating command
+   uses `--plan`, `--confirm`, and `--lock-held`. `reconcile` and final
+   `verify` additionally acknowledge `--barrier-held` when run in the final
+   window.
+   Review ownership normalization: for `/user/alice/memories/a.md`, a missing
+   `owner_user_id` is derived as `alice`; ownerless roots `/user` and
+   `/resources` remain ownerless when the source value is null or absent.
+   Malformed or URI-inconsistent owners fail closed.
+4. Acquire the write barrier at the application boundary. Stop all legacy
+   data and metadata writes, including deletes and partial updates, and drain
+   in-flight requests. Keep the barrier held; the controller cannot infer that
+   writers stopped.
+5. Run final `reconcile --barrier-held` and
+   `verify --final --barrier-held --confirm --lock-held`. Final verification
+   independently compares canonical transformed-source and target-content
+   fingerprints and exact IDs, payloads, dense/sparse vectors, metadata,
+   indexes, and ACL state. `source_fingerprint` remains the raw-source drift
+   receipt; it is not a target-content proof.
+6. Run `cutover` with `--confirm --lock-held --barrier-held --plan` and
+   `--deployment-hooks`. The controller invokes the validated idempotent hooks
+   for drain, legacy serving removal, current rollout/readiness, read-only
+   smoke, and accepted-write inspection in the required order. The complete
+   runner also validates the target-not-served, current-removal, and
+   legacy-read hooks used by rollback and retire. The operator owns both
+   barrier acquisition and release; there is no release hook. Release the
+   barrier only after the controller returns the `active` receipt and the
+   current read-only smoke passes.
+7. Perform the first normal read/write acceptance check, then retain both
+   source and target for the agreed audit window.
 
-   ```bash
-   ./.venv/bin/python scripts/maintenance/qdrant_migrate.py \
-     --url https://qdrant.example \
-     --source-collection legacy__context \
-     --target-collection current__context \
-     --source-metadata-collection __openviking_meta \
-     --logical-collection legacy/context \
-     --migration-id migration-2026-09-08 \
-     --timeout-seconds 30 \
-     --sparse-map /path/to/legacy-sparse-map.json \
-     apply --plan /path/to/preflight.json --confirm --lock-held --allow-acl-fail-open
-   ```
+The deployment-hook JSON must contain exactly these ten non-empty argv arrays:
 
-   Set `QDRANT_API_KEY` in the environment when authentication is required;
-   do not put secrets in command-line arguments.
-   Remove `--allow-acl-fail-open` when all source records have complete ACL
-   fields. `--confirm` is always required for writes.
-6. Verify the reported `source_count`, `target_count`, and source/metadata
-   fingerprints. Read back the target marker and verify that
-   `setup_complete` is `true`; inspect the physical target scalar indexes,
-   confirm normalized `owner_user_id` on user-scoped records and its absence
-   on ownerless roots, and decode a representative dense and sparse record
-   through the current adapter.
-7. Change the OpenViking collection configuration to the target collection and
-   its target metadata sidecar, then restart/roll out the application through
-   the normal deployment process. Configuration cutover is separate from this
-   script.
-8. Retain the legacy source collection and metadata sidecar for the agreed
-   rollback/audit window. Roll back by pointing configuration at the retained
-   source; do not delete it as part of this migration.
+```text
+drain_legacy_writes
+remove_legacy_from_serving_path
+rollout_current
+wait_current_ready
+smoke_current_read_only
+remove_current_from_serving_path
+restore_legacy
+verify_legacy_read_path
+current_target_has_accepted_writes
+assert_target_not_served
+```
 
-### Failure and resume behavior
+The accepted-write hook must print exactly lowercase `true` or `false`;
+other hooks are exit-code assertions. Commands run with `shell=False`, a
+finite `timeout_seconds`, captured output, and non-secret `OV_*` bindings.
+Hook output and inherited secrets are never placed in the JSON receipt.
 
-The target marker binds the target to the source collection, source snapshot,
-metadata fingerprint, and vector/schema layout. A changed source, stale plan,
-unowned target, count mismatch, metadata mismatch, or sparse collision fails
-closed. An interrupted migration-owned setup leaves an incomplete marker and
-can be resumed after the cause is fixed; an unmarked pre-existing target is
-never adopted or overwritten.
+Each reconciliation round uses a temporary SQLite manifest containing only
+target IDs and canonical fingerprints. It is deleted after verification and
+needs disk space for approximately one source scan. Backfill's marker
+`source_count`, ACL/distinct-term counts, and fingerprints remain the most
+recent full-source scan observations; the cursor, completion bit, and target
+count are durable page progress. A page write must complete before its opaque
+integer/string cursor advances. This is not a claim that online page reads
+form one source snapshot.
 
-This script does not freeze writes, update application configuration, restart
-services, or delete legacy data.
+### ACL and recovery boundaries
+
+Records with missing or malformed `acl_enabled`, `acl_direct_grants`, or
+`acl_inherited_grants` remain fail-open. Do not expose the target until they
+are repaired, or explicitly accept that risk with `--allow-acl-fail-open`.
+That flag records the incomplete count and prints a warning; it never fakes
+ACL protection and does not retroactively protect those records.
+
+If cutover fails, the marker remains `cutting_over` (or `failed`) and the
+operator keeps the barrier held. An interrupted cutover requires explicit
+`--resume`; the controller checks for accepted current-format writes before
+source-authoritative repair and again before publishing `active`. It never
+silently overwrites accepted target writes.
+
+Rollback is allowed only while the barrier is held, before any accepted
+current-format target write, with `--confirm --lock-held
+--barrier-held --no-current-format-writes-accepted` and the deployment hooks.
+It removes the current serving path, restores and verifies the legacy read
+path, and retains the target as `rolled_back` for raw audit. After barrier
+release or any accepted target write, automatic rollback is refused; use a
+separate reverse migration.
+
+`retire --confirm --lock-held --plan ... --deployment-hooks ...` is allowed
+only after the retention window and when the target is not served. Normal
+retire supports `active -> retained`, retries for an owned retained pair, and
+an owned retained metadata-only retry. It deletes target data first, verifies
+absence, then deletes target metadata. A reviewed, unmarked pre-marker orphan
+is a separate cleanup path requiring the exact absent plan, external lock,
+exact-name recheck, and confirmation. `ready`, `building`, `failed`,
+`cutting_over`, and `rolled_back` are not ordinary retire states. The legacy
+source and legacy metadata sidecar are never deleted.
+
+The source is authoritative before cutover. A newer target timestamp does not
+justify preserving divergent target values: reconciliation corrects them from
+the authorized source or verification fails closed.
+
+### Offline compatibility apply
+
+For an explicitly offline migration, the compatibility wrapper keeps the
+full-window freeze around both the source collection and legacy metadata
+sidecar:
+
+```bash
+./.venv/bin/python scripts/maintenance/qdrant_migrate.py \
+  --url https://qdrant.example \
+  --source-collection legacy__context \
+  --target-collection current__context \
+  --source-metadata-collection __openviking_meta \
+  --logical-collection default/context \
+  --migration-id migration-2026-09-08 \
+  --timeout-seconds 30 \
+  --sparse-map /path/to/legacy-sparse-map.json \
+  apply --plan /path/to/preflight.json --confirm --lock-held \
+  --allow-acl-fail-open
+```
+
+Set `QDRANT_API_KEY` in the environment when authentication is required; do
+not put secrets in command-line arguments. Remove
+`--allow-acl-fail-open` after every source record has complete
+`acl_enabled`, `acl_direct_grants`, and `acl_inherited_grants` fields. Grant
+values must be encoded ACL tokens. The flag never rewrites or retroactively
+protects incomplete records.
+
+After either path, configure the application with the target physical pair,
+perform the normal deployment rollout separately, and retain the legacy
+source/sidecar for the agreed audit window. This script never updates
+application configuration, restarts services, or deletes legacy data.

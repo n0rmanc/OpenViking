@@ -101,6 +101,7 @@ jobs:
       deps_changed: ${{ steps.check.outputs.deps_changed }}
       cuvs_changed: ${{ steps.check.outputs.cuvs_changed }}
       langchain_changed: ${{ steps.check.outputs.langchain_changed }}
+      qdrant_changed: ${{ steps.check.outputs.qdrant_changed }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -152,6 +153,20 @@ jobs:
             echo "langchain_changed=false" >> $GITHUB_OUTPUT
           fi
 
+          # Run the Qdrant fake-REST and opt-in integration suites when any
+          # Qdrant implementation, configuration, test, or workflow input changes.
+          QDRANT_PATTERN="openviking/storage/vectordb/(qdrant_.*|collection/qdrant_.*)\.py|openviking/storage/vectordb_adapters/qdrant_adapter\.py|openviking_cli/utils/config/vectordb_config\.py|scripts/maintenance/qdrant_migrate\.py|tests/(maintenance/test_qdrant_migrate|storage/test_qdrant_(adapter|migration_integration|integration)|storage/test_collection_schemas)\.py|pyproject\.toml|uv\.lock|\.github/workflows/(pr|_test_lite)\.yml"
+          QDRANT_CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }} HEAD | grep -E "$QDRANT_PATTERN" || true)
+
+          if [ -n "$QDRANT_CHANGED_FILES" ]; then
+            echo "Qdrant-related changes detected:"
+            echo "$QDRANT_CHANGED_FILES"
+            echo "qdrant_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No Qdrant-related changes detected."
+            echo "qdrant_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     needs: check-deps
     if: ${{ needs.check-deps.outputs.deps_changed == 'true' }}
@@ -164,6 +179,21 @@ jobs:
     with:
       os_json: '["ubuntu-24.04"]'
       python_json: '["3.11"]'
+
+  qdrant-tests:
+    needs: check-deps
+    if: ${{ needs.check-deps.outputs.qdrant_changed == 'true' }}
+    uses: ./.github/workflows/_test_lite.yml
+    # _test_lite clears QDRANT_URL/QDRANT_API_KEY for this mandatory fake-REST run.
+    with:
+      os_json: '["ubuntu-24.04"]'
+      python_json: '["3.10"]'
+      test_paths_json: >-
+        ["tests/maintenance/test_qdrant_migrate.py",
+        "tests/storage/test_qdrant_adapter.py",
+        "tests/storage/test_qdrant_migration_integration.py",
+        "tests/storage/test_qdrant_integration.py",
+        "tests/storage/test_collection_schemas.py"]
 
   langchain-tests:
     needs: check-deps
