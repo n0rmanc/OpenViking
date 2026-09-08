@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import json
 import math
+from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 
@@ -1650,9 +1651,17 @@ def test_migration_fields_survive_normal_marker_rewrites() -> None:
         sparse_weight=0.5,
         logical_collection="project/docs",
     )
-    marker_fields = {
+    remote_marker = _target_marker(
+        migration_id="remote-migration",
+        source_fingerprint="remote-source-fingerprint",
+        source_count=2,
+        target_count=2,
+        transformed_source_fingerprint="remote-transformed-source-fingerprint",
+        target_content_fingerprint="remote-target-content-fingerprint",
+    )
+    remote_marker_fields = {
         name: value
-        for name, value in _target_marker().items()
+        for name, value in remote_marker.items()
         if name
         not in {
             "_openviking_meta_version",
@@ -1669,16 +1678,32 @@ def test_migration_fields_survive_normal_marker_rewrites() -> None:
             "indexes",
         }
     }
+    stale_marker_fields = {
+        name: value
+        for name, value in _target_marker().items()
+        if name in remote_marker_fields
+    }
     collection._schema = {"CollectionName": "docs", "Fields": []}
-    collection._migration_marker_fields = marker_fields
-    marker = {}
+    collection._migration_marker_fields = stale_marker_fields
+    loaded_markers: list[dict[str, Any]] = []
+
+    def load_marker() -> dict[str, Any]:
+        loaded_markers.append(remote_marker)
+        return remote_marker
+
+    collection._marker_loaded_from_remote = True
+    collection._load_metadata_marker = load_marker  # type: ignore[method-assign]
+    marker: dict[str, Any] = {}
     collection._upsert_points = (  # type: ignore[method-assign]
         lambda _name, points: marker.update(points[0]["payload"])
     )
 
     collection.update(description="rewritten")
 
-    for field_name, expected in marker_fields.items():
+    assert loaded_markers == [remote_marker]
+    assert stale_marker_fields["migration_id"] != remote_marker_fields["migration_id"]
+    assert stale_marker_fields["target_count"] != remote_marker_fields["target_count"]
+    for field_name, expected in remote_marker_fields.items():
         assert marker[field_name] == expected
     assert marker["schema"]["Description"] == "rewritten"
 
@@ -1707,28 +1732,6 @@ def test_legacy_marker_is_not_loadable_by_current_adapter() -> None:
     assert collection.has_openviking_metadata() is False
     with pytest.raises(RuntimeError, match="valid current marker"):
         collection.get_meta_data()
-
-
-def test_missing_original_id_does_not_fabricate_a_record_id() -> None:
-    collection = QdrantCollection(
-        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
-        collection_name="docs",
-        metadata_collection_name="docs__meta",
-        dense_vector_name="dense",
-        sparse_vector_name="sparse",
-        vector_dim=2,
-        distance="cosine",
-        sparse_enabled=False,
-        sparse_weight=0.0,
-    )
-
-    with pytest.raises(ValueError, match="_openviking_original_id"):
-        collection._payload_to_record(
-            {
-                "id": to_qdrant_point_id("fabricated"),
-                "payload": {"uri": "/resources/doc.md"},
-            }
-        )
 
 
 def test_migration_marker_binds_physical_and_logical_names() -> None:
@@ -1967,7 +1970,7 @@ def test_metadata_updates_preserve_migration_provenance() -> None:
     assert marker["schema"]["Description"] == "updated"
 
 
-def test_payload_to_record_requires_original_id() -> None:
+def test_missing_original_id_does_not_fabricate_a_record_id() -> None:
     collection = QdrantCollection(
         client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
         collection_name="docs",
