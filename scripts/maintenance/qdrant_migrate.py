@@ -26,6 +26,7 @@ import math
 import os
 import re
 import sqlite3
+import struct
 import sys
 import tempfile
 import time
@@ -566,6 +567,17 @@ def _finite_vector(value: Any, *, field_name: str, dimension: int | None = None)
     return vector
 
 
+def _canonical_float32(value: Any, *, field_name: str) -> float:
+    try:
+        numeric = float(value)
+        canonical = struct.unpack("!f", struct.pack("!f", numeric))[0]
+    except (OverflowError, TypeError, ValueError, struct.error) as exc:
+        raise MigrationError(f"{field_name} contains a value outside float32") from exc
+    if not math.isfinite(canonical):
+        raise MigrationError(f"{field_name} contains a non-finite value")
+    return canonical
+
+
 def _point_fingerprint(
     *,
     source_point_id: Any,
@@ -975,6 +987,7 @@ class QdrantMigration:
         self._dense_vector_name_override = dense_vector_name
         self._sparse_vector_name_override = sparse_vector_name
         self._sparse_map = _legacy_sparse_map(sparse_map)
+        self._manifest_path: Path | None = None
         self.logical_collection = self._name(logical_collection, "logical collection")
         self.migration_id = self._name(migration_id, "migration ID")
         if migrator_version != MIGRATOR_VERSION:
@@ -2004,7 +2017,7 @@ class QdrantMigration:
         self._validate_marker_ownership(marker)
         previous_state = marker["migration_state"]
         allowed_previous = {
-            "building": {"building", "failed"},
+            "building": {"building", "failed", "ready"},
             "ready": {"building", "ready"},
             "cutting_over": {"ready", "cutting_over"},
             "active": {"cutting_over", "active"},
@@ -2319,6 +2332,371 @@ class QdrantMigration:
                 f"source physical layout changed {phase}; "
                 "rerun preflight with source writes frozen"
             )
+
+    def _open_manifest(self) -> sqlite3.Connection:
+        """Open the bounded reconciliation manifest on local disk."""
+
+        handle = tempfile.NamedTemporaryFile(
+            prefix="openviking-qdrant-reconcile-",
+            suffix=".sqlite3",
+            delete=False,
+        )
+        self._manifest_path = Path(handle.name)
+        handle.close()
+        try:
+            connection = sqlite3.connect(self._manifest_path)
+            connection.execute(
+                """
+                CREATE TABLE points (
+                    target_id TEXT PRIMARY KEY,
+                    fingerprint TEXT NOT NULL
+                )
+                """
+            )
+            connection.commit()
+            return connection
+        except BaseException:
+            try:
+                self._manifest_path.unlink()
+            except FileNotFoundError:
+                pass
+            self._manifest_path = None
+            raise
+
+    def _delete_points(self, collection: str, point_ids: list[str]) -> None:
+        if not point_ids:
+            return
+        self._request(
+            "POST",
+            self._path(collection, "/points/delete"),
+            {"points": point_ids},
+            mutation=True,
+        )
+
+    def _reconcile_round(
+        self,
+        *,
+        layout: CollectionLayout,
+        schema: Mapping[str, Any],
+        metadata: LegacyMetadata,
+        state: str,
+    ) -> SourceSnapshot:
+        """Rebuild the target from one bounded, source-authoritative scan."""
+
+        del metadata, state  # The caller pins these values around the round.
+        connection = self._open_manifest()
+        stats = {"migrated_count": 0, "skipped_count": 0, "deleted_count": 0}
+        try:
+            with _ScanManifest() as scan:
+                pending: list[dict[str, Any]] = []
+
+                def upsert_pending() -> None:
+                    if not pending:
+                        return
+                    migrated, skipped = self._upsert_target_batch(pending)
+                    stats["migrated_count"] += migrated
+                    stats["skipped_count"] += skipped
+                    pending.clear()
+
+                def point_callback(transformed: dict[str, Any]) -> None:
+                    if (
+                        not _acl_complete(transformed["payload"])
+                        and not getattr(self, "_reconcile_allow_acl_fail_open", False)
+                    ):
+                        raise MigrationError(
+                            f"point {transformed.get('id')!r} lacks complete ACL fields"
+                        )
+                    pending.append(transformed)
+                    if len(pending) >= self.batch_size:
+                        upsert_pending()
+
+                source = self._scan_source(
+                    layout=layout,
+                    schema=schema,
+                    manifest=scan,
+                    point_callback=point_callback,
+                )
+                upsert_pending()
+
+                rows = scan.connection.execute(
+                    "SELECT target_id, fingerprint FROM source_targets"
+                )
+                while True:
+                    batch = rows.fetchmany(self.batch_size)
+                    if not batch:
+                        break
+                    try:
+                        connection.executemany(
+                            "INSERT INTO points(target_id, fingerprint) VALUES (?, ?)",
+                            batch,
+                        )
+                    except sqlite3.IntegrityError as exc:
+                        raise MigrationError(
+                            "source scan produced a duplicate transformed target id"
+                        ) from exc
+                    connection.commit()
+
+                # The map is input-sized and therefore bounded independently of
+                # the point count; write only terms observed in this scan.
+                self._write_sparse_dictionary(scan.iter_sparse_terms())
+
+                pending_deletes: list[str] = []
+                for point in self._scroll(self.target_collection, with_vectors=False):
+                    point_id = point.get("id")
+                    if point_id is None:
+                        raise MigrationError(
+                            "target collection contains a point without an id"
+                        )
+                    point_id = str(point_id)
+                    payload = point.get("payload")
+                    if not isinstance(payload, Mapping):
+                        raise MigrationError(
+                            f"target point {point_id!r} has no payload"
+                        )
+                    original_id = payload.get(_ORIGINAL_ID_FIELD)
+                    if original_id is None or not str(original_id):
+                        raise MigrationError(
+                            f"target point {point_id!r} is missing "
+                            f"{_ORIGINAL_ID_FIELD}"
+                        )
+                    expected_id = str(to_qdrant_point_id(str(original_id)))
+                    if expected_id != point_id:
+                        raise MigrationError(
+                            f"target point-id {point_id!r} does not match "
+                            f"deterministic encoding for {original_id!r}"
+                        )
+                    row = connection.execute(
+                        "SELECT 1 FROM points WHERE target_id = ?",
+                        (point_id,),
+                    ).fetchone()
+                    if row is None:
+                        pending_deletes.append(point_id)
+                        if len(pending_deletes) >= self.batch_size:
+                            self._delete_points(
+                                self.target_collection,
+                                pending_deletes,
+                            )
+                            stats["deleted_count"] += len(pending_deletes)
+                            pending_deletes.clear()
+                if pending_deletes:
+                    self._delete_points(self.target_collection, pending_deletes)
+                    stats["deleted_count"] += len(pending_deletes)
+
+                self._reconcile_last_stats = stats
+                return source
+        finally:
+            try:
+                connection.close()
+            finally:
+                if self._manifest_path is not None:
+                    try:
+                        self._manifest_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    self._manifest_path = None
+
+    def reconcile(
+        self,
+        *,
+        confirm: bool,
+        plan: MigrationPlan,
+        barrier_held: bool = False,
+        allow_acl_fail_open: bool = False,
+        lock_held: bool = False,
+    ) -> dict[str, Any]:
+        """Converge an owned target to the rolling source snapshot."""
+
+        if not confirm:
+            raise MigrationError("reconcile requires explicit confirm=True / --confirm")
+        if not barrier_held and not lock_held:
+            raise MigrationError(
+                "reconcile requires external source lock acknowledgement via "
+                "lock_held=True / --lock-held"
+            )
+        if not isinstance(plan, MigrationPlan):
+            raise MigrationError("reconcile requires a reviewed migration plan")
+
+        marker: Mapping[str, Any] | None = None
+        try:
+            marker = self._load_current_marker()
+            if marker is None:
+                raise MigrationError("reconcile requires an owned target marker")
+            self._validate_marker_ownership(marker)
+            self._assert_prepare_plan_identity(plan)
+            layout = self._layout_from_plan(plan)
+            metadata = self._legacy_metadata()
+            self._validate_source_metadata_layout(metadata.schema, layout)
+            pinned_metadata_fingerprint = _metadata_fingerprint(metadata)
+            pinned_sparse_map_fingerprint = _sparse_map_fingerprint(self._sparse_map)
+            if pinned_metadata_fingerprint != plan.metadata_fingerprint:
+                raise MigrationError(
+                    "legacy metadata fingerprint differs from the reviewed plan"
+                )
+            if pinned_sparse_map_fingerprint != plan.sparse_map_fingerprint:
+                raise MigrationError(
+                    "authoritative sparse map fingerprint differs from the reviewed plan"
+                )
+            if marker.get("metadata_fingerprint") != pinned_metadata_fingerprint:
+                raise MigrationError("target marker metadata fingerprint is stale")
+            if marker.get("sparse_map_fingerprint") != pinned_sparse_map_fingerprint:
+                raise MigrationError("target marker sparse-map fingerprint is stale")
+            self._validate_metadata_layout(self.target_metadata_collection)
+            self._validate_existing_target(
+                target_info=self._collection_info(self.target_collection),
+                marker=marker,
+                layout=layout,
+                metadata=metadata,
+            )
+
+            state = marker.get("migration_state")
+            if barrier_held:
+                if state != "cutting_over" or marker.get("setup_complete") is not True:
+                    raise MigrationError(
+                        "barrier-held reconcile requires a cutting_over target"
+                    )
+            elif state not in {"building", "ready", "failed"}:
+                raise MigrationError(
+                    "reconcile may mutate only a building, ready, or failed target; "
+                    f"current state is {state!r}"
+                )
+            if not barrier_held:
+                marker = self._transition("building")
+
+            self._reconcile_allow_acl_fail_open = allow_acl_fail_open
+            previous: SourceSnapshot | None = None
+            final_source: SourceSnapshot | None = None
+            total_migrated = 0
+            total_skipped = 0
+            total_deleted = 0
+            rounds = 0
+            target_count = 0
+            for round_number in range(1, MAX_RECONCILIATION_ROUNDS + 1):
+                rounds = round_number
+                current_marker = self._load_current_marker()
+                if current_marker is None:
+                    raise MigrationError("target marker disappeared during reconcile")
+                self._validate_marker_ownership(current_marker)
+                expected_state = "cutting_over" if barrier_held else "building"
+                if (
+                    current_marker.get("migration_state") != expected_state
+                    or current_marker.get("setup_complete")
+                    is not _MIGRATION_STATE_SETUP[expected_state]
+                ):
+                    raise MigrationError(
+                        "target marker state changed during reconcile"
+                    )
+                before_metadata = self._legacy_metadata()
+                before_metadata_fingerprint = _metadata_fingerprint(before_metadata)
+                before_sparse_map_fingerprint = _sparse_map_fingerprint(self._sparse_map)
+                if before_metadata_fingerprint != pinned_metadata_fingerprint:
+                    raise MigrationError(
+                        "legacy metadata fingerprint changed before reconcile round"
+                    )
+                if before_sparse_map_fingerprint != pinned_sparse_map_fingerprint:
+                    raise MigrationError(
+                        "authoritative sparse map fingerprint changed before "
+                        "reconcile round"
+                    )
+
+                source = self._reconcile_round(
+                    layout=layout,
+                    schema=before_metadata.schema,
+                    metadata=before_metadata,
+                    state=expected_state,
+                )
+                round_stats = getattr(self, "_reconcile_last_stats", {})
+                total_migrated += int(round_stats.get("migrated_count", 0))
+                total_skipped += int(round_stats.get("skipped_count", 0))
+                total_deleted += int(round_stats.get("deleted_count", 0))
+
+                after_metadata = self._legacy_metadata()
+                after_metadata_fingerprint = _metadata_fingerprint(after_metadata)
+                after_sparse_map_fingerprint = _sparse_map_fingerprint(self._sparse_map)
+                if after_metadata_fingerprint != pinned_metadata_fingerprint:
+                    raise MigrationError(
+                        "legacy metadata fingerprint changed during reconcile"
+                    )
+                if after_sparse_map_fingerprint != pinned_sparse_map_fingerprint:
+                    raise MigrationError(
+                        "authoritative sparse map fingerprint changed during "
+                        "reconcile"
+                    )
+                target_count = self._count(self.target_collection)
+                if (
+                    previous is not None
+                    and source.source_count == previous.source_count
+                    and source.fingerprint == previous.fingerprint
+                    and source.acl_incomplete_count == previous.acl_incomplete_count
+                    and source.sparse_term_count == previous.sparse_term_count
+                    and source.sparse_term_fingerprint
+                    == previous.sparse_term_fingerprint
+                    and target_count == source.source_count
+                ):
+                    final_source = source
+                    break
+                previous = source
+
+            if final_source is None:
+                raise MigrationError(
+                    "source did not converge after "
+                    f"round {MAX_RECONCILIATION_ROUNDS}: "
+                    f"source_count={source.source_count} target_count={target_count}"
+                )
+
+            current_marker = self._load_current_marker()
+            if current_marker is None:
+                raise MigrationError("target marker disappeared before reconcile completion")
+            updated = dict(current_marker)
+            updated.update(
+                {
+                    "source_count": final_source.source_count,
+                    "source_fingerprint": final_source.fingerprint,
+                    "acl_incomplete_count": final_source.acl_incomplete_count,
+                    "sparse_term_count": final_source.sparse_term_count,
+                    "sparse_term_fingerprint": final_source.sparse_term_fingerprint,
+                    "target_count": target_count,
+                }
+            )
+            if barrier_held:
+                updated["migration_state"] = "cutting_over"
+                updated["setup_complete"] = True
+                self._write_marker(updated)
+                final_state = "cutting_over"
+            else:
+                updated["migration_state"] = "building"
+                updated["setup_complete"] = False
+                self._write_marker(updated)
+                final_state = self._transition("ready")["migration_state"]
+            return {
+                "source_count": final_source.source_count,
+                "target_count": target_count,
+                "migrated_count": total_migrated,
+                "skipped_count": total_skipped,
+                "deleted_count": total_deleted,
+                "rounds": rounds,
+                "target_collection": self.target_collection,
+                "migration_state": final_state,
+            }
+        except Exception:
+            if marker is not None and not barrier_held:
+                try:
+                    current = self._load_current_marker()
+                    if current is not None:
+                        self._validate_marker_ownership(current)
+                        if current.get("migration_state") in {
+                            "building",
+                            "ready",
+                            "failed",
+                        }:
+                            failed = dict(current)
+                            failed["migration_state"] = "failed"
+                            failed["setup_complete"] = False
+                            self._write_marker(failed)
+                except Exception:
+                    pass
+            raise
+        finally:
+            self._reconcile_allow_acl_fail_open = False
 
     def _scan_target_ids(self, manifest: _ScanManifest) -> int:
         scanned = 0
@@ -3426,6 +3804,20 @@ class QdrantMigration:
                     expected_value,
                     field_name=f"expected point vector {name!r}",
                 )
+                actual_normalized = [
+                    _canonical_float32(
+                        value,
+                        field_name=f"target point {point.get('id')!r} vector {name!r}",
+                    )
+                    for value in actual_normalized
+                ]
+                expected_normalized = [
+                    _canonical_float32(
+                        value,
+                        field_name=f"expected point vector {name!r}",
+                    )
+                    for value in expected_normalized
+                ]
                 if exact and actual_normalized != expected_normalized:
                     raise MigrationError(
                         f"target point {point.get('id')!r} vector {name!r} differs"
@@ -3483,8 +3875,25 @@ class QdrantMigration:
                         f"{missing_dictionary_indexes!r}"
                     )
             try:
-                actual_weight_values = [float(value) for value in actual_values]
-                expected_weight_values = [float(value) for value in expected_values]
+                actual_weight_values = [
+                    _canonical_float32(
+                        value,
+                        field_name=(
+                            f"target point {point.get('id')!r} "
+                            f"sparse vector {name!r}"
+                        ),
+                    )
+                    for value in actual_values
+                ]
+                expected_weight_values = [
+                    _canonical_float32(
+                        value,
+                        field_name=f"expected point sparse vector {name!r}",
+                    )
+                    for value in expected_values
+                ]
+            except MigrationError:
+                raise
             except (TypeError, ValueError) as exc:
                 raise MigrationError(
                     f"target point {point.get('id')!r} sparse vector {name!r} is malformed"

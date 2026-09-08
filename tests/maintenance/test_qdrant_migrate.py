@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import sqlite3
 from urllib.parse import unquote, urlsplit
 
 import pytest
@@ -130,6 +131,14 @@ class FakeQdrant:
                 if str(point_id) in points
             ]
             return {"result": result}
+
+        if suffix == ["points", "delete"] and method == "POST":
+            selector = (body or {}).get("points")
+            if not isinstance(selector, list):
+                raise AssertionError(body)
+            for point_id in selector:
+                points.pop(str(point_id), None)
+            return {"result": {"status": "completed"}}
 
         if suffix == ["points", "count"] and method == "POST":
             return {
@@ -1426,6 +1435,241 @@ def _prepare_backfill(
         lock_held=True,
     )
     return migration, plan
+
+
+def _prepare_reconcile(
+    qdrant: FakeQdrant,
+    *,
+    batch_size: int = 1,
+) -> tuple[QdrantMigration, object]:
+    migration, plan = _prepare_backfill(qdrant, batch_size=batch_size)
+    migration.backfill(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+    return migration, plan
+
+
+def test_reconcile_upserts_source_payload_and_vector_changes() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_reconcile(qdrant)
+    source = qdrant.collections["legacy__context"]["points"]["1"]
+    source["payload"]["name"] = "changed"
+    source["vector"]["vector"] = [0.0, 1.0]
+
+    result = migration.reconcile(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+
+    target = qdrant.collections["current__context"]["points"][
+        to_qdrant_point_id("1")
+    ]
+    assert target["payload"]["name"] == "changed"
+    assert target["vector"]["vector"] == [0.0, 1.0]
+    assert result["source_count"] == 2
+
+
+def test_reconcile_deletes_target_extras() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_reconcile(qdrant)
+    extra = _point(to_qdrant_point_id("extra"), "extra", uri="/resources/extra.md")
+    qdrant.collections["current__context"]["points"][extra["id"]] = extra
+
+    migration.reconcile(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+
+    assert extra["id"] not in qdrant.collections["current__context"]["points"]
+
+
+def test_reconcile_uses_sqlite_manifest_not_an_unbounded_id_set(monkeypatch) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_reconcile(qdrant)
+    opened: list[object] = []
+    original = migration._open_manifest
+
+    def open_manifest():
+        connection = original()
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(migration, "_open_manifest", open_manifest)
+    migration.reconcile(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+
+    assert opened
+    connection = opened[0]
+    with pytest.raises(sqlite3.ProgrammingError):
+        connection.execute("SELECT target_id FROM source_targets")
+
+
+def test_reconcile_rechecks_fingerprint_candidates_with_direct_payload_vector_compare(
+    monkeypatch,
+) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_reconcile(qdrant)
+    target = qdrant.collections["current__context"]["points"][
+        to_qdrant_point_id("1")
+    ]
+    target["payload"]["name"] = "stale"
+    monkeypatch.setattr(
+        "scripts.maintenance.qdrant_migrate._point_fingerprint",
+        lambda **_kwargs: "same",
+    )
+
+    migration.reconcile(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+
+    assert (
+        qdrant.collections["current__context"]["points"][
+            to_qdrant_point_id("1")
+        ]["payload"]["name"]
+        == "doc"
+    )
+
+
+def test_reconcile_compares_canonical_float32_vector_values() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    qdrant.collections["legacy__context"]["points"]["1"]["vector"]["vector"] = [
+        0.1,
+        0.2,
+    ]
+    migration, plan = _prepare_reconcile(qdrant)
+    target = qdrant.collections["current__context"]["points"][
+        to_qdrant_point_id("1")
+    ]
+    target["vector"]["vector"] = [0.10000000149011612, 0.20000000298023224]
+    result = migration.reconcile(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+
+    assert result["migrated_count"] == 0
+    assert target["vector"]["vector"] == [0.10000000149011612, 0.20000000298023224]
+
+
+def test_reconcile_fails_closed_on_metadata_or_sparse_map_drift(monkeypatch) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_reconcile(qdrant)
+    original = migration._upsert_target_batch
+
+    def mutate_map(points):
+        migration._sparse_map[7] = "changed"
+        return original(points)
+
+    monkeypatch.setattr(migration, "_upsert_target_batch", mutate_map)
+    with pytest.raises(MigrationError, match="sparse map"):
+        migration.reconcile(
+            confirm=True,
+            plan=plan,
+            allow_acl_fail_open=True,
+            lock_held=True,
+        )
+
+    marker = qdrant.collections["current__context__openviking_meta"]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    assert marker["migration_state"] == "failed"
+
+
+def test_reconcile_fails_after_three_non_converging_rounds(monkeypatch) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_reconcile(qdrant)
+    original = migration._scan_source
+    calls = 0
+
+    def changing_source(*, layout, schema, manifest=None, point_callback=None):
+        nonlocal calls
+        calls += 1
+        snapshot = original(
+            layout=layout,
+            schema=schema,
+            manifest=manifest,
+            point_callback=point_callback,
+        )
+        return snapshot.__class__(
+            source_count=snapshot.source_count,
+            fingerprint=f"{snapshot.fingerprint}-{calls}",
+            acl_incomplete_count=snapshot.acl_incomplete_count,
+            sparse_term_count=snapshot.sparse_term_count,
+            sparse_term_fingerprint=snapshot.sparse_term_fingerprint,
+        )
+
+    monkeypatch.setattr(migration, "_scan_source", changing_source)
+    with pytest.raises(MigrationError, match="round 3"):
+        migration.reconcile(
+            confirm=True,
+            plan=plan,
+            allow_acl_fail_open=True,
+            lock_held=True,
+        )
+
+
+def test_cutover_reconcile_preserves_cutting_over_and_setup_gate() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_reconcile(qdrant)
+    marker = qdrant.collections["current__context__openviking_meta"]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    marker["migration_state"] = "cutting_over"
+    marker["setup_complete"] = True
+
+    migration.reconcile(
+        confirm=True,
+        plan=plan,
+        barrier_held=True,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+
+    assert marker["migration_state"] == "cutting_over"
+    assert marker["setup_complete"] is True
+
+
+def test_interrupted_reconcile_rebuilds_and_deletes_manifest(monkeypatch) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_reconcile(qdrant)
+    paths = []
+    original_open = migration._open_manifest
+
+    def open_manifest():
+        connection = original_open()
+        paths.append(migration._manifest_path)
+        return connection
+
+    monkeypatch.setattr(migration, "_open_manifest", open_manifest)
+    monkeypatch.setattr(
+        migration,
+        "_upsert_target_batch",
+        lambda _points: (_ for _ in ()).throw(RuntimeError("stop")),
+    )
+    with pytest.raises(RuntimeError, match="stop"):
+        migration.reconcile(
+            confirm=True,
+            plan=plan,
+            allow_acl_fail_open=True,
+            lock_held=True,
+        )
+    assert paths
+    assert not paths[0].exists()
 
 
 def test_backfill_persists_integer_cursor_after_each_batch() -> None:
