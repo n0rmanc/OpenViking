@@ -4223,12 +4223,12 @@ class QdrantMigration:
                 metadata.indexes,
             )
         )
+        self._validate_payload_indexes(metadata.schema, metadata.indexes)
         self._wait_collection_ready(
             self.target_collection,
             payload_fields=expected_payload_fields,
         )
         self._wait_collection_ready(self.target_metadata_collection)
-        self._validate_payload_indexes(metadata.schema, metadata.indexes)
         self._assert_sparse_dictionary_complete(self._sparse_map.values())
 
         marker_source = SourceSnapshot(
