@@ -67,9 +67,7 @@ class QdrantCollectionAdapter(CollectionAdapter):
             self._data_collection_name_override is not None
             or self._metadata_collection_name_override is not None
         )
-        self._logical_collection = logical_collection or (
-            f"{self._project_name}/{collection_name}"
-        )
+        self._logical_collection = logical_collection or (f"{self._project_name}/{collection_name}")
         self._distance_metric = distance_metric
         self._dimension = int(dimension)
         self._sparse_weight = float(sparse_weight)
@@ -95,11 +93,7 @@ class QdrantCollectionAdapter(CollectionAdapter):
     def from_config(cls, config: Any) -> "QdrantCollectionAdapter":
         qdrant_cfg = getattr(config, "qdrant", None)
         custom = dict(getattr(config, "custom_params", {}) or {})
-        url = (
-            getattr(qdrant_cfg, "url", None)
-            or getattr(config, "url", None)
-            or custom.get("url")
-        )
+        url = getattr(qdrant_cfg, "url", None) or getattr(config, "url", None) or custom.get("url")
         if not url:
             raise ValueError("Qdrant backend requires qdrant.url or vectordb.url")
         project_name = str(config.project_name or "default")
@@ -168,9 +162,7 @@ class QdrantCollectionAdapter(CollectionAdapter):
             sparse_enabled=self._sparse_weight > 0.0,
             sparse_weight=self._sparse_weight,
             logical_collection=(
-                self._logical_collection
-                if self._explicit_physical_names
-                else logical_collection
+                self._logical_collection if self._explicit_physical_names else logical_collection
             ),
         )
 

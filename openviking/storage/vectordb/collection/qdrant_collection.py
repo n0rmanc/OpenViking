@@ -115,7 +115,13 @@ class QdrantCollection(ICollection):
     @staticmethod
     def _normalize_distance(distance: str) -> str:
         value = str(distance or "cosine").strip().lower()
-        mapping = {"cosine": "Cosine", "ip": "Dot", "dot": "Dot", "l2": "Euclid", "euclid": "Euclid"}
+        mapping = {
+            "cosine": "Cosine",
+            "ip": "Dot",
+            "dot": "Dot",
+            "l2": "Euclid",
+            "euclid": "Euclid",
+        }
         if value not in mapping:
             raise ValueError(f"Unsupported Qdrant distance metric: {distance!r}")
         return mapping[value]
@@ -266,9 +272,7 @@ class QdrantCollection(ICollection):
         except QdrantError as exc:
             if exc.status != 409:
                 raise
-            raise RuntimeError(
-                f"Qdrant collection {name!r} appeared during creation"
-            ) from exc
+            raise RuntimeError(f"Qdrant collection {name!r} appeared during creation") from exc
 
     def create_remote_collection(self, metadata: dict[str, Any]) -> None:
         self._schema = dict(metadata)
@@ -339,9 +343,7 @@ class QdrantCollection(ICollection):
                 )
             self._validate_marker_binding(marker)
             self._migration_marker_fields = {
-                name: value
-                for name, value in marker.items()
-                if name not in _ADAPTER_MARKER_FIELDS
+                name: value for name, value in marker.items() if name not in _ADAPTER_MARKER_FIELDS
             }
         self._upsert_points(
             self._metadata_collection_name,
@@ -373,9 +375,7 @@ class QdrantCollection(ICollection):
             self._migration_marker_fields = {}
             return None
         self._migration_marker_fields = {
-            name: value
-            for name, value in payload.items()
-            if name not in _ADAPTER_MARKER_FIELDS
+            name: value for name, value in payload.items() if name not in _ADAPTER_MARKER_FIELDS
         }
         return payload
 
@@ -418,9 +418,7 @@ class QdrantCollection(ICollection):
                 f"Qdrant collection {self._collection_name!r} has an incomplete migration"
             )
         if marker.get("migration_state") == "rolled_back":
-            raise RuntimeError(
-                f"Qdrant collection {self._collection_name!r} has been rolled back"
-            )
+            raise RuntimeError(f"Qdrant collection {self._collection_name!r} has been rolled back")
         if marker.get("collection_name") != self._collection_name:
             raise RuntimeError(
                 f"Qdrant metadata collection does not belong to {self._collection_name!r}"
@@ -429,13 +427,10 @@ class QdrantCollection(ICollection):
             "metadata_collection_name" in marker
             and marker["metadata_collection_name"] != self._metadata_collection_name
         ):
-            raise RuntimeError(
-                "Qdrant metadata marker is bound to a different metadata collection"
-            )
+            raise RuntimeError("Qdrant metadata marker is bound to a different metadata collection")
         logical_collection = marker.get("logical_collection")
         if migration_marker and (
-            self._logical_collection is None
-            or logical_collection != self._logical_collection
+            self._logical_collection is None or logical_collection != self._logical_collection
         ):
             raise RuntimeError(
                 "Qdrant migration marker is missing or bound to a different logical collection"
@@ -445,9 +440,7 @@ class QdrantCollection(ICollection):
             and self._logical_collection is not None
             and logical_collection != self._logical_collection
         ):
-            raise RuntimeError(
-                "Qdrant metadata marker is bound to a different logical collection"
-            )
+            raise RuntimeError("Qdrant metadata marker is bound to a different logical collection")
         schema = marker.get("schema")
         if not isinstance(schema, dict):
             raise RuntimeError(
@@ -469,9 +462,7 @@ class QdrantCollection(ICollection):
         ):
             raise RuntimeError("Qdrant metadata marker has an invalid vector_dimension")
         if marker_vector_dimension is not None and marker_vector_dimension != marker_vector_dim:
-            raise RuntimeError(
-                "Qdrant metadata marker vector_dimension does not match vector_dim"
-            )
+            raise RuntimeError("Qdrant metadata marker vector_dimension does not match vector_dim")
         if not migration_marker:
             return
         if marker_vector_dim is not None and self._vector_dim > 0:
@@ -481,7 +472,10 @@ class QdrantCollection(ICollection):
                 )
         if "dense_vector_name" in marker and marker["dense_vector_name"] != self._dense_vector_name:
             raise RuntimeError("Qdrant migration marker dense vector name differs")
-        if "sparse_vector_name" in marker and marker["sparse_vector_name"] != self._sparse_vector_name:
+        if (
+            "sparse_vector_name" in marker
+            and marker["sparse_vector_name"] != self._sparse_vector_name
+        ):
             raise RuntimeError("Qdrant migration marker sparse vector name differs")
         if "distance" in marker:
             try:
@@ -514,12 +508,8 @@ class QdrantCollection(ICollection):
         self._validate_marker_binding(marker)
         self._schema = dict(marker["schema"])
         self._vector_dim = int(marker.get("vector_dim") or self._vector_dim)
-        self._dense_vector_name = str(
-            marker.get("dense_vector_name") or self._dense_vector_name
-        )
-        self._sparse_vector_name = str(
-            marker.get("sparse_vector_name") or self._sparse_vector_name
-        )
+        self._dense_vector_name = str(marker.get("dense_vector_name") or self._dense_vector_name)
+        self._sparse_vector_name = str(marker.get("sparse_vector_name") or self._sparse_vector_name)
         self._distance = str(marker.get("distance") or self._distance)
         self._sparse_enabled = bool(marker.get("sparse_enabled", self._sparse_enabled))
         if "sparse_weight" in marker:
@@ -599,9 +589,7 @@ class QdrantCollection(ICollection):
         for field in dict.fromkeys(scalar_fields):
             body = {
                 "field_name": field,
-                "field_schema": (
-                    "integer" if field == "uri_depth" else self._field_schema(field)
-                ),
+                "field_schema": ("integer" if field == "uri_depth" else self._field_schema(field)),
             }
             try:
                 response = self._client.request(
@@ -831,7 +819,9 @@ class QdrantCollection(ICollection):
         del ttl
         if not data_list:
             return {"status": "ok"}
-        self._upsert_points(self._collection_name, [self._point_from_record(item) for item in data_list])
+        self._upsert_points(
+            self._collection_name, [self._point_from_record(item) for item in data_list]
+        )
         return {"status": "ok"}
 
     def _payload_to_record(self, point: dict[str, Any]) -> dict[str, Any]:
@@ -1137,7 +1127,9 @@ class QdrantCollection(ICollection):
         filters: dict[str, Any] | None = None,
         output_fields: list[str] | None = None,
     ) -> SearchResult:
-        points = self._retrieve_points(self._collection_name, [to_qdrant_point_id(id)], with_vectors=True)
+        points = self._retrieve_points(
+            self._collection_name, [to_qdrant_point_id(id)], with_vectors=True
+        )
         if not points:
             return SearchResult()
         record = self._vectors_to_record(points[0])
@@ -1255,8 +1247,7 @@ class QdrantCollection(ICollection):
         }
         if len(terms) > 1:
             raise ValueError(
-                "sparse term index collision: "
-                f"index={index} existing_terms={sorted(terms)!r}"
+                f"sparse term index collision: index={index} existing_terms={sorted(terms)!r}"
             )
         return next(iter(terms), None)
 

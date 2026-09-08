@@ -278,8 +278,7 @@ class _ScanManifest:
             ).fetchone()
             previous = existing[0] if existing else "<unknown>"
             raise MigrationError(
-                "physical target point-id collision between "
-                f"{previous!r} and {logical_id!r}"
+                f"physical target point-id collision between {previous!r} and {logical_id!r}"
             ) from exc
         self._connection.executemany(
             "INSERT OR IGNORE INTO sparse_terms(term) VALUES (?)",
@@ -292,9 +291,7 @@ class _ScanManifest:
             field_name="target physical point id",
         )
         if original_id is None or str(original_id) == "":
-            raise MigrationError(
-                f"target point {point_id!r} is missing {_ORIGINAL_ID_FIELD}"
-            )
+            raise MigrationError(f"target point {point_id!r} is missing {_ORIGINAL_ID_FIELD}")
         logical_id = str(original_id)
         try:
             self._connection.execute(
@@ -362,9 +359,7 @@ class _ScanManifest:
             (fingerprint, target_id),
         )
         if updated.rowcount != 1:
-            raise MigrationError(
-                f"target point {target_id!r} was not present in the scan manifest"
-            )
+            raise MigrationError(f"target point {target_id!r} was not present in the scan manifest")
 
     def first_extra_target(self) -> str | None:
         row = self._connection.execute(
@@ -380,9 +375,7 @@ class _ScanManifest:
         return row[0] if row is not None else None
 
     def iter_sparse_terms(self) -> Iterable[str]:
-        rows = self._connection.execute(
-            "SELECT term FROM sparse_terms ORDER BY term"
-        )
+        rows = self._connection.execute("SELECT term FROM sparse_terms ORDER BY term")
         for (term,) in rows:
             yield str(term)
 
@@ -400,9 +393,7 @@ class _ScanManifest:
             ORDER BY content_fingerprint
             """
         )
-        return _fingerprint_values(
-            str(fingerprint) for (fingerprint,) in rows
-        )
+        return _fingerprint_values(str(fingerprint) for (fingerprint,) in rows)
 
     def target_content_fingerprint(self) -> str:
         rows = self._connection.execute(
@@ -414,13 +405,9 @@ class _ScanManifest:
             """
         )
         fingerprints = [str(fingerprint) for (fingerprint,) in rows]
-        expected = self._connection.execute(
-            "SELECT COUNT(*) FROM target_points"
-        ).fetchone()
+        expected = self._connection.execute("SELECT COUNT(*) FROM target_points").fetchone()
         if expected is None or len(fingerprints) != int(expected[0]):
-            raise MigrationError(
-                "target content fingerprint is incomplete"
-            )
+            raise MigrationError("target content fingerprint is incomplete")
         return _fingerprint_values(fingerprints)
 
     def sparse_term_count(self) -> int:
@@ -428,9 +415,7 @@ class _ScanManifest:
         return int(row[0]) if row is not None else 0
 
     def sparse_term_fingerprint(self) -> str:
-        rows = self._connection.execute(
-            "SELECT term FROM sparse_terms ORDER BY term"
-        )
+        rows = self._connection.execute("SELECT term FROM sparse_terms ORDER BY term")
         return _fingerprint_values(str(term) for (term,) in rows)
 
 
@@ -525,9 +510,7 @@ class _ScrollOffsets:
         )
         os.close(descriptor)
         self._connection = sqlite3.connect(self._path)
-        self._connection.execute(
-            "CREATE TABLE offsets (offset_key TEXT PRIMARY KEY)"
-        )
+        self._connection.execute("CREATE TABLE offsets (offset_key TEXT PRIMARY KEY)")
 
     def __enter__(self) -> "_ScrollOffsets":
         return self
@@ -704,9 +687,7 @@ def _point_fingerprint(
             allow_nan=False,
         ).encode("utf-8")
     except (TypeError, ValueError) as exc:
-        raise MigrationError(
-            f"source point {source_point_id!r} is not JSON-serializable"
-        ) from exc
+        raise MigrationError(f"source point {source_point_id!r} is not JSON-serializable") from exc
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -724,20 +705,17 @@ def _fingerprint_values(values: Iterable[str]) -> str:
 def _canonical_uuid_string(value: Any, *, field_name: str) -> str:
     if not isinstance(value, str):
         raise MigrationError(
-            f"{field_name} must be a canonical UUID string; "
-            "deterministic target IDs are required"
+            f"{field_name} must be a canonical UUID string; deterministic target IDs are required"
         )
     try:
         canonical = str(uuid.UUID(value))
     except (AttributeError, TypeError, ValueError) as exc:
         raise MigrationError(
-            f"{field_name} must be a canonical UUID string; "
-            "deterministic target IDs are required"
+            f"{field_name} must be a canonical UUID string; deterministic target IDs are required"
         ) from exc
     if canonical != value:
         raise MigrationError(
-            f"{field_name} must be a canonical UUID string; "
-            "deterministic target IDs are required"
+            f"{field_name} must be a canonical UUID string; deterministic target IDs are required"
         )
     return value
 
@@ -806,9 +784,7 @@ def _canonical_point_content_fingerprint(point: Mapping[str, Any]) -> str:
             allow_nan=False,
         ).encode("utf-8")
     except (TypeError, ValueError) as exc:
-        raise MigrationError(
-            f"point {point_id!r} content is not JSON-serializable"
-        ) from exc
+        raise MigrationError(f"point {point_id!r} content is not JSON-serializable") from exc
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -841,11 +817,7 @@ def _sparse_map_fingerprint(sparse_map: Mapping[int, str]) -> str:
 
 
 def _legacy_qdrant_point_id(value: Any) -> Any:
-    if (
-        isinstance(value, int)
-        and not isinstance(value, bool)
-        and 0 <= value <= _LEGACY_UINT64_MAX
-    ):
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _LEGACY_UINT64_MAX:
         return value
     value_string = str(value)
     try:
@@ -903,9 +875,7 @@ def _normalize_owner_user_id(
     point_id: Any,
     source_keys: set[str],
 ) -> None:
-    expected_owner = owner_fields_for_uri(
-        f"viking://{uri.lstrip('/')}"
-    ).get("owner_user_id")
+    expected_owner = owner_fields_for_uri(f"viking://{uri.lstrip('/')}").get("owner_user_id")
     actual_owner = payload.get("owner_user_id")
     if actual_owner is None:
         if expected_owner is None:
@@ -917,9 +887,7 @@ def _normalize_owner_user_id(
     if not isinstance(actual_owner, str) or not actual_owner.strip():
         raise MigrationError(f"point {point_id!r} has an invalid owner_user_id")
     if expected_owner is not None and actual_owner != expected_owner:
-        raise MigrationError(
-            f"point {point_id!r} owner_user_id does not match uri {uri!r}"
-        )
+        raise MigrationError(f"point {point_id!r} owner_user_id does not match uri {uri!r}")
 
 
 def _assert_security_payload(
@@ -932,13 +900,10 @@ def _assert_security_payload(
         expected_present = field_name in expected_payload
         actual_present = field_name in payload
         if expected_present != actual_present or (
-            expected_present
-            and not _typed_equal(payload[field_name], expected_payload[field_name])
+            expected_present and not _typed_equal(payload[field_name], expected_payload[field_name])
         ):
             label = "ACL field" if field_name in _ACL_FIELDS else "security field"
-            raise MigrationError(
-                f"target point {point_id!r} {label} {field_name!r} differs"
-            )
+            raise MigrationError(f"target point {point_id!r} {label} {field_name!r} differs")
 
 
 def _sparse_index(
@@ -992,9 +957,7 @@ def _validate_cursor(
         raise MigrationError(f"{field_name} must be an unsigned integer or UUID string")
     if isinstance(value, int):
         if value < 0 or value > _LEGACY_UINT64_MAX:
-            raise MigrationError(
-                f"{field_name} must be between 0 and {_LEGACY_UINT64_MAX}"
-            )
+            raise MigrationError(f"{field_name} must be between 0 and {_LEGACY_UINT64_MAX}")
         return value
     if isinstance(value, str):
         if not value or not value.strip():
@@ -1040,9 +1003,7 @@ def _legacy_sparse_map(value: Mapping[Any, Any] | None) -> dict[int, str]:
             )
         previous_index = terms_to_indexes.get(term)
         if previous_index is not None and previous_index != old_index:
-            raise SparseMigrationError(
-                f"sparse map maps term {term!r} to multiple old indexes"
-            )
+            raise SparseMigrationError(f"sparse map maps term {term!r} to multiple old indexes")
         normalized[old_index] = term
         terms_to_indexes[term] = old_index
     return normalized
@@ -1123,9 +1084,7 @@ def _validate_schema_subset(
             )
         for key in ("Dim", "IsPrimaryKey"):
             if key in source_field and target_field.get(key) != source_field[key]:
-                raise MigrationError(
-                    f"target current marker schema changed field {name!r} {key}"
-                )
+                raise MigrationError(f"target current marker schema changed field {name!r} {key}")
 
     source_scalar = source.get("ScalarIndex")
     target_scalar = target.get("ScalarIndex")
@@ -1135,8 +1094,7 @@ def _validate_schema_subset(
         missing = set(map(str, source_scalar)) - set(map(str, target_scalar))
         if missing:
             raise MigrationError(
-                "target current marker schema is missing scalar indexes: "
-                f"{sorted(missing)!r}"
+                f"target current marker schema is missing scalar indexes: {sorted(missing)!r}"
             )
 
 
@@ -1161,15 +1119,11 @@ class DeploymentHooks:
                 not isinstance(command, list)
                 or not command
                 or any(
-                    not isinstance(argument, str)
-                    or not argument.strip()
-                    or "\x00" in argument
+                    not isinstance(argument, str) or not argument.strip() or "\x00" in argument
                     for argument in command
                 )
             ):
-                raise MigrationError(
-                    f"deployment hook {name!r} must be a non-empty argv list"
-                )
+                raise MigrationError(f"deployment hook {name!r} must be a non-empty argv list")
             self._commands[name] = list(command)
 
     @classmethod
@@ -1246,8 +1200,7 @@ class DeploymentHooks:
         value = self._run("current_target_has_accepted_writes", migration).strip()
         if value not in {"true", "false"}:
             raise MigrationError(
-                "deployment hook 'current_target_has_accepted_writes' must print "
-                "only true or false"
+                "deployment hook 'current_target_has_accepted_writes' must print only true or false"
             )
         return value == "true"
 
@@ -1284,9 +1237,7 @@ class QdrantMigration:
             rel_tol=0.0,
             abs_tol=1e-9,
         ):
-            raise ValueError(
-                "Qdrant client timeout_seconds must match migration timeout_seconds"
-            )
+            raise ValueError("Qdrant client timeout_seconds must match migration timeout_seconds")
         self.source_collection = self._name(source_collection, "source collection")
         self.target_collection = self._name(target_collection, "target collection")
         if self.source_collection == self.target_collection:
@@ -1329,8 +1280,7 @@ class QdrantMigration:
         self.migration_id = self._name(migration_id, "migration ID")
         if migrator_version != MIGRATOR_VERSION:
             raise ValueError(
-                f"migrator_version must be {MIGRATOR_VERSION!r}; "
-                f"got {migrator_version!r}"
+                f"migrator_version must be {MIGRATOR_VERSION!r}; got {migrator_version!r}"
             )
         self.migrator_version = MIGRATOR_VERSION
 
@@ -1358,18 +1308,10 @@ class QdrantMigration:
     ) -> dict[str, Any]:
         method = method.upper()
         request_params = dict(params or {})
-        segments = [
-            segment
-            for segment in urlsplit(path).path.rstrip("/").split("/")
-            if segment
-        ]
-        is_collection_endpoint = (
-            len(segments) == 2 and segments[0] == "collections"
-        )
+        segments = [segment for segment in urlsplit(path).path.rstrip("/").split("/") if segment]
+        is_collection_endpoint = len(segments) == 2 and segments[0] == "collections"
         is_point_upsert_endpoint = (
-            len(segments) == 3
-            and segments[0] == "collections"
-            and segments[2] == "points"
+            len(segments) == 3 and segments[0] == "collections" and segments[2] == "points"
         )
         is_point_delete_endpoint = (
             len(segments) == 4
@@ -1377,16 +1319,13 @@ class QdrantMigration:
             and segments[2:4] == ["points", "delete"]
         )
         is_index_endpoint = (
-            len(segments) in {3, 4}
-            and segments[0] == "collections"
-            and segments[2] == "index"
+            len(segments) in {3, 4} and segments[0] == "collections" and segments[2] == "index"
         )
         requires_completed = False
         requires_true_result = False
         if mutation:
-            if (
-                (method == "PUT" and is_point_upsert_endpoint)
-                or (method == "POST" and is_point_delete_endpoint)
+            if (method == "PUT" and is_point_upsert_endpoint) or (
+                method == "POST" and is_point_delete_endpoint
             ):
                 request_params.update({"wait": "true", "ordering": "strong"})
                 requires_completed = True
@@ -1443,7 +1382,15 @@ class QdrantMigration:
         if isinstance(value, (list, tuple, set)):
             return bool(value)
         if isinstance(value, str):
-            return value.strip().lower() not in {"", "0", "false", "none", "ok", "complete", "completed"}
+            return value.strip().lower() not in {
+                "",
+                "0",
+                "false",
+                "none",
+                "ok",
+                "complete",
+                "completed",
+            }
         return True
 
     def _wait_collection_ready(
@@ -1458,14 +1405,14 @@ class QdrantMigration:
             status = info.get("status")
             optimizer_status = info.get("optimizer_status")
             if not isinstance(status, str) or not isinstance(optimizer_status, (str, Mapping)):
-                raise MigrationError(f"Qdrant collection readiness response is malformed for {collection}")
+                raise MigrationError(
+                    f"Qdrant collection readiness response is malformed for {collection}"
+                )
             normalized_status = status.strip().lower()
             if normalized_status in {"red", "error", "failed"}:
                 raise MigrationError(f"Qdrant collection {collection} is not ready: {status}")
             if isinstance(optimizer_status, Mapping):
-                raise MigrationError(
-                    f"Qdrant collection {collection} optimizer reported an error"
-                )
+                raise MigrationError(f"Qdrant collection {collection} optimizer reported an error")
             normalized_optimizer = optimizer_status.strip().lower()
             if normalized_optimizer in {"red", "error", "failed"}:
                 raise MigrationError(
@@ -1478,8 +1425,7 @@ class QdrantMigration:
             )
             payload_schema = info.get("payload_schema")
             indexes_visible = payload_fields is None or (
-                isinstance(payload_schema, Mapping)
-                and payload_fields <= set(payload_schema)
+                isinstance(payload_schema, Mapping) and payload_fields <= set(payload_schema)
             )
             if (
                 normalized_status == "green"
@@ -1491,16 +1437,11 @@ class QdrantMigration:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 if payload_fields is not None:
-                    visible = (
-                        set(payload_schema)
-                        if isinstance(payload_schema, Mapping)
-                        else set()
-                    )
+                    visible = set(payload_schema) if isinstance(payload_schema, Mapping) else set()
                     missing = sorted(payload_fields - visible)
                     if missing:
                         raise MigrationError(
-                            "target collection is missing payload index: "
-                            f"{missing!r}"
+                            f"target collection is missing payload index: {missing!r}"
                         )
                 raise MigrationError(f"Qdrant collection {collection} did not become ready")
             time.sleep(min(0.1, remaining))
@@ -1555,8 +1496,7 @@ class QdrantMigration:
         if "size" in vectors:
             if dense_override:
                 raise MigrationError(
-                    "cannot rename an unnamed source dense vector; "
-                    "remove --dense-vector-name"
+                    "cannot rename an unnamed source dense vector; remove --dense-vector-name"
                 )
             dense_name = dense_override or "vector"
             dense_config = vectors
@@ -1694,9 +1634,7 @@ class QdrantMigration:
                 if next_offset is None:
                     return
                 if not offsets.add(next_offset):
-                    raise MigrationError(
-                        f"Qdrant scroll repeated its page offset for {collection}"
-                    )
+                    raise MigrationError(f"Qdrant scroll repeated its page offset for {collection}")
                 offset = next_offset
 
     def _scroll_page(
@@ -1739,9 +1677,7 @@ class QdrantMigration:
             field_name="Qdrant next_page_offset",
         )
         if next_offset is not None and _cursor_key(next_offset) == _cursor_key(offset):
-            raise MigrationError(
-                f"Qdrant scroll repeated its page offset for {collection}"
-            )
+            raise MigrationError(f"Qdrant scroll repeated its page offset for {collection}")
         if not page and next_offset is not None:
             raise MigrationError(
                 f"Qdrant scroll returned an empty page with a next offset for {collection}"
@@ -1829,8 +1765,7 @@ class QdrantMigration:
                 index_docs.append(dict(payload))
             else:
                 raise MigrationError(
-                    "legacy metadata has an unknown kind for "
-                    f"{self.source_collection!r}: {kind!r}"
+                    f"legacy metadata has an unknown kind for {self.source_collection!r}: {kind!r}"
                 )
         if metadata_scanned != metadata_count:
             raise MigrationError(
@@ -1862,9 +1797,7 @@ class QdrantMigration:
             if isinstance(meta.get("VectorIndex"), (list, tuple, set)) or (
                 "VectorIndex" in meta and not isinstance(meta.get("VectorIndex"), Mapping)
             ):
-                raise MigrationError(
-                    f"legacy index metadata VectorIndex is malformed for {name!r}"
-                )
+                raise MigrationError(f"legacy index metadata VectorIndex is malformed for {name!r}")
             if name in indexes:
                 raise MigrationError(f"duplicate legacy index metadata: {name}")
             indexes[name] = dict(meta)
@@ -1953,9 +1886,7 @@ class QdrantMigration:
                 f"point {point.get('id')!r} sparse indices/values are not parallel lists"
             )
         if not indices:
-            raise SparseMigrationError(
-                f"point {point.get('id')!r} sparse vector has no entries"
-            )
+            raise SparseMigrationError(f"point {point.get('id')!r} sparse vector has no entries")
         return dense, {"indices": list(indices), "values": list(values)}
 
     def _transform_point(
@@ -2001,9 +1932,7 @@ class QdrantMigration:
             level = payload.get("level")
             if isinstance(level, bool) or not isinstance(level, (int, float)):
                 raise MigrationError(f"point {point.get('id')!r} has no valid level")
-            if isinstance(level, float) and (
-                not math.isfinite(level) or not level.is_integer()
-            ):
+            if isinstance(level, float) and (not math.isfinite(level) or not level.is_integer()):
                 raise MigrationError(f"point {point.get('id')!r} has no valid level")
             level_int = int(level)
             if level_int not in (0, 1, 2):
@@ -2019,9 +1948,7 @@ class QdrantMigration:
             if identity_field in payload or identity_field in field_names:
                 value = payload.get(identity_field)
                 if not isinstance(value, str) or not value.strip():
-                    raise MigrationError(
-                        f"point {point.get('id')!r} is missing {identity_field}"
-                    )
+                    raise MigrationError(f"point {point.get('id')!r} is missing {identity_field}")
 
         covered = source_keys | _INTERNAL_PAYLOAD_FIELDS
         if not covered.issubset(payload):
@@ -2213,9 +2140,7 @@ class QdrantMigration:
             raise MigrationError(f"invalid migration state: {migration_state!r}")
         expected_setup = _MIGRATION_STATE_SETUP[migration_state]
         if setup_complete is not expected_setup:
-            raise MigrationError(
-                "migration_state and setup_complete disagree"
-            )
+            raise MigrationError("migration_state and setup_complete disagree")
         return {
             "_openviking_meta_version": _META_VERSION,
             "collection_name": self.target_collection,
@@ -2266,9 +2191,10 @@ class QdrantMigration:
                 values.append(value)
                 continue
             vector_index = meta.get("VectorIndex")
-            if isinstance(vector_index, Mapping) and vector_index.get(
-                "SearchWithSparseLogitAlpha"
-            ) is not None:
+            if (
+                isinstance(vector_index, Mapping)
+                and vector_index.get("SearchWithSparseLogitAlpha") is not None
+            ):
                 try:
                     value = float(vector_index["SearchWithSparseLogitAlpha"])
                 except (TypeError, ValueError) as exc:
@@ -2324,9 +2250,7 @@ class QdrantMigration:
                 )
         state = marker.get("migration_state")
         if not isinstance(state, str) or state not in MIGRATION_STATES:
-            raise MigrationError(
-                f"target current marker has an invalid migration state: {state!r}"
-            )
+            raise MigrationError(f"target current marker has an invalid migration state: {state!r}")
         setup_complete = marker.get("setup_complete")
         if setup_complete is not _MIGRATION_STATE_SETUP[state]:
             raise MigrationError(
@@ -2343,9 +2267,7 @@ class QdrantMigration:
             or vector_dimension <= 0
             or vector_dim != vector_dimension
         ):
-            raise MigrationError(
-                "target current marker has inconsistent vector dimensions"
-            )
+            raise MigrationError("target current marker has inconsistent vector dimensions")
 
     def _transition(
         self,
@@ -2362,14 +2284,10 @@ class QdrantMigration:
         if setup_complete is None:
             setup_complete = expected_setup
         if setup_complete is not expected_setup:
-            raise MigrationError(
-                "migration_state and setup_complete disagree"
-            )
+            raise MigrationError("migration_state and setup_complete disagree")
         marker = self._load_current_marker()
         if marker is None:
-            raise MigrationError(
-                "target metadata collection has no migration marker"
-            )
+            raise MigrationError("target metadata collection has no migration marker")
         self._validate_marker_ownership(marker)
         previous_state = marker["migration_state"]
         allowed_previous = {
@@ -2388,8 +2306,7 @@ class QdrantMigration:
                 and allow_active_rollback
             ):
                 raise MigrationError(
-                    f"cannot transition migration state from {previous_state!r} "
-                    f"to {target_state!r}"
+                    f"cannot transition migration state from {previous_state!r} to {target_state!r}"
                 )
         updated = dict(marker)
         updated["migration_state"] = target_state
@@ -2467,8 +2384,7 @@ class QdrantMigration:
         missing_fields = sorted(field for field in required_fields if field not in marker)
         if missing_fields:
             raise MigrationError(
-                "target current marker is missing required fields: "
-                f"{missing_fields!r}"
+                f"target current marker is missing required fields: {missing_fields!r}"
             )
         if marker.get("_openviking_meta_version") != _META_VERSION:
             raise MigrationError(
@@ -2516,13 +2432,9 @@ class QdrantMigration:
         for field_name in ("source_count", "target_count", "sparse_term_count"):
             value = marker.get(field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise MigrationError(
-                    f"target current marker has an invalid {field_name}"
-                )
+                raise MigrationError(f"target current marker has an invalid {field_name}")
         if not isinstance(marker.get("backfill_complete"), bool):
-            raise MigrationError(
-                "target current marker has an invalid backfill_complete flag"
-            )
+            raise MigrationError("target current marker has an invalid backfill_complete flag")
         cursor = marker.get("last_source_cursor")
         try:
             _validate_cursor(
@@ -2530,25 +2442,20 @@ class QdrantMigration:
                 field_name="target current marker last_source_cursor",
             )
         except MigrationError as exc:
-            raise MigrationError(
-                "target current marker has an invalid last_source_cursor"
-            ) from exc
+            raise MigrationError("target current marker has an invalid last_source_cursor") from exc
         if marker["backfill_complete"] and cursor is not None:
-            raise MigrationError(
-                "target current marker has an inconsistent completion cursor"
-            )
-        if not isinstance(marker.get("source_fingerprint"), str) or not marker["source_fingerprint"]:
-            raise MigrationError(
-                "target current marker has no valid source fingerprint"
-            )
+            raise MigrationError("target current marker has an inconsistent completion cursor")
+        if (
+            not isinstance(marker.get("source_fingerprint"), str)
+            or not marker["source_fingerprint"]
+        ):
+            raise MigrationError("target current marker has no valid source fingerprint")
         for field_name in (
             "transformed_source_fingerprint",
             "target_content_fingerprint",
         ):
             if not isinstance(marker.get(field_name), str):
-                raise MigrationError(
-                    f"target current marker has an invalid {field_name}"
-                )
+                raise MigrationError(f"target current marker has an invalid {field_name}")
         if (
             not isinstance(marker.get("metadata_fingerprint"), str)
             or not marker["metadata_fingerprint"]
@@ -2563,9 +2470,7 @@ class QdrantMigration:
             not isinstance(marker.get("sparse_term_fingerprint"), str)
             or not marker["sparse_term_fingerprint"]
         ):
-            raise MigrationError(
-                "target current marker has no valid sparse-term fingerprint"
-            )
+            raise MigrationError("target current marker has no valid sparse-term fingerprint")
         if not isinstance(marker.get("setup_complete"), bool):
             raise MigrationError("target current marker has an invalid setup_complete flag")
         acl_incomplete_count = marker.get("acl_incomplete_count")
@@ -2603,14 +2508,14 @@ class QdrantMigration:
         ):
             raise MigrationError("target current marker has an invalid vector layout")
         if vector_dimension != vector_dim:
-            raise MigrationError(
-                "target current marker has inconsistent vector dimensions"
-            )
+            raise MigrationError("target current marker has inconsistent vector dimensions")
         try:
             marker_distance = _canonical_distance(marker["distance"])
             marker_sparse_weight = float(marker["sparse_weight"])
         except (TypeError, ValueError) as exc:
-            raise MigrationError("target current marker has invalid distance or sparse weight") from exc
+            raise MigrationError(
+                "target current marker has invalid distance or sparse weight"
+            ) from exc
         if (
             marker_distance != layout.distance
             or not math.isfinite(marker_sparse_weight)
@@ -2659,9 +2564,7 @@ class QdrantMigration:
         for index_name in metadata.indexes:
             target_index = indexes.get(index_name)
             if not isinstance(target_index, Mapping):
-                raise MigrationError(
-                    f"target current marker is missing index {index_name!r}"
-                )
+                raise MigrationError(f"target current marker is missing index {index_name!r}")
         if target_info is None:
             target_layout = None
         else:
@@ -2692,22 +2595,18 @@ class QdrantMigration:
             missing = sorted(expected_indexes - actual_indexes)
             extra = sorted(actual_indexes - expected_indexes)
             raise MigrationError(
-                "target current marker index map differs: "
-                f"missing={missing!r} extra={extra!r}"
+                f"target current marker index map differs: missing={missing!r} extra={extra!r}"
             )
         for index_name, source_index in metadata.indexes.items():
             target_index = indexes[index_name]
             if target_index != source_index:
-                raise MigrationError(
-                    f"target current marker index {index_name!r} changed"
-                )
+                raise MigrationError(f"target current marker index {index_name!r} changed")
 
     def _assert_source_layout(self, expected: CollectionLayout, *, phase: str) -> None:
         actual = self._layout(self._collection_info(self.source_collection))
         if actual != expected:
             raise MigrationError(
-                f"source physical layout changed {phase}; "
-                "rerun preflight with source writes frozen"
+                f"source physical layout changed {phase}; rerun preflight with source writes frozen"
             )
 
     def _delete_points(self, collection: str, point_ids: list[str]) -> None:
@@ -2744,9 +2643,8 @@ class QdrantMigration:
                 pending.clear()
 
             def point_callback(transformed: dict[str, Any]) -> None:
-                if (
-                    not _acl_complete(transformed["payload"])
-                    and not getattr(self, "_reconcile_allow_acl_fail_open", False)
+                if not _acl_complete(transformed["payload"]) and not getattr(
+                    self, "_reconcile_allow_acl_fail_open", False
                 ):
                     raise MigrationError(
                         f"point {transformed.get('id')!r} lacks complete ACL fields"
@@ -2771,20 +2669,15 @@ class QdrantMigration:
             for point in self._scroll(self.target_collection, with_vectors=False):
                 point_id = point.get("id")
                 if point_id is None:
-                    raise MigrationError(
-                        "target collection contains a point without an id"
-                    )
+                    raise MigrationError("target collection contains a point without an id")
                 point_id = str(point_id)
                 payload = point.get("payload")
                 if not isinstance(payload, Mapping):
-                    raise MigrationError(
-                        f"target point {point_id!r} has no payload"
-                    )
+                    raise MigrationError(f"target point {point_id!r} has no payload")
                 original_id = payload.get(_ORIGINAL_ID_FIELD)
                 if original_id is None or not str(original_id):
                     raise MigrationError(
-                        f"target point {point_id!r} is missing "
-                        f"{_ORIGINAL_ID_FIELD}"
+                        f"target point {point_id!r} is missing {_ORIGINAL_ID_FIELD}"
                     )
                 expected_id = str(to_qdrant_point_id(str(original_id)))
                 if expected_id != point_id:
@@ -2845,9 +2738,7 @@ class QdrantMigration:
             pinned_metadata_fingerprint = _metadata_fingerprint(metadata)
             pinned_sparse_map_fingerprint = _sparse_map_fingerprint(self._sparse_map)
             if pinned_metadata_fingerprint != plan.metadata_fingerprint:
-                raise MigrationError(
-                    "legacy metadata fingerprint differs from the reviewed plan"
-                )
+                raise MigrationError("legacy metadata fingerprint differs from the reviewed plan")
             if pinned_sparse_map_fingerprint != plan.sparse_map_fingerprint:
                 raise MigrationError(
                     "authoritative sparse map fingerprint differs from the reviewed plan"
@@ -2867,9 +2758,7 @@ class QdrantMigration:
             state = marker.get("migration_state")
             if barrier_held:
                 if state != "cutting_over" or marker.get("setup_complete") is not True:
-                    raise MigrationError(
-                        "barrier-held reconcile requires a cutting_over target"
-                    )
+                    raise MigrationError("barrier-held reconcile requires a cutting_over target")
             elif state not in {"building", "ready", "failed"}:
                 raise MigrationError(
                     "reconcile may mutate only a building, ready, or failed target; "
@@ -2898,9 +2787,7 @@ class QdrantMigration:
                     or current_marker.get("setup_complete")
                     is not _MIGRATION_STATE_SETUP[expected_state]
                 ):
-                    raise MigrationError(
-                        "target marker state changed during reconcile"
-                    )
+                    raise MigrationError("target marker state changed during reconcile")
                 before_metadata = self._legacy_metadata()
                 before_metadata_fingerprint = _metadata_fingerprint(before_metadata)
                 before_sparse_map_fingerprint = _sparse_map_fingerprint(self._sparse_map)
@@ -2910,8 +2797,7 @@ class QdrantMigration:
                     )
                 if before_sparse_map_fingerprint != pinned_sparse_map_fingerprint:
                     raise MigrationError(
-                        "authoritative sparse map fingerprint changed before "
-                        "reconcile round"
+                        "authoritative sparse map fingerprint changed before reconcile round"
                     )
 
                 source = self._reconcile_round(
@@ -2929,13 +2815,10 @@ class QdrantMigration:
                 after_metadata_fingerprint = _metadata_fingerprint(after_metadata)
                 after_sparse_map_fingerprint = _sparse_map_fingerprint(self._sparse_map)
                 if after_metadata_fingerprint != pinned_metadata_fingerprint:
-                    raise MigrationError(
-                        "legacy metadata fingerprint changed during reconcile"
-                    )
+                    raise MigrationError("legacy metadata fingerprint changed during reconcile")
                 if after_sparse_map_fingerprint != pinned_sparse_map_fingerprint:
                     raise MigrationError(
-                        "authoritative sparse map fingerprint changed during "
-                        "reconcile"
+                        "authoritative sparse map fingerprint changed during reconcile"
                     )
                 target_count = self._count(self.target_collection)
                 if (
@@ -2944,8 +2827,7 @@ class QdrantMigration:
                     and source.fingerprint == previous.fingerprint
                     and source.acl_incomplete_count == previous.acl_incomplete_count
                     and source.sparse_term_count == previous.sparse_term_count
-                    and source.sparse_term_fingerprint
-                    == previous.sparse_term_fingerprint
+                    and source.sparse_term_fingerprint == previous.sparse_term_fingerprint
                     and target_count == source.source_count
                 ):
                     final_source = source
@@ -2969,14 +2851,10 @@ class QdrantMigration:
                 or current_marker.get("setup_complete")
                 is not _MIGRATION_STATE_SETUP[expected_final_state]
             ):
-                raise MigrationError(
-                    "target marker state changed before reconcile completion"
-                )
+                raise MigrationError("target marker state changed before reconcile completion")
             if (
-                current_marker.get("metadata_fingerprint")
-                != pinned_metadata_fingerprint
-                or current_marker.get("sparse_map_fingerprint")
-                != pinned_sparse_map_fingerprint
+                current_marker.get("metadata_fingerprint") != pinned_metadata_fingerprint
+                or current_marker.get("sparse_map_fingerprint") != pinned_sparse_map_fingerprint
             ):
                 raise MigrationError(
                     "target marker fingerprints changed before reconcile completion"
@@ -3020,8 +2898,7 @@ class QdrantMigration:
                         self._validate_marker_ownership(current)
                         if (
                             current.get("migration_state") == "building"
-                            and current.get("setup_complete")
-                            is False
+                            and current.get("setup_complete") is False
                         ):
                             failed = dict(current)
                             failed["migration_state"] = "failed"
@@ -3043,11 +2920,7 @@ class QdrantMigration:
                 field_name="target physical point id",
             )
             payload = point.get("payload")
-            original_id = (
-                payload.get(_ORIGINAL_ID_FIELD)
-                if isinstance(payload, Mapping)
-                else None
-            )
+            original_id = payload.get(_ORIGINAL_ID_FIELD) if isinstance(payload, Mapping) else None
             manifest.add_target(point_id, original_id)
         return scanned
 
@@ -3113,9 +2986,7 @@ class QdrantMigration:
         for field_name, expected_type in self._expected_payload_indexes(schema, indexes).items():
             value = physical.get(field_name)
             if not isinstance(value, Mapping):
-                raise MigrationError(
-                    f"target collection is missing payload index {field_name!r}"
-                )
+                raise MigrationError(f"target collection is missing payload index {field_name!r}")
             actual_type = self._physical_index_type(value)
             if actual_type != expected_type:
                 raise MigrationError(
@@ -3133,13 +3004,9 @@ class QdrantMigration:
                 if point_id is not None and str(point_id) == _META_MARKER_ID:
                     continue
                 payload = point.get("payload")
-                if (
-                    not isinstance(payload, Mapping)
-                    or payload.get(_SPARSE_TERM_MARKER) is not True
-                ):
+                if not isinstance(payload, Mapping) or payload.get(_SPARSE_TERM_MARKER) is not True:
                     raise SparseMigrationError(
-                        "target metadata collection contains an unexpected point "
-                        f"{point_id!r}"
+                        f"target metadata collection contains an unexpected point {point_id!r}"
                     )
                 if (
                     payload.get("logical_collection") != self.logical_collection
@@ -3185,8 +3052,7 @@ class QdrantMigration:
             missing = sorted(term for term in term_set if not dictionary.has_term(term))
             if missing:
                 raise SparseMigrationError(
-                    "target sparse dictionary is missing terms after write: "
-                    f"{missing!r}"
+                    f"target sparse dictionary is missing terms after write: {missing!r}"
                 )
             for term in term_set:
                 expected_index = stable_sparse_index(term)
@@ -3360,16 +3226,11 @@ class QdrantMigration:
                     if target_metadata_exists and not target_exists
                     else "target current marker"
                 )
-                raise MigrationError(
-                    f"{subject} is missing; "
-                    "refusing to adopt or overwrite it"
-                )
+                raise MigrationError(f"{subject} is missing; refusing to adopt or overwrite it")
             self._validate_metadata_layout(self.target_metadata_collection)
             self._validate_existing_target(
                 target_info=(
-                    self._collection_info(self.target_collection)
-                    if target_exists
-                    else None
+                    self._collection_info(self.target_collection) if target_exists else None
                 ),
                 marker=marker,
                 layout=layout,
@@ -3482,16 +3343,12 @@ class QdrantMigration:
             if _status(exc) == 409:
                 if allow_conflict:
                     return False
-                error = MigrationError(
-                    f"target collection appeared during migration: {name}"
-                )
+                error = MigrationError(f"target collection appeared during migration: {name}")
                 error.status = 409  # type: ignore[attr-defined]
                 raise error from exc
             raise
         if response.get("result") is not True:
-            raise MigrationError(
-                f"Qdrant collection creation did not complete for {name}"
-            )
+            raise MigrationError(f"Qdrant collection creation did not complete for {name}")
         return True
 
     def _delete_collection(self, name: str) -> None:
@@ -3506,9 +3363,7 @@ class QdrantMigration:
                 raise
             return
         if response.get("result") is not True:
-            raise MigrationError(
-                f"Qdrant collection deletion did not complete for {name}"
-            )
+            raise MigrationError(f"Qdrant collection deletion did not complete for {name}")
 
     def _write_points(self, collection: str, points: list[dict[str, Any]]) -> None:
         if not points:
@@ -3532,7 +3387,9 @@ class QdrantMigration:
             ],
         )
 
-    def _write_indexes(self, schema: Mapping[str, Any], indexes: Mapping[str, Mapping[str, Any]]) -> None:
+    def _write_indexes(
+        self, schema: Mapping[str, Any], indexes: Mapping[str, Mapping[str, Any]]
+    ) -> None:
         for field_name, field_schema in self._expected_payload_indexes(schema, indexes).items():
             try:
                 self._request(
@@ -3647,13 +3504,9 @@ class QdrantMigration:
 
     def _assert_empty_collection(self, collection: str) -> None:
         if self._count(collection) != 0:
-            raise MigrationError(
-                f"unmarked target collection {collection} is not empty"
-            )
+            raise MigrationError(f"unmarked target collection {collection} is not empty")
         if any(self._scroll(collection, with_vectors=False)):
-            raise MigrationError(
-                f"unmarked target collection {collection} is not empty"
-            )
+            raise MigrationError(f"unmarked target collection {collection} is not empty")
 
     def _assert_collection_layout(
         self,
@@ -3689,9 +3542,7 @@ class QdrantMigration:
         )
         self._assert_empty_collection(collection)
         if metadata and self._load_current_marker() is not None:
-            raise MigrationError(
-                "target metadata collection already contains a migration marker"
-            )
+            raise MigrationError("target metadata collection already contains a migration marker")
 
     def _assert_prepare_plan_identity(self, plan: MigrationPlan) -> None:
         expected_identity = {
@@ -3705,9 +3556,7 @@ class QdrantMigration:
         }
         for field_name, expected in expected_identity.items():
             if getattr(plan, field_name) != expected:
-                raise MigrationError(
-                    f"reviewed plan {field_name} does not match this migration"
-                )
+                raise MigrationError(f"reviewed plan {field_name} does not match this migration")
         if plan.batch_size != self.batch_size or not math.isclose(
             plan.timeout_seconds,
             self.timeout_seconds,
@@ -3728,15 +3577,11 @@ class QdrantMigration:
         if layout != self._layout_from_plan(plan):
             raise MigrationError("reviewed plan vector layout does not match the source")
         if _metadata_fingerprint(metadata) != plan.metadata_fingerprint:
-            raise MigrationError(
-                "reviewed plan metadata fingerprint does not match the source"
-            )
+            raise MigrationError("reviewed plan metadata fingerprint does not match the source")
         if self._sparse_weight(metadata, sparse_enabled=layout.sparse_enabled) != (
             plan.sparse_weight
         ):
-            raise MigrationError(
-                "reviewed plan sparse search policy does not match the source"
-            )
+            raise MigrationError("reviewed plan sparse search policy does not match the source")
 
     def _validate_owned_prepare_marker(
         self,
@@ -3943,9 +3788,7 @@ class QdrantMigration:
 
         target_exists = self._exists(self.target_collection)
         target_metadata_exists = self._exists(self.target_metadata_collection)
-        existing_marker = (
-            self._load_current_marker() if target_metadata_exists else None
-        )
+        existing_marker = self._load_current_marker() if target_metadata_exists else None
         if (target_exists or target_metadata_exists) and existing_marker is None:
             if not plan.target_absent:
                 raise MigrationError(
@@ -3961,13 +3804,9 @@ class QdrantMigration:
         if self._prepare_reviewed_plan_fields(plan) != self._prepare_reviewed_plan_fields(
             current_plan
         ):
-            raise MigrationError(
-                "provided migration plan is stale; rerun preflight before prepare"
-            )
+            raise MigrationError("provided migration plan is stale; rerun preflight before prepare")
         if not plan.target_absent and current_plan.target_absent:
-            raise MigrationError(
-                "reviewed target disappeared; rerun preflight before prepare"
-            )
+            raise MigrationError("reviewed target disappeared; rerun preflight before prepare")
         if current_plan.acl_incomplete_count and not allow_acl_fail_open:
             raise MigrationError(
                 f"{current_plan.acl_incomplete_count} records lack ACL fields; "
@@ -4065,9 +3904,7 @@ class QdrantMigration:
         )
         marker_schema = marker.get("schema")
         marker_indexes = marker.get("indexes")
-        if not isinstance(marker_schema, Mapping) or not isinstance(
-            marker_indexes, Mapping
-        ):
+        if not isinstance(marker_schema, Mapping) or not isinstance(marker_indexes, Mapping):
             raise MigrationError("target marker has invalid index metadata")
         self._write_indexes(marker_schema, marker_indexes)
         self._write_sparse_dictionary(self._sparse_map.values())
@@ -4124,12 +3961,8 @@ class QdrantMigration:
         if actual_vectors is None:
             actual_vectors = point.get("vectors")
         expected_vectors = expected.get("vector")
-        if not isinstance(actual_vectors, Mapping) or not isinstance(
-            expected_vectors, Mapping
-        ):
-            raise MigrationError(
-                f"target point {point.get('id')!r} has an invalid vector payload"
-            )
+        if not isinstance(actual_vectors, Mapping) or not isinstance(expected_vectors, Mapping):
+            raise MigrationError(f"target point {point.get('id')!r} has an invalid vector payload")
         if set(actual_vectors) != set(expected_vectors):
             raise MigrationError(
                 f"target point {point.get('id')!r} vector names differ: "
@@ -4167,12 +4000,8 @@ class QdrantMigration:
                         f"target point {point.get('id')!r} vector {name!r} differs"
                     )
                 continue
-            if not isinstance(expected_value, Mapping) or not isinstance(
-                actual_value, Mapping
-            ):
-                raise MigrationError(
-                    f"target point {point.get('id')!r} vector {name!r} differs"
-                )
+            if not isinstance(expected_value, Mapping) or not isinstance(actual_value, Mapping):
+                raise MigrationError(f"target point {point.get('id')!r} vector {name!r} differs")
             if set(actual_value) != {"indices", "values"}:
                 raise MigrationError(
                     f"target point {point.get('id')!r} sparse vector {name!r} is malformed"
@@ -4222,10 +4051,7 @@ class QdrantMigration:
                 actual_weight_values = [
                     _canonical_float32(
                         value,
-                        field_name=(
-                            f"target point {point.get('id')!r} "
-                            f"sparse vector {name!r}"
-                        ),
+                        field_name=(f"target point {point.get('id')!r} sparse vector {name!r}"),
                     )
                     for value in actual_values
                 ]
@@ -4269,9 +4095,7 @@ class QdrantMigration:
 
         source_payload = source_point.get("payload")
         if not isinstance(source_payload, Mapping):
-            raise MigrationError(
-                f"source point {source_point.get('id')!r} has an invalid payload"
-            )
+            raise MigrationError(f"source point {source_point.get('id')!r} has an invalid payload")
         if "uri_depth" in source_payload and "scope_roots" in source_payload:
             expected = {
                 "id": source_point.get("id"),
@@ -4288,36 +4112,25 @@ class QdrantMigration:
         expected_id = expected.get("id")
         actual_id = target_point.get("id")
         if expected_id is None:
-            raise MigrationError(
-                f"target point {actual_id!r} has no expected target id"
-            )
+            raise MigrationError(f"target point {actual_id!r} has no expected target id")
         actual_id = _canonical_uuid_string(
             actual_id,
             field_name=f"target point {actual_id!r} physical id",
         )
         if actual_id != expected_id:
             raise MigrationError(
-                f"target point {actual_id!r} has the wrong target id; "
-                f"expected={expected_id!r}"
+                f"target point {actual_id!r} has the wrong target id; expected={expected_id!r}"
             )
         expected_payload = expected.get("payload")
         actual_payload = target_point.get("payload")
-        if not isinstance(expected_payload, Mapping) or not isinstance(
-            actual_payload, Mapping
-        ):
-            raise MigrationError(
-                f"target point {actual_id!r} has an invalid payload"
-            )
+        if not isinstance(expected_payload, Mapping) or not isinstance(actual_payload, Mapping):
+            raise MigrationError(f"target point {actual_id!r} has an invalid payload")
         original_id = actual_payload.get(_ORIGINAL_ID_FIELD)
         expected_original_id = expected_payload.get(_ORIGINAL_ID_FIELD)
         if original_id is None or expected_original_id is None:
-            raise MigrationError(
-                f"target point {actual_id!r} is missing {_ORIGINAL_ID_FIELD}"
-            )
+            raise MigrationError(f"target point {actual_id!r} is missing {_ORIGINAL_ID_FIELD}")
         if str(original_id) != str(expected_original_id):
-            raise MigrationError(
-                f"target point {actual_id!r} has the wrong original id"
-            )
+            raise MigrationError(f"target point {actual_id!r} has the wrong original id")
         self._validate_target_payload(
             actual_payload,
             expected_payload,
@@ -4326,9 +4139,7 @@ class QdrantMigration:
             point_id=str(actual_id),
         )
         if not _typed_equal(actual_payload, expected_payload):
-            raise MigrationError(
-                f"target point {actual_id!r} payload differs from copied source"
-            )
+            raise MigrationError(f"target point {actual_id!r} payload differs from copied source")
         self._assert_target_vectors(target_point, expected, exact=True)
 
     def _validate_final_target(
@@ -4406,23 +4217,17 @@ class QdrantMigration:
                 if (
                     actual_source.source_count != source.source_count
                     or actual_source.fingerprint != source.fingerprint
-                    or actual_source.acl_incomplete_count
-                    != source.acl_incomplete_count
+                    or actual_source.acl_incomplete_count != source.acl_incomplete_count
                     or actual_source.sparse_term_count != source.sparse_term_count
-                    or actual_source.sparse_term_fingerprint
-                    != source.sparse_term_fingerprint
+                    or actual_source.sparse_term_fingerprint != source.sparse_term_fingerprint
                 ):
                     raise MigrationError("source changed final verification")
                 if pending:
                     validate_batch(pending)
                 extra = manifest.first_extra_target()
                 if extra is not None:
-                    raise MigrationError(
-                        f"target records differ after copy: extras={extra!r}"
-                    )
-                transformed_source_fingerprint = (
-                    manifest.transformed_source_fingerprint()
-                )
+                    raise MigrationError(f"target records differ after copy: extras={extra!r}")
+                transformed_source_fingerprint = manifest.transformed_source_fingerprint()
                 target_content_fingerprint = manifest.target_content_fingerprint()
         self._assert_sparse_dictionary_complete(self._sparse_map.values())
         return (
@@ -4467,31 +4272,22 @@ class QdrantMigration:
             if identity_field in expected_payload or identity_field in schema_fields:
                 value = payload.get(identity_field)
                 if not isinstance(value, str) or not value.strip():
-                    raise MigrationError(
-                        f"target point {point_id!r} is missing {identity_field}"
-                    )
-        expected_owner = owner_fields_for_uri(
-            f"viking://{normalized_uri.lstrip('/')}"
-        ).get("owner_user_id")
+                    raise MigrationError(f"target point {point_id!r} is missing {identity_field}")
+        expected_owner = owner_fields_for_uri(f"viking://{normalized_uri.lstrip('/')}").get(
+            "owner_user_id"
+        )
         actual_owner = payload.get("owner_user_id")
         if expected_owner is not None and actual_owner != expected_owner:
-            raise MigrationError(
-                f"target point {point_id!r} owner_user_id does not match uri"
-            )
+            raise MigrationError(f"target point {point_id!r} owner_user_id does not match uri")
 
         expected_acl_fields = _ACL_FIELDS & set(expected_payload)
         actual_acl_fields = _ACL_FIELDS & set(payload)
         if (
-            len(expected_acl_fields) == len(_ACL_FIELDS)
-            and not _acl_complete(expected_payload)
-        ) or (
-            len(actual_acl_fields) == len(_ACL_FIELDS) and not _acl_complete(payload)
-        ):
+            len(expected_acl_fields) == len(_ACL_FIELDS) and not _acl_complete(expected_payload)
+        ) or (len(actual_acl_fields) == len(_ACL_FIELDS) and not _acl_complete(payload)):
             raise MigrationError(f"target point {point_id!r} has malformed ACL fields")
         if not _acl_complete(expected_payload) and not allow_acl_fail_open:
-            raise MigrationError(
-                f"target point {point_id!r} lacks complete ACL fields"
-            )
+            raise MigrationError(f"target point {point_id!r} lacks complete ACL fields")
 
     def _verify_target_marker(
         self,
@@ -4506,9 +4302,7 @@ class QdrantMigration:
         self._validate_marker_ownership(marker)
         state = marker.get("migration_state")
         if expected_state is not None and state != expected_state:
-            raise MigrationError(
-                f"target current marker must be {expected_state!r}; got {state!r}"
-            )
+            raise MigrationError(f"target current marker must be {expected_state!r}; got {state!r}")
         if state == "rolled_back" and marker.get("setup_complete") is True:
             raise MigrationError("rolled_back target cannot be serving-ready")
 
@@ -4528,9 +4322,7 @@ class QdrantMigration:
         if _metadata_fingerprint(fresh_metadata) != metadata_fingerprint:
             raise MigrationError("legacy metadata changed during verification")
         if _sparse_map_fingerprint(self._sparse_map) != sparse_map_fingerprint:
-            raise MigrationError(
-                "authoritative sparse map changed during verification"
-            )
+            raise MigrationError("authoritative sparse map changed during verification")
         self._assert_source_layout(layout, phase="final verification")
         self._validate_metadata_layout(self.target_metadata_collection)
         target_info = self._collection_info(self.target_collection)
@@ -4574,13 +4366,9 @@ class QdrantMigration:
         if not isinstance(plan, MigrationPlan):
             raise MigrationError("verify requires a reviewed migration plan")
         if final and not barrier_held:
-            raise MigrationError(
-                "final verify requires barrier_held=True / --barrier-held"
-            )
+            raise MigrationError("final verify requires barrier_held=True / --barrier-held")
         if final and not confirm:
-            raise MigrationError(
-                "final verify requires explicit confirm=True / --confirm"
-            )
+            raise MigrationError("final verify requires explicit confirm=True / --confirm")
         if final and not lock_held:
             raise MigrationError(
                 "final verify requires external source lock acknowledgement via "
@@ -4593,9 +4381,7 @@ class QdrantMigration:
         metadata_fingerprint = _metadata_fingerprint(metadata)
         sparse_map_fingerprint = _sparse_map_fingerprint(self._sparse_map)
         if metadata_fingerprint != plan.metadata_fingerprint:
-            raise MigrationError(
-                "legacy metadata fingerprint differs from the reviewed plan"
-            )
+            raise MigrationError("legacy metadata fingerprint differs from the reviewed plan")
         if sparse_map_fingerprint != plan.sparse_map_fingerprint:
             raise MigrationError(
                 "authoritative sparse map fingerprint differs from the reviewed plan"
@@ -4615,9 +4401,7 @@ class QdrantMigration:
                     "final verify requires a cutting_over target with setup_complete=true"
                 )
         elif state == "cutting_over":
-            raise MigrationError(
-                "cutting_over verification requires final=True"
-            )
+            raise MigrationError("cutting_over verification requires final=True")
         elif state not in {"building", "ready", "failed", "active", "retained", "rolled_back"}:
             raise MigrationError(f"verify does not support target state {state!r}")
 
@@ -4673,11 +4457,9 @@ class QdrantMigration:
             or current.get("sparse_map_fingerprint") != sparse_map_fingerprint
             or current.get("source_count") != marker_source.source_count
             or current.get("source_fingerprint") != marker_source.fingerprint
-            or current.get("acl_incomplete_count")
-            != marker_source.acl_incomplete_count
+            or current.get("acl_incomplete_count") != marker_source.acl_incomplete_count
             or current.get("sparse_term_count") != marker_source.sparse_term_count
-            or current.get("sparse_term_fingerprint")
-            != marker_source.sparse_term_fingerprint
+            or current.get("sparse_term_fingerprint") != marker_source.sparse_term_fingerprint
         ):
             raise MigrationError("target marker changed during verification")
         if transformed_source_fingerprint != target_content_fingerprint:
@@ -4722,10 +4504,8 @@ class QdrantMigration:
                     "target marker target count differs from the audited target count"
                 )
             if (
-                current.get("transformed_source_fingerprint")
-                != transformed_source_fingerprint
-                or current.get("target_content_fingerprint")
-                != target_content_fingerprint
+                current.get("transformed_source_fingerprint") != transformed_source_fingerprint
+                or current.get("target_content_fingerprint") != target_content_fingerprint
             ):
                 raise MigrationError(
                     "target marker content fingerprints differ from the audited target"
@@ -4735,8 +4515,7 @@ class QdrantMigration:
         if state == "building" and not final:
             if not confirm:
                 raise MigrationError(
-                    "verify requires explicit confirm=True / --confirm when "
-                    "publishing ready"
+                    "verify requires explicit confirm=True / --confirm when publishing ready"
                 )
             if not lock_held:
                 raise MigrationError(
@@ -4779,9 +4558,7 @@ class QdrantMigration:
         try:
             self._verify_target_marker(verified, expected_state=result_state)
         except MigrationError as exc:
-            raise MigrationError(
-                f"target completion marker was not persisted: {exc}"
-            ) from exc
+            raise MigrationError(f"target completion marker was not persisted: {exc}") from exc
         if verified.get("setup_complete") is not (
             result_state in {"ready", "cutting_over", "active", "retained"}
         ):
@@ -4799,25 +4576,17 @@ class QdrantMigration:
     @staticmethod
     def _validate_deployment_hooks(hooks: Any) -> None:
         if hooks is None:
-            raise MigrationError(
-                "deployment hooks are required for this lifecycle operation"
-            )
+            raise MigrationError("deployment hooks are required for this lifecycle operation")
         missing = [
-            name
-            for name in _DEPLOYMENT_HOOK_NAMES
-            if not callable(getattr(hooks, name, None))
+            name for name in _DEPLOYMENT_HOOK_NAMES if not callable(getattr(hooks, name, None))
         ]
         if missing:
-            raise MigrationError(
-                f"deployment hooks are missing required operations: {missing!r}"
-            )
+            raise MigrationError(f"deployment hooks are missing required operations: {missing!r}")
 
     @staticmethod
     def _hook_bool(value: Any, *, operation: str) -> bool:
         if not isinstance(value, bool):
-            raise MigrationError(
-                f"deployment hook {operation!r} must return a boolean"
-            )
+            raise MigrationError(f"deployment hook {operation!r} must return a boolean")
         return value
 
     def cutover(
@@ -4836,9 +4605,7 @@ class QdrantMigration:
         if not confirm:
             raise MigrationError("cutover requires explicit confirm=True / --confirm")
         if not barrier_held:
-            raise MigrationError(
-                "cutover requires barrier_held=True / --barrier-held"
-            )
+            raise MigrationError("cutover requires barrier_held=True / --barrier-held")
         if not lock_held:
             raise MigrationError(
                 "cutover requires external source lock acknowledgement via "
@@ -4929,18 +4696,14 @@ class QdrantMigration:
         if not confirm:
             raise MigrationError("rollback requires explicit confirm=True / --confirm")
         if not barrier_held:
-            raise MigrationError(
-                "rollback requires barrier_held=True / --barrier-held"
-            )
+            raise MigrationError("rollback requires barrier_held=True / --barrier-held")
         if not lock_held:
             raise MigrationError(
                 "rollback requires external source lock acknowledgement via "
                 "lock_held=True / --lock-held"
             )
         if not no_current_format_writes_accepted:
-            raise MigrationError(
-                "rollback requires --no-current-format-writes-accepted"
-            )
+            raise MigrationError("rollback requires --no-current-format-writes-accepted")
         self._validate_deployment_hooks(hooks)
 
         marker = self._load_current_marker()
@@ -4950,17 +4713,14 @@ class QdrantMigration:
         state = marker["migration_state"]
         if state not in {"cutting_over", "active"}:
             raise MigrationError(
-                "rollback requires a cutting_over or active target; "
-                f"current state is {state!r}"
+                f"rollback requires a cutting_over or active target; current state is {state!r}"
             )
         accepted = self._hook_bool(
             hooks.current_target_has_accepted_writes(self),
             operation="current_target_has_accepted_writes",
         )
         if accepted:
-            raise MigrationError(
-                "rollback refuses after accepted current-format writes"
-            )
+            raise MigrationError("rollback refuses after accepted current-format writes")
         hooks.remove_current_from_serving_path(self)
         hooks.assert_target_not_served(self)
         hooks.restore_legacy(self)
@@ -4992,19 +4752,13 @@ class QdrantMigration:
             raise MigrationError("retire requires an owned target marker")
         self._validate_marker_ownership(marker)
         if marker.get("migration_state") != expected_state:
-            raise MigrationError(
-                f"retire target state changed from {expected_state!r}"
-            )
+            raise MigrationError(f"retire target state changed from {expected_state!r}")
         layout = self._layout_from_plan(plan)
         metadata = self._legacy_metadata()
         self._validate_source_metadata_layout(metadata.schema, layout)
         self._validate_metadata_layout(self.target_metadata_collection)
         self._validate_existing_target(
-            target_info=(
-                self._collection_info(self.target_collection)
-                if target_exists
-                else None
-            ),
+            target_info=(self._collection_info(self.target_collection) if target_exists else None),
             marker=marker,
             layout=layout,
             metadata=metadata,
@@ -5057,13 +4811,10 @@ class QdrantMigration:
         state = marker["migration_state"]
         if state not in {"active", "retained"}:
             raise MigrationError(
-                "retire supports only active or retained targets; "
-                f"current state is {state!r}"
+                f"retire supports only active or retained targets; current state is {state!r}"
             )
         if plan.target_absent or plan.target_state not in {"active", "retained"}:
-            raise MigrationError(
-                "retire requires a reviewed active or retained target plan"
-            )
+            raise MigrationError("retire requires a reviewed active or retained target plan")
         if state == "active" and not target_exists:
             raise MigrationError("active retire target collection is missing")
         self._validate_retire_pair(
@@ -5092,9 +4843,7 @@ class QdrantMigration:
                 )
         else:
             if self._exists(self.target_collection):
-                raise MigrationError(
-                    "target data collection reappeared during retained retry"
-                )
+                raise MigrationError("target data collection reappeared during retained retry")
             self._validate_retire_pair(
                 plan=plan,
                 expected_state="retained",
@@ -5102,9 +4851,7 @@ class QdrantMigration:
             )
 
         if self._exists(self.target_collection):
-            raise MigrationError(
-                "target data collection reappeared before metadata deletion"
-            )
+            raise MigrationError("target data collection reappeared before metadata deletion")
         self._validate_retire_pair(
             plan=plan,
             expected_state="retained",
@@ -5112,9 +4859,7 @@ class QdrantMigration:
         )
         hooks.assert_target_not_served(self)
         if self._exists(self.target_collection):
-            raise MigrationError(
-                "target data collection reappeared before metadata deletion"
-            )
+            raise MigrationError("target data collection reappeared before metadata deletion")
         self._delete_collection(self.target_metadata_collection)
         if self._exists(self.target_metadata_collection):
             raise MigrationError(
@@ -5132,9 +4877,7 @@ class QdrantMigration:
         plan: MigrationPlan,
     ) -> None:
         if marker.get("source_fingerprint") != plan.source_fingerprint:
-            raise MigrationError(
-                "target current marker source fingerprint changed after preflight"
-            )
+            raise MigrationError("target current marker source fingerprint changed after preflight")
         if marker.get("metadata_fingerprint") != plan.metadata_fingerprint:
             raise MigrationError(
                 "target current marker metadata fingerprint changed after preflight"
@@ -5178,9 +4921,8 @@ class QdrantMigration:
         )
         for field_name in ("metadata_fingerprint", "sparse_map_fingerprint"):
             if marker.get(field_name) != getattr(plan, field_name):
-                raise MigrationError(
-                    f"target current marker {field_name} changed after prepare"
-                )
+                raise MigrationError(f"target current marker {field_name} changed after prepare")
+        self._assert_sparse_dictionary_complete(self._sparse_map.values())
         if marker.get("backfill_complete") is True:
             return {
                 "source_count": marker["source_count"],
@@ -5227,9 +4969,7 @@ class QdrantMigration:
                         schema=metadata.schema,
                     )
                     if not _acl_complete(transformed["payload"]) and not allow_acl_fail_open:
-                        raise MigrationError(
-                            f"point {point.get('id')!r} lacks complete ACL fields"
-                        )
+                        raise MigrationError(f"point {point.get('id')!r} lacks complete ACL fields")
                     self._record_source_point(
                         manifest,
                         point,
@@ -5238,13 +4978,11 @@ class QdrantMigration:
                     )
                     pending.append(transformed)
                     if len(pending) >= self.batch_size:
-                        self._validate_sparse_terms(manifest.iter_sparse_terms())
                         migrated_batch, skipped_batch = self._upsert_target_batch(pending)
                         migrated += migrated_batch
                         skipped += skipped_batch
                         pending.clear()
                 if pending:
-                    self._validate_sparse_terms(manifest.iter_sparse_terms())
                     migrated_batch, skipped_batch = self._upsert_target_batch(pending)
                     migrated += migrated_batch
                     skipped += skipped_batch
@@ -5270,11 +5008,9 @@ class QdrantMigration:
                     layout=layout,
                     metadata=metadata,
                 )
-                if (
-                    _cursor_key(persisted.get("last_source_cursor"))
-                    != _cursor_key(next_cursor)
-                    or persisted.get("backfill_complete") is not (next_cursor is None)
-                ):
+                if _cursor_key(persisted.get("last_source_cursor")) != _cursor_key(
+                    next_cursor
+                ) or persisted.get("backfill_complete") is not (next_cursor is None):
                     raise MigrationError("backfill cursor was not persisted")
                 marker = persisted
                 if marker["backfill_complete"]:
@@ -5318,11 +5054,7 @@ class QdrantMigration:
             target_exists = self._exists(self.target_collection)
             target_metadata_exists = self._exists(self.target_metadata_collection)
             if target_exists or target_metadata_exists:
-                existing_marker = (
-                    self._load_current_marker()
-                    if target_metadata_exists
-                    else None
-                )
+                existing_marker = self._load_current_marker() if target_metadata_exists else None
                 if existing_marker is None:
                     # preflight cannot inspect an unmarked pair. Prove the
                     # reviewed source is still frozen before destructive
@@ -5355,9 +5087,7 @@ class QdrantMigration:
                     )
         current_plan = self.preflight()
         if self._reviewed_plan_fields(plan) != self._reviewed_plan_fields(current_plan):
-            raise MigrationError(
-                "provided migration plan is stale; rerun preflight before apply"
-            )
+            raise MigrationError("provided migration plan is stale; rerun preflight before apply")
         plan = current_plan
         if plan.target_state == "ready":
             raise MigrationError(
@@ -5547,9 +5277,7 @@ def _load_plan(path: str | None) -> MigrationPlan | None:
     missing = sorted(expected_fields - set(value))
     extra = sorted(set(value) - expected_fields)
     if missing or extra:
-        raise MigrationError(
-            f"migration plan fields differ: missing={missing!r} extra={extra!r}"
-        )
+        raise MigrationError(f"migration plan fields differ: missing={missing!r} extra={extra!r}")
 
     def text(name: str, *, non_empty: bool = True) -> str:
         item = value[name]
@@ -5576,26 +5304,18 @@ def _load_plan(path: str | None) -> MigrationPlan | None:
         if not isinstance(value[name], bool):
             raise MigrationError(f"migration plan field {name!r} must be a boolean")
     target_state = value["target_state"]
-    if (
-        target_state is not None
-        and (
-            not isinstance(target_state, str)
-            or target_state not in MIGRATION_STATES
-        )
+    if target_state is not None and (
+        not isinstance(target_state, str) or target_state not in MIGRATION_STATES
     ):
         raise MigrationError("migration plan target_state is invalid")
     if value["target_absent"] and target_state is not None:
-        raise MigrationError(
-            "migration plan target_state must be null when target_absent is true"
-        )
+        raise MigrationError("migration plan target_state must be null when target_absent is true")
     if value["migrator_version"] != MIGRATOR_VERSION:
         raise MigrationError(
             "migration plan migrator_version does not match the running controller"
         )
     for name in ("dense_datatype", "sparse_modifier", "sparse_datatype"):
-        if value[name] is not None and (
-            not isinstance(value[name], str) or not value[name]
-        ):
+        if value[name] is not None and (not isinstance(value[name], str) or not value[name]):
             raise MigrationError(f"migration plan field {name!r} must be a string or null")
     sparse_term_count = integer("sparse_term_count", non_negative=True)
     sparse_term_fingerprint = text("sparse_term_fingerprint")
@@ -5649,8 +5369,7 @@ def _load_plan(path: str | None) -> MigrationPlan | None:
 def _warn_acl_risk(plan: MigrationPlan | None, allow_acl_fail_open: bool) -> None:
     if allow_acl_fail_open and plan is not None and plan.acl_incomplete_count:
         print(
-            "warning: allowing fail-open ACL fields for "
-            f"{plan.acl_incomplete_count} records",
+            f"warning: allowing fail-open ACL fields for {plan.acl_incomplete_count} records",
             file=sys.stderr,
         )
 
@@ -5885,9 +5604,7 @@ def main(argv: list[str] | None = None) -> int:
                     migration.rollback(
                         confirm=args.confirm,
                         barrier_held=args.barrier_held,
-                        no_current_format_writes_accepted=(
-                            args.no_current_format_writes_accepted
-                        ),
+                        no_current_format_writes_accepted=(args.no_current_format_writes_accepted),
                         hooks=hooks,
                         lock_held=args.lock_held,
                     ),

@@ -730,6 +730,8 @@ def test_preflight_plan_is_compact_and_binds_identity() -> None:
     assert "id_map" not in value
     assert "existing_target_ids" not in value
     assert "sparse_terms" not in value
+    assert "vectors" not in value
+    assert "payloads" not in value
     assert "url" not in value
     assert "api_key" not in value
 
@@ -1170,6 +1172,128 @@ def test_sparse_dictionary_write_is_chunked_and_verified() -> None:
     ) == 2
 
 
+def test_backfill_validates_sparse_dictionary_once_per_invocation() -> None:
+    qdrant = _legacy_fixture(sparse=True)
+    migration = _migration(
+        qdrant,
+        batch_size=1,
+        sparse_map={111: "hello", 222: "world"},
+    )
+    plan = migration.preflight()
+    migration.prepare(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+    qdrant.requests.clear()
+    qdrant.request_params.clear()
+
+    result = migration.backfill(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+
+    assert result["backfill_complete"] is True
+    dictionary_scroll_path = migration._path(
+        migration.target_metadata_collection,
+        "/points/scroll",
+    )
+    dictionary_scans = [
+        request
+        for request in qdrant.requests
+        if request[0] == "POST" and request[1] == dictionary_scroll_path
+    ]
+    # The marker plus two dictionary terms require three pages at batch_size=1,
+    # regardless of the two source pages copied by this invocation.
+    assert len(dictionary_scans) == 3
+    term_ids = {
+        to_qdrant_point_id("openviking:sparse:hello"),
+        to_qdrant_point_id("openviking:sparse:world"),
+    }
+    per_term_lookups = [
+        request
+        for request in qdrant.requests
+        if request[0] == "POST"
+        and request[1] == migration._path(migration.target_metadata_collection, "/points")
+        and isinstance(request[2], dict)
+        and term_ids.intersection(str(point_id) for point_id in request[2].get("ids", []))
+    ]
+    assert per_term_lookups == []
+
+
+def test_backfill_rejects_missing_sparse_dictionary_before_writes_and_revalidates_retry() -> None:
+    qdrant = _legacy_fixture(sparse=True)
+    migration = _migration(
+        qdrant,
+        batch_size=1,
+        sparse_map={111: "hello", 222: "world"},
+    )
+    plan = migration.preflight()
+    migration.prepare(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+    sparse_points = qdrant.collections[migration.target_metadata_collection]["points"]
+    missing_id = to_qdrant_point_id("openviking:sparse:hello")
+    missing_point = sparse_points.pop(missing_id)
+    qdrant.requests.clear()
+    qdrant.request_params.clear()
+
+    with pytest.raises(SparseMigrationError, match="missing terms"):
+        migration.backfill(
+            confirm=True,
+            plan=plan,
+            allow_acl_fail_open=True,
+            lock_held=True,
+        )
+
+    source_scroll_path = migration._path(migration.source_collection, "/points/scroll")
+    target_data_path = migration._path(migration.target_collection, "/points")
+    assert not any(
+        request[0] == "POST" and request[1] == source_scroll_path
+        for request in qdrant.requests
+    )
+    assert not any(
+        request[0] == "PUT" and request[1] == target_data_path
+        for request in qdrant.requests
+    )
+    first_invocation_dictionary_scans = sum(
+        request[0] == "POST"
+        and request[1] == migration._path(
+            migration.target_metadata_collection,
+            "/points/scroll",
+        )
+        for request in qdrant.requests
+    )
+    assert first_invocation_dictionary_scans == 2
+
+    sparse_points[missing_id] = missing_point
+    qdrant.requests.clear()
+    qdrant.request_params.clear()
+    result = migration.backfill(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+
+    assert result["backfill_complete"] is True
+    second_invocation_dictionary_scans = sum(
+        request[0] == "POST"
+        and request[1] == migration._path(
+            migration.target_metadata_collection,
+            "/points/scroll",
+        )
+        for request in qdrant.requests
+    )
+    assert second_invocation_dictionary_scans == 3
+
+
 def _apply(migration: QdrantMigration, **kwargs: object):
     kwargs.setdefault("plan", migration.preflight())
     kwargs.setdefault("lock_held", True)
@@ -1241,9 +1365,23 @@ def test_apply_creates_current_marker_indexes_and_data_but_never_changes_source(
     target_meta = qdrant.collections["current__context__openviking_meta"]
     assert len(target["points"]) == 2
     marker = target_meta["points"][to_qdrant_point_id("openviking:metadata")]
-    assert marker["payload"]["_openviking_meta_version"] == 1
-    assert marker["payload"]["collection_name"] == "current__context"
-    assert "default" in marker["payload"]["indexes"]
+    marker_payload = marker["payload"]
+    assert marker_payload["_openviking_meta_version"] == 1
+    assert marker_payload["collection_name"] == "current__context"
+    assert marker_payload["metadata_collection_name"] == (
+        "current__context__openviking_meta"
+    )
+    assert marker_payload["logical_collection"] == "legacy/context"
+    assert marker_payload["migration_id"] == "mig-1"
+    assert marker_payload["migration_state"] == "ready"
+    assert marker_payload["setup_complete"] is True
+    assert marker_payload["last_source_cursor"] is None
+    assert marker_payload["backfill_complete"] is True
+    assert marker_payload["vector_dim"] == marker_payload["vector_dimension"] == 2
+    assert marker_payload["source_fingerprint"]
+    assert marker_payload["metadata_fingerprint"]
+    assert marker_payload["sparse_map_fingerprint"]
+    assert marker_payload["indexes"]
     assert result.target_count == 2
 
 

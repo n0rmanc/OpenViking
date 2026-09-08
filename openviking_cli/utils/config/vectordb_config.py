@@ -244,8 +244,7 @@ class VectorDBBackendConfig(BaseModel):
     url: Optional[str] = Field(
         default=None,
         description=(
-            "Remote service URL for 'http' or 'qdrant' backends "
-            "(e.g., 'http://localhost:5000')"
+            "Remote service URL for 'http' or 'qdrant' backends (e.g., 'http://localhost:5000')"
         ),
     )
 
