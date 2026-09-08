@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -36,6 +37,8 @@ _INTERNAL_PAYLOAD_FIELDS = {
 _ADAPTER_MARKER_FIELDS = {
     "_openviking_meta_version",
     "collection_name",
+    "metadata_collection_name",
+    "logical_collection",
     "schema",
     "dense_vector_name",
     "sparse_vector_name",
@@ -44,6 +47,29 @@ _ADAPTER_MARKER_FIELDS = {
     "sparse_enabled",
     "sparse_weight",
     "indexes",
+}
+_MIGRATION_MARKER_FIELDS = {
+    "migration_id",
+    "migration_state",
+    "migrator_version",
+    "source_collection",
+    "source_metadata_collection",
+    "source_fingerprint",
+    "metadata_fingerprint",
+    "sparse_map_fingerprint",
+    "target_count",
+    "target_collection",
+    "target_metadata_collection",
+    "vector_dimension",
+}
+_MIGRATION_STATE_SETUP = {
+    "building": False,
+    "failed": False,
+    "rolled_back": False,
+    "ready": True,
+    "cutting_over": True,
+    "active": True,
+    "retained": True,
 }
 
 
@@ -68,6 +94,7 @@ class QdrantCollection(ICollection):
         distance: str,
         sparse_enabled: bool,
         sparse_weight: float,
+        logical_collection: str | None = None,
     ) -> None:
         self._client = client
         self._collection_name = collection_name
@@ -82,11 +109,19 @@ class QdrantCollection(ICollection):
         self._indexes: dict[str, dict[str, Any]] = {}
         self._sparse_dictionary: SparseTermDictionary | None = None
         self._migration_marker_fields: dict[str, Any] | None = None
+        self._logical_collection = logical_collection
+        self._marker_loaded_from_remote = False
 
     @staticmethod
     def _normalize_distance(distance: str) -> str:
         value = str(distance or "cosine").strip().lower()
-        mapping = {"cosine": "Cosine", "ip": "Dot", "dot": "Dot", "l2": "Euclid", "euclid": "Euclid"}
+        mapping = {
+            "cosine": "Cosine",
+            "ip": "Dot",
+            "dot": "Dot",
+            "l2": "Euclid",
+            "euclid": "Euclid",
+        }
         if value not in mapping:
             raise ValueError(f"Unsupported Qdrant distance metric: {distance!r}")
         return mapping[value]
@@ -94,6 +129,102 @@ class QdrantCollection(ICollection):
     @staticmethod
     def _result(response: dict[str, Any]) -> Any:
         return response.get("result", response)
+
+    @staticmethod
+    def _require_completed(response: dict[str, Any], operation: str) -> None:
+        result = response.get("result")
+        if not isinstance(result, dict) or result.get("status") != "completed":
+            raise QdrantError(f"Qdrant {operation} did not complete")
+
+    def _timeout_param(self) -> int:
+        return max(1, math.ceil(self._client.timeout_seconds))
+
+    @staticmethod
+    def _strong_point_params() -> dict[str, str]:
+        return {"wait": "true", "ordering": "strong"}
+
+    def _wait_payload_index(self, field: str, *, present: bool) -> None:
+        self._wait_collection_ready(
+            self._collection_name,
+            payload_field=field,
+            payload_present=present,
+        )
+
+    def _wait_collection_ready(
+        self,
+        name: str,
+        *,
+        payload_field: str | None = None,
+        payload_present: bool = True,
+    ) -> None:
+        deadline = time.monotonic() + self._client.timeout_seconds
+        while True:
+            response = self._client.request("GET", self._path(name))
+            result = self._result(response)
+            if not isinstance(result, dict):
+                raise QdrantError("Qdrant collection readiness response is malformed")
+            status = result.get("status")
+            optimizer_status = result.get("optimizer_status")
+            if not isinstance(status, str) or not isinstance(optimizer_status, (str, dict)):
+                raise QdrantError("Qdrant collection readiness response is malformed")
+            normalized_status = status.strip().lower()
+            if normalized_status in {"red", "error", "failed"} or isinstance(
+                optimizer_status, dict
+            ):
+                raise QdrantError(f"Qdrant collection {name!r} is not ready")
+            normalized_optimizer = optimizer_status.strip().lower()
+            if normalized_optimizer in {"red", "error", "failed"}:
+                raise QdrantError(f"Qdrant collection {name!r} is not ready")
+            payload_ready = True
+            if payload_field is not None:
+                payload_schema = result.get("payload_schema")
+                if not isinstance(payload_schema, dict):
+                    raise QdrantError("Qdrant collection response has no payload_schema")
+                payload_ready = (payload_field in payload_schema) is payload_present
+            if (
+                normalized_status == "green"
+                and normalized_optimizer == "ok"
+                and not any(
+                    self._pending_work(result[field])
+                    for field in ("update_queue", "deferred")
+                    if field in result
+                )
+                and payload_ready
+            ):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if payload_field is not None:
+                    state = "visible" if payload_present else "absent"
+                    raise QdrantError(
+                        f"Qdrant payload index {payload_field!r} did not become {state}"
+                    )
+                raise QdrantError(f"Qdrant collection {name!r} did not become ready")
+            time.sleep(min(0.1, remaining))
+
+    @staticmethod
+    def _pending_work(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value > 0
+        if isinstance(value, dict):
+            return any(QdrantCollection._pending_work(item) for item in value.values())
+        if isinstance(value, (list, tuple, set)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() not in {
+                "",
+                "0",
+                "false",
+                "none",
+                "ok",
+                "complete",
+                "completed",
+            }
+        return True
 
     def _path(self, name: str, suffix: str = "") -> str:
         return f"/collections/{quote(name, safe='')}{suffix}"
@@ -131,13 +262,17 @@ class QdrantCollection(ICollection):
             if self._sparse_enabled:
                 body["sparse_vectors"] = {self._sparse_vector_name: {}}
         try:
-            self._client.request("PUT", self._path(name), body, params={"wait": "true"})
+            self._client.request(
+                "PUT",
+                self._path(name),
+                body,
+                params={"timeout": self._timeout_param()},
+            )
+            self._wait_collection_ready(name)
         except QdrantError as exc:
             if exc.status != 409:
                 raise
-            raise RuntimeError(
-                f"Qdrant collection {name!r} appeared during creation"
-            ) from exc
+            raise RuntimeError(f"Qdrant collection {name!r} appeared during creation") from exc
 
     def create_remote_collection(self, metadata: dict[str, Any]) -> None:
         self._schema = dict(metadata)
@@ -163,27 +298,27 @@ class QdrantCollection(ICollection):
         self._create_collection(self._collection_name)
         self._create_collection(self._metadata_collection_name, metadata=True)
         self._migration_marker_fields = {}
+        self._marker_loaded_from_remote = False
         self._write_metadata_marker()
 
     def has_openviking_metadata(self) -> bool:
         payload = self._load_metadata_marker()
-        setup_complete = payload.get("setup_complete", True) if payload else None
-        return bool(
-            payload
-            and isinstance(setup_complete, bool)
-            and setup_complete
-            and payload.get("_openviking_meta_version") == _META_VERSION
-            and payload.get("collection_name") == self._collection_name
-            and isinstance(payload.get("schema"), dict)
-        )
+        if not payload:
+            return False
+        try:
+            self._validate_marker_binding(payload)
+        except RuntimeError:
+            return False
+        return True
 
     def _metadata_payload(self) -> dict[str, Any]:
         if self._migration_marker_fields is None:
             self._load_metadata_marker()
-        return {
+        payload = {
             **(self._migration_marker_fields or {}),
             "_openviking_meta_version": _META_VERSION,
             "collection_name": self._collection_name,
+            "metadata_collection_name": self._metadata_collection_name,
             "schema": self._schema,
             "dense_vector_name": self._dense_vector_name,
             "sparse_vector_name": self._sparse_vector_name,
@@ -193,8 +328,23 @@ class QdrantCollection(ICollection):
             "sparse_weight": self._sparse_weight,
             "indexes": self._indexes,
         }
+        if self._logical_collection is not None:
+            payload["logical_collection"] = self._logical_collection
+        if self._is_migration_marker(payload):
+            payload["vector_dimension"] = self._vector_dim
+        return payload
 
     def _write_metadata_marker(self) -> None:
+        if self._marker_loaded_from_remote:
+            marker = self._load_metadata_marker()
+            if marker is None:
+                raise RuntimeError(
+                    f"Qdrant metadata marker disappeared for {self._collection_name!r}"
+                )
+            self._validate_marker_binding(marker)
+            self._migration_marker_fields = {
+                name: value for name, value in marker.items() if name not in _ADAPTER_MARKER_FIELDS
+            }
         self._upsert_points(
             self._metadata_collection_name,
             [
@@ -205,8 +355,10 @@ class QdrantCollection(ICollection):
                 }
             ],
         )
+        self._marker_loaded_from_remote = True
 
     def _load_metadata_marker(self) -> dict[str, Any] | None:
+        self._marker_loaded_from_remote = True
         if not self._exists(self._metadata_collection_name):
             self._migration_marker_fields = {}
             return None
@@ -223,11 +375,127 @@ class QdrantCollection(ICollection):
             self._migration_marker_fields = {}
             return None
         self._migration_marker_fields = {
-            name: value
-            for name, value in payload.items()
-            if name not in _ADAPTER_MARKER_FIELDS
+            name: value for name, value in payload.items() if name not in _ADAPTER_MARKER_FIELDS
         }
         return payload
+
+    @staticmethod
+    def _is_migration_marker(marker: dict[str, Any]) -> bool:
+        return any(name in marker for name in _MIGRATION_MARKER_FIELDS)
+
+    def _validate_marker_binding(self, marker: dict[str, Any]) -> None:
+        if marker.get("_openviking_meta_version") != _META_VERSION:
+            raise RuntimeError(
+                f"Qdrant collection {self._collection_name!r} has no valid current marker"
+            )
+        migration_marker = self._is_migration_marker(marker)
+        setup_complete = marker.get("setup_complete", True)
+        if migration_marker and "setup_complete" not in marker:
+            raise RuntimeError(
+                f"Qdrant collection {self._collection_name!r} has no setup_complete flag"
+            )
+        if not isinstance(setup_complete, bool):
+            raise RuntimeError(
+                f"Qdrant collection {self._collection_name!r} has an invalid setup_complete flag"
+            )
+        migration_state = marker.get("migration_state")
+        if migration_marker and migration_state is not None:
+            expected_setup = (
+                _MIGRATION_STATE_SETUP.get(migration_state)
+                if isinstance(migration_state, str)
+                else None
+            )
+            if expected_setup is None:
+                raise RuntimeError(
+                    f"Qdrant migration marker has an invalid migration state: {migration_state!r}"
+                )
+            if setup_complete is not expected_setup:
+                raise RuntimeError(
+                    "Qdrant migration marker migration_state and setup_complete disagree"
+                )
+        if not setup_complete:
+            raise RuntimeError(
+                f"Qdrant collection {self._collection_name!r} has an incomplete migration"
+            )
+        if marker.get("migration_state") == "rolled_back":
+            raise RuntimeError(f"Qdrant collection {self._collection_name!r} has been rolled back")
+        if marker.get("collection_name") != self._collection_name:
+            raise RuntimeError(
+                f"Qdrant metadata collection does not belong to {self._collection_name!r}"
+            )
+        if (
+            "metadata_collection_name" in marker
+            and marker["metadata_collection_name"] != self._metadata_collection_name
+        ):
+            raise RuntimeError("Qdrant metadata marker is bound to a different metadata collection")
+        logical_collection = marker.get("logical_collection")
+        if migration_marker and (
+            self._logical_collection is None or logical_collection != self._logical_collection
+        ):
+            raise RuntimeError(
+                "Qdrant migration marker is missing or bound to a different logical collection"
+            )
+        if (
+            logical_collection is not None
+            and self._logical_collection is not None
+            and logical_collection != self._logical_collection
+        ):
+            raise RuntimeError("Qdrant metadata marker is bound to a different logical collection")
+        schema = marker.get("schema")
+        if not isinstance(schema, dict):
+            raise RuntimeError(
+                f"Qdrant collection {self._collection_name!r} has no metadata schema"
+            )
+
+        marker_vector_dim = marker.get("vector_dim")
+        if marker_vector_dim is not None and (
+            isinstance(marker_vector_dim, bool)
+            or not isinstance(marker_vector_dim, int)
+            or marker_vector_dim <= 0
+        ):
+            raise RuntimeError("Qdrant metadata marker has an invalid vector dimension")
+        marker_vector_dimension = marker.get("vector_dimension")
+        if marker_vector_dimension is not None and (
+            isinstance(marker_vector_dimension, bool)
+            or not isinstance(marker_vector_dimension, int)
+            or marker_vector_dimension <= 0
+        ):
+            raise RuntimeError("Qdrant metadata marker has an invalid vector_dimension")
+        if marker_vector_dimension is not None and marker_vector_dimension != marker_vector_dim:
+            raise RuntimeError("Qdrant metadata marker vector_dimension does not match vector_dim")
+        if not migration_marker:
+            return
+        if marker_vector_dim is not None and self._vector_dim > 0:
+            if marker_vector_dim != self._vector_dim:
+                raise RuntimeError(
+                    "Qdrant migration marker vector dimension differs from configured dimension"
+                )
+        if "dense_vector_name" in marker and marker["dense_vector_name"] != self._dense_vector_name:
+            raise RuntimeError("Qdrant migration marker dense vector name differs")
+        if (
+            "sparse_vector_name" in marker
+            and marker["sparse_vector_name"] != self._sparse_vector_name
+        ):
+            raise RuntimeError("Qdrant migration marker sparse vector name differs")
+        if "distance" in marker:
+            try:
+                marker_distance = self._normalize_distance(marker["distance"])
+            except ValueError as exc:
+                raise RuntimeError("Qdrant migration marker has an invalid distance") from exc
+            if marker_distance != self._distance:
+                raise RuntimeError("Qdrant migration marker distance differs")
+        if "sparse_enabled" in marker:
+            if not isinstance(marker["sparse_enabled"], bool):
+                raise RuntimeError("Qdrant migration marker sparse policy is invalid")
+            if marker["sparse_enabled"] != self._sparse_enabled:
+                raise RuntimeError("Qdrant migration marker sparse policy differs")
+        if "sparse_weight" in marker:
+            try:
+                marker_weight = float(marker["sparse_weight"])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("Qdrant migration marker sparse weight is invalid") from exc
+            if not math.isclose(marker_weight, self._sparse_weight):
+                raise RuntimeError("Qdrant migration marker sparse weight differs")
 
     def _ensure_loaded(self) -> None:
         if self._schema:
@@ -237,27 +505,11 @@ class QdrantCollection(ICollection):
             raise RuntimeError(
                 f"Qdrant collection {self._collection_name!r} is missing OpenViking metadata"
             )
-        setup_complete = marker.get("setup_complete", True)
-        if not isinstance(setup_complete, bool):
-            raise RuntimeError(
-                f"Qdrant collection {self._collection_name!r} has an invalid setup_complete flag"
-            )
-        if not setup_complete:
-            raise RuntimeError(
-                f"Qdrant collection {self._collection_name!r} has an incomplete migration"
-            )
-        if marker.get("collection_name") != self._collection_name:
-            raise RuntimeError(
-                f"Qdrant metadata collection does not belong to {self._collection_name!r}"
-            )
+        self._validate_marker_binding(marker)
         self._schema = dict(marker["schema"])
         self._vector_dim = int(marker.get("vector_dim") or self._vector_dim)
-        self._dense_vector_name = str(
-            marker.get("dense_vector_name") or self._dense_vector_name
-        )
-        self._sparse_vector_name = str(
-            marker.get("sparse_vector_name") or self._sparse_vector_name
-        )
+        self._dense_vector_name = str(marker.get("dense_vector_name") or self._dense_vector_name)
+        self._sparse_vector_name = str(marker.get("sparse_vector_name") or self._sparse_vector_name)
         self._distance = str(marker.get("distance") or self._distance)
         self._sparse_enabled = bool(marker.get("sparse_enabled", self._sparse_enabled))
         if "sparse_weight" in marker:
@@ -311,7 +563,11 @@ class QdrantCollection(ICollection):
     def drop(self):
         for name in (self._collection_name, self._metadata_collection_name):
             if self._exists(name):
-                self._client.request("DELETE", self._path(name), params={"timeout": 30})
+                self._client.request(
+                    "DELETE",
+                    self._path(name),
+                    params={"timeout": self._timeout_param()},
+                )
         self._schema.clear()
         return True
 
@@ -333,25 +589,25 @@ class QdrantCollection(ICollection):
         for field in dict.fromkeys(scalar_fields):
             body = {
                 "field_name": field,
-                "field_schema": (
-                    "integer" if field == "uri_depth" else self._field_schema(field)
-                ),
+                "field_schema": ("integer" if field == "uri_depth" else self._field_schema(field)),
             }
             try:
-                self._client.request(
+                response = self._client.request(
                     "PUT",
                     self._path(self._collection_name, "/index"),
                     body,
                     params={"wait": "true"},
                 )
+                self._require_completed(response, f"index creation for {field!r}")
             except QdrantError as exc:
                 if exc.status != 409:
                     raise
+            self._wait_payload_index(field, present=True)
 
     def _delete_remote_indexes(self, fields: list[str]) -> None:
         for field in dict.fromkeys(fields):
             try:
-                self._client.request(
+                response = self._client.request(
                     "DELETE",
                     self._path(
                         self._collection_name,
@@ -359,9 +615,11 @@ class QdrantCollection(ICollection):
                     ),
                     params={"wait": "true"},
                 )
+                self._require_completed(response, f"index deletion for {field!r}")
             except QdrantError as exc:
                 if exc.status != 404:
                     raise
+            self._wait_payload_index(field, present=False)
 
     def create_index(self, index_name: str, meta_data: dict[str, Any]):
         self._ensure_remote_indexes(meta_data)
@@ -456,12 +714,13 @@ class QdrantCollection(ICollection):
         return True
 
     def _upsert_points(self, collection_name: str, points: list[dict[str, Any]]) -> None:
-        self._client.request(
+        response = self._client.request(
             "PUT",
             self._path(collection_name, "/points"),
             {"points": points},
-            params={"wait": "true"},
+            params=self._strong_point_params(),
         )
+        self._require_completed(response, "point upsert")
 
     def _retrieve_points(
         self,
@@ -560,14 +819,16 @@ class QdrantCollection(ICollection):
         del ttl
         if not data_list:
             return {"status": "ok"}
-        self._upsert_points(self._collection_name, [self._point_from_record(item) for item in data_list])
+        self._upsert_points(
+            self._collection_name, [self._point_from_record(item) for item in data_list]
+        )
         return {"status": "ok"}
 
     def _payload_to_record(self, point: dict[str, Any]) -> dict[str, Any]:
         payload = dict(point.get("payload") or {})
         original_id = payload.pop("_openviking_original_id", None)
         if original_id is None:
-            original_id = point.get("id")
+            raise ValueError("Qdrant payload is missing _openviking_original_id")
         for field in _INTERNAL_PAYLOAD_FIELDS:
             payload.pop(field, None)
         payload["id"] = original_id
@@ -658,21 +919,23 @@ class QdrantCollection(ICollection):
     def delete_data(self, primary_keys: list[Any]):
         if not primary_keys:
             return {"status": "ok"}
-        self._client.request(
+        response = self._client.request(
             "POST",
             self._path(self._collection_name, "/points/delete"),
             {"points": [to_qdrant_point_id(value) for value in primary_keys]},
-            params={"wait": "true"},
+            params=self._strong_point_params(),
         )
+        self._require_completed(response, "point deletion")
         return {"status": "ok"}
 
     def delete_all_data(self):
-        self._client.request(
+        response = self._client.request(
             "POST",
             self._path(self._collection_name, "/points/delete"),
             {"filter": {}},
-            params={"wait": "true"},
+            params=self._strong_point_params(),
         )
+        self._require_completed(response, "point deletion")
         return True
 
     def aggregate_data(
@@ -864,7 +1127,9 @@ class QdrantCollection(ICollection):
         filters: dict[str, Any] | None = None,
         output_fields: list[str] | None = None,
     ) -> SearchResult:
-        points = self._retrieve_points(self._collection_name, [to_qdrant_point_id(id)], with_vectors=True)
+        points = self._retrieve_points(
+            self._collection_name, [to_qdrant_point_id(id)], with_vectors=True
+        )
         if not points:
             return SearchResult()
         record = self._vectors_to_record(points[0])
@@ -982,8 +1247,7 @@ class QdrantCollection(ICollection):
         }
         if len(terms) > 1:
             raise ValueError(
-                "sparse term index collision: "
-                f"index={index} existing_terms={sorted(terms)!r}"
+                f"sparse term index collision: index={index} existing_terms={sorted(terms)!r}"
             )
         return next(iter(terms), None)
 

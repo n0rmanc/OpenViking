@@ -267,7 +267,9 @@ collection，不新增 `qdrant-client` 依赖：
         "api_key": "optional-key",
         "dense_vector_name": "vector",
         "sparse_vector_name": "sparse_vector",
-        "timeout_seconds": 10
+        "timeout_seconds": 10,
+        "data_collection_name": "default__context__generation",
+        "metadata_collection_name": "default__context__generation__openviking_meta"
       }
     }
   }
@@ -284,6 +286,23 @@ collection，不新增 `qdrant-client` 依赖：
   与多 `search_tags` AND 语义会保留。
 - `Contains` 与 Qdrant content grep 不支持；`USE_CONTENT_FIELD=False`，grep
   继续走 filesystem fallback。
+- `data_collection_name` 与 `metadata_collection_name` 是 current-format target
+  的 physical collection 名称，不是 alias；两者必须互异且不能与 legacy
+  source pair 冲突。省略时沿用 project/name 推导和现有 sidecar fallback。
+- 在线迁移的 `logical_collection`、`migration_id`、`timeout_seconds` 和
+  target pair 会写入并校验 marker；缺少 required identity、foreign marker 或
+  legacy marker 都会 fail closed。`migrator_version` 由代码固定，不自动升级
+  未发布的中间 marker schema。
+- 迁移流程为
+  `preflight -> prepare -> backfill -> reconcile -> verify`。online copy 不冻结
+  整个长窗口，只在 cutover 前由 operator 获取 barrier、drain in-flight writes，
+  再以 `cutover --confirm --lock-held --barrier-held --plan /path/to/plan.json --deployment-hooks /path/to/hooks.json`
+  完成 rollout/readiness/read-only smoke。
+  operator 也负责明确 release barrier。
+- `--allow-acl-fail-open` 只记录并警告 incomplete ACL，绝不伪造保护；barrier
+  release 后若 target 已接受 current-format writes，rollback 必须另做 reverse
+  migration。`retire --confirm` 仅在 retention window 后、target 未被 serving 时
+  使用，且 data 先于 metadata 删除。
 - 可用 `QDRANT_URL`（以及可选的 `QDRANT_API_KEY`）运行 live coverage：
 
 ```bash

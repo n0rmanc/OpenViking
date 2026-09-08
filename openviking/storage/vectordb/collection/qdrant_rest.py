@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -29,6 +30,20 @@ class QdrantError(RuntimeError):
         self.status = status
 
 
+def _validate_timeout_seconds(value: Any) -> float:
+    if isinstance(value, bool):
+        raise ValueError("Qdrant timeout_seconds must be a finite number greater than zero")
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Qdrant timeout_seconds must be a finite number greater than zero"
+        ) from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("Qdrant timeout_seconds must be a finite number greater than zero")
+    return timeout
+
+
 class QdrantRestClient:
     """Minimal JSON REST transport with injectable opener for tests."""
 
@@ -45,12 +60,16 @@ class QdrantRestClient:
             raise ValueError("Qdrant URL must not be empty")
         self._base_url = normalized
         self._api_key = api_key
-        self._timeout_seconds = float(timeout_seconds)
+        self._timeout_seconds = _validate_timeout_seconds(timeout_seconds)
         self._opener = opener or urlopen
 
     @property
     def base_url(self) -> str:
         return self._base_url
+
+    @property
+    def timeout_seconds(self) -> float:
+        return self._timeout_seconds
 
     def request(
         self,
