@@ -3670,6 +3670,17 @@ class QdrantMigration:
             allow_acl_fail_open=allow_acl_fail_open,
             lock_held=lock_held,
         )
+        # prepare may return a snapshot that became ready before the first
+        # source point is copied. Re-read the owned marker and enforce the
+        # mutable prepare-state contract at the copy boundary.
+        marker_incomplete = self._load_current_marker()
+        if marker_incomplete is None:
+            raise MigrationError("target marker disappeared before copy")
+        self._validate_owned_prepare_marker(
+            marker=marker_incomplete,
+            layout=layout,
+            metadata=metadata,
+        )
         self._assert_marker_fingerprints(marker_incomplete, plan)
         marker_complete = dict(marker_incomplete)
         marker_complete["setup_complete"] = True

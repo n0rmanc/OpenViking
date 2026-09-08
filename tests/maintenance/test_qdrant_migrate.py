@@ -1589,6 +1589,35 @@ def test_apply_rejects_ready_target_before_copy() -> None:
     )
 
 
+def test_apply_rechecks_marker_state_after_prepare_before_copy(monkeypatch) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    plan = migration.preflight()
+    original_prepare = migration.prepare
+
+    def prepare_then_ready(**kwargs):
+        marker = original_prepare(**kwargs)
+        migration._transition("ready")
+        return marker
+
+    monkeypatch.setattr(migration, "prepare", prepare_then_ready)
+
+    with pytest.raises(MigrationError, match="ready"):
+        migration.apply(
+            confirm=True,
+            plan=plan,
+            allow_acl_fail_open=True,
+            lock_held=True,
+        )
+
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    assert marker["migration_state"] == "ready"
+    assert marker["setup_complete"] is True
+    assert qdrant.collections[migration.target_collection]["points"] == {}
+
+
 def test_existing_target_rejects_changed_source_field_type() -> None:
     qdrant = _legacy_fixture(sparse=False)
     migration = _migration(qdrant)
