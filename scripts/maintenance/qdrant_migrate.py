@@ -26,6 +26,7 @@ import math
 import os
 import re
 import sys
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -43,6 +44,7 @@ from openviking.storage.acl import DirectAcl  # noqa: E402
 from openviking.storage.vectordb.collection.qdrant_rest import (  # noqa: E402
     QdrantError,
     QdrantRestClient,
+    _validate_timeout_seconds,
 )
 from openviking.storage.vectordb.qdrant_sparse import (  # noqa: E402
     stable_sparse_index,
@@ -70,6 +72,7 @@ _LEGACY_UINT64_MAX = 2**64 - 1
 _QDRANT_SPARSE_INDEX_MAX = 0x7FFF_FFFF
 _QDRANT_ID_NAMESPACE = uuid.UUID("4b6bb5a8-7f1f-5b1a-9d4c-b93f29b1d67c")
 _INTEGER_RE = re.compile(r"^[+-]?[0-9]+$")
+_QDRANT_VERSION_FLOOR = (1, 10, 0)
 
 
 def _legacy_collection_metadata_id(collection_key: str) -> str:
@@ -564,8 +567,20 @@ class QdrantMigration:
         dense_vector_name: str | None = None,
         sparse_vector_name: str | None = None,
         sparse_map: Mapping[Any, Any] | None = None,
+        timeout_seconds: float = 10.0,
     ) -> None:
         self._client = client
+        self.timeout_seconds = _validate_timeout_seconds(timeout_seconds)
+        client_timeout = getattr(client, "timeout_seconds", None)
+        if client_timeout is not None and not math.isclose(
+            _validate_timeout_seconds(client_timeout),
+            self.timeout_seconds,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                "Qdrant client timeout_seconds must match migration timeout_seconds"
+            )
         self.source_collection = self._name(source_collection, "source collection")
         self.target_collection = self._name(target_collection, "target collection")
         if self.source_collection == self.target_collection:
@@ -615,6 +630,9 @@ class QdrantMigration:
     def _path(self, collection: str, suffix: str = "") -> str:
         return f"/collections/{quote(collection, safe='')}{suffix}"
 
+    def _timeout_param(self) -> int:
+        return max(1, math.ceil(self.timeout_seconds))
+
     def _request(
         self,
         method: str,
@@ -622,11 +640,126 @@ class QdrantMigration:
         body: dict[str, Any] | None = None,
         *,
         params: dict[str, Any] | None = None,
+        mutation: bool = False,
     ) -> dict[str, Any]:
-        response = self._client.request(method, path, body, params=params)
+        method = method.upper()
+        request_params = dict(params or {})
+        endpoint = path.rstrip("/")
+        requires_completed = False
+        if mutation:
+            if (
+                (method == "PUT" and endpoint.endswith("/points"))
+                or (method == "POST" and endpoint.endswith("/points/delete"))
+            ):
+                request_params.update({"wait": "true", "ordering": "strong"})
+                requires_completed = True
+            elif "/index" in endpoint:
+                request_params.update({"wait": "true", "timeout": self._timeout_param()})
+                requires_completed = True
+            elif endpoint.startswith("/collections/") and endpoint.count("/") == 2:
+                request_params.pop("wait", None)
+                request_params.pop("ordering", None)
+                request_params["timeout"] = self._timeout_param()
+        response = self._client.request(method, path, body, params=request_params or None)
         if not isinstance(response, dict):
             raise MigrationError(f"Qdrant returned a non-object response for {method} {path}")
+        if requires_completed:
+            result = response.get("result")
+            if not isinstance(result, Mapping) or result.get("status") != "completed":
+                raise MigrationError(f"Qdrant {method} {path} did not complete")
         return response
+
+    def _assert_strong_ordering_support(self) -> None:
+        response = self._request("GET", "/")
+        value = _result(response)
+        version = value.get("version") if isinstance(value, Mapping) else None
+        if not isinstance(version, str):
+            raise MigrationError("Qdrant version is missing from the root response")
+        match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?", version.strip())
+        if match is None:
+            raise MigrationError(f"Qdrant version is unparseable: {version!r}")
+        parsed = tuple(int(part) for part in match.groups())
+        if parsed < _QDRANT_VERSION_FLOOR:
+            floor = ".".join(map(str, _QDRANT_VERSION_FLOOR))
+            raise MigrationError(
+                f"Qdrant version {version!r} does not support the required "
+                f"strong ordering contract (minimum {floor})"
+            )
+
+    @staticmethod
+    def _pending_work(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value > 0
+        if isinstance(value, Mapping):
+            return any(QdrantMigration._pending_work(item) for item in value.values())
+        if isinstance(value, (list, tuple, set)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() not in {"", "0", "false", "none", "ok", "complete", "completed"}
+        return True
+
+    def _wait_collection_ready(
+        self,
+        collection: str,
+        *,
+        payload_fields: set[str] | None = None,
+    ) -> None:
+        deadline = time.monotonic() + self.timeout_seconds
+        while True:
+            info = self._collection_info(collection)
+            status = info.get("status")
+            optimizer_status = info.get("optimizer_status")
+            if not isinstance(status, str) or not isinstance(optimizer_status, (str, Mapping)):
+                raise MigrationError(f"Qdrant collection readiness response is malformed for {collection}")
+            normalized_status = status.strip().lower()
+            if normalized_status in {"red", "error", "failed"}:
+                raise MigrationError(f"Qdrant collection {collection} is not ready: {status}")
+            if isinstance(optimizer_status, Mapping):
+                raise MigrationError(
+                    f"Qdrant collection {collection} optimizer reported an error"
+                )
+            normalized_optimizer = optimizer_status.strip().lower()
+            if normalized_optimizer in {"red", "error", "failed"}:
+                raise MigrationError(
+                    f"Qdrant collection {collection} optimizer is not ready: {optimizer_status}"
+                )
+            pending = any(
+                self._pending_work(info[name])
+                for name in ("update_queue", "deferred")
+                if name in info
+            )
+            payload_schema = info.get("payload_schema")
+            indexes_visible = payload_fields is None or (
+                isinstance(payload_schema, Mapping)
+                and payload_fields <= set(payload_schema)
+            )
+            if (
+                normalized_status == "green"
+                and normalized_optimizer == "ok"
+                and not pending
+                and indexes_visible
+            ):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if payload_fields is not None:
+                    visible = (
+                        set(payload_schema)
+                        if isinstance(payload_schema, Mapping)
+                        else set()
+                    )
+                    missing = sorted(payload_fields - visible)
+                    if missing:
+                        raise MigrationError(
+                            "target collection is missing payload index: "
+                            f"{missing!r}"
+                        )
+                raise MigrationError(f"Qdrant collection {collection} did not become ready")
+            time.sleep(min(0.1, remaining))
 
     def _exists(self, collection: str) -> bool:
         try:
@@ -805,6 +938,7 @@ class QdrantMigration:
                 "POST",
                 self._path(collection, "/points/scroll"),
                 body,
+                params={"consistency": "all"},
             )
             value = _result(response)
             if not isinstance(value, Mapping):
@@ -843,6 +977,7 @@ class QdrantMigration:
                 "with_payload": True,
                 "with_vector": with_vectors,
             },
+            params={"consistency": "all"},
         )
         value = _result(response)
         if not isinstance(value, list):
@@ -1847,6 +1982,7 @@ class QdrantMigration:
     def preflight(self) -> MigrationPlan:
         """Read and validate source/target state without mutating Qdrant."""
 
+        self._assert_strong_ordering_support()
         if not self._exists(self.source_collection):
             raise MigrationError(f"source collection does not exist: {self.source_collection}")
         source_info = self._collection_info(self.source_collection)
@@ -1974,7 +2110,12 @@ class QdrantMigration:
 
     def _create_collection(self, name: str, body: dict[str, Any]) -> None:
         try:
-            self._request("PUT", self._path(name), body, params={"wait": "true"})
+            self._request(
+                "PUT",
+                self._path(name),
+                body,
+                mutation=True,
+            )
         except Exception as exc:
             if _status(exc) == 409:
                 raise MigrationError(
@@ -1984,7 +2125,11 @@ class QdrantMigration:
 
     def _delete_collection(self, name: str) -> None:
         try:
-            self._request("DELETE", self._path(name), params={"timeout": 30})
+            self._request(
+                "DELETE",
+                self._path(name),
+                mutation=True,
+            )
         except Exception as exc:
             if _status(exc) != 404:
                 raise
@@ -1996,7 +2141,7 @@ class QdrantMigration:
             "PUT",
             self._path(collection, "/points"),
             {"points": points},
-            params={"wait": "true"},
+            mutation=True,
         )
 
     def _write_marker(self, marker: Mapping[str, Any]) -> None:
@@ -2021,11 +2166,15 @@ class QdrantMigration:
                         "field_name": field_name,
                         "field_schema": field_schema,
                     },
-                    params={"wait": "true"},
+                    mutation=True,
                 )
             except Exception as exc:
                 if _status(exc) != 409:
                     raise
+        self._wait_collection_ready(
+            self.target_collection,
+            payload_fields=set(self._expected_payload_indexes(schema, indexes)),
+        )
         self._validate_payload_indexes(schema, indexes)
 
     def _write_sparse_dictionary(self, terms: set[str]) -> None:
@@ -2462,6 +2611,7 @@ class QdrantMigration:
                     {"vectors": {_META_VECTOR_NAME: {"size": 1, "distance": "Dot"}}},
                 )
                 metadata_created = True
+                self._wait_collection_ready(self.target_metadata_collection)
                 # Reserve the target before creating its data collection. If
                 # setup stops here, a later apply can resume from this
                 # migration-owned incomplete marker.
@@ -2511,11 +2661,15 @@ class QdrantMigration:
                     },
                 )
                 target_created = True
+                self._wait_collection_ready(self.target_collection)
                 if not marker_written:
                     self._write_marker(marker_incomplete)
                     marker_written = True
                 self._write_indexes(index_schema, index_metadata)
                 self._write_sparse_dictionary(source.sparse_terms)
+
+            self._wait_collection_ready(self.target_collection)
+            self._wait_collection_ready(self.target_metadata_collection)
 
             migrated = 0
             skipped = 0
@@ -2544,6 +2698,7 @@ class QdrantMigration:
                 raise MigrationError(
                     "legacy metadata changed during apply; rerun preflight with writes frozen"
                 )
+            self._wait_collection_ready(self.target_collection)
             target_count = self._validate_final_target(
                 source=source,
                 schema=metadata.schema,
@@ -2778,6 +2933,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-metadata-collection")
     parser.add_argument("--target-metadata-collection")
     parser.add_argument("--batch-size", type=int, default=100)
+    parser.add_argument("--timeout-seconds", type=float, default=10.0)
     parser.add_argument("--dense-vector-name")
     parser.add_argument("--sparse-vector-name")
     parser.add_argument(
@@ -2812,7 +2968,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         sparse_map = _load_sparse_map(args.sparse_map)
-        client = QdrantRestClient(args.url, api_key=args.api_key)
+        client = QdrantRestClient(
+            args.url,
+            api_key=args.api_key,
+            timeout_seconds=args.timeout_seconds,
+        )
         migration = QdrantMigration(
             client=client,
             source_collection=args.source_collection,
@@ -2823,6 +2983,7 @@ def main(argv: list[str] | None = None) -> int:
             dense_vector_name=args.dense_vector_name,
             sparse_vector_name=args.sparse_vector_name,
             sparse_map=sparse_map,
+            timeout_seconds=args.timeout_seconds,
         )
         if args.command == "preflight":
             print(json.dumps(migration.preflight().to_dict(), sort_keys=True))

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -123,6 +124,96 @@ class QdrantCollection(ICollection):
     def _result(response: dict[str, Any]) -> Any:
         return response.get("result", response)
 
+    @staticmethod
+    def _require_completed(response: dict[str, Any], operation: str) -> None:
+        result = response.get("result")
+        if not isinstance(result, dict) or result.get("status") != "completed":
+            raise QdrantError(f"Qdrant {operation} did not complete")
+
+    def _timeout_param(self) -> int:
+        return max(1, math.ceil(self._client.timeout_seconds))
+
+    @staticmethod
+    def _strong_point_params() -> dict[str, str]:
+        return {"wait": "true", "ordering": "strong"}
+
+    def _wait_payload_index(self, field: str, *, present: bool) -> None:
+        deadline = time.monotonic() + self._client.timeout_seconds
+        while True:
+            response = self._client.request(
+                "GET",
+                self._path(self._collection_name),
+            )
+            result = self._result(response)
+            if not isinstance(result, dict):
+                raise QdrantError("Qdrant collection readiness response is malformed")
+            payload_schema = result.get("payload_schema")
+            if not isinstance(payload_schema, dict):
+                raise QdrantError("Qdrant collection response has no payload_schema")
+            if (field in payload_schema) is present:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                state = "visible" if present else "absent"
+                raise QdrantError(
+                    f"Qdrant payload index {field!r} did not become {state}"
+                )
+            time.sleep(min(0.1, remaining))
+
+    def _wait_collection_ready(self, name: str) -> None:
+        deadline = time.monotonic() + self._client.timeout_seconds
+        while True:
+            response = self._client.request("GET", self._path(name))
+            result = self._result(response)
+            if not isinstance(result, dict):
+                raise QdrantError("Qdrant collection readiness response is malformed")
+            status = result.get("status")
+            optimizer_status = result.get("optimizer_status")
+            if not isinstance(status, str) or not isinstance(optimizer_status, (str, dict)):
+                raise QdrantError("Qdrant collection readiness response is malformed")
+            if status.lower() in {"red", "error", "failed"} or isinstance(
+                optimizer_status, dict
+            ):
+                raise QdrantError(f"Qdrant collection {name!r} is not ready")
+            if (
+                status.lower() == "green"
+                and optimizer_status.lower() == "ok"
+                and not any(
+                    self._pending_work(result[field])
+                    for field in ("update_queue", "deferred")
+                    if field in result
+                )
+            ):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise QdrantError(f"Qdrant collection {name!r} did not become ready")
+            time.sleep(min(0.1, remaining))
+
+    @staticmethod
+    def _pending_work(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value > 0
+        if isinstance(value, dict):
+            return any(QdrantCollection._pending_work(item) for item in value.values())
+        if isinstance(value, (list, tuple, set)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() not in {
+                "",
+                "0",
+                "false",
+                "none",
+                "ok",
+                "complete",
+                "completed",
+            }
+        return True
+
     def _path(self, name: str, suffix: str = "") -> str:
         return f"/collections/{quote(name, safe='')}{suffix}"
 
@@ -159,7 +250,13 @@ class QdrantCollection(ICollection):
             if self._sparse_enabled:
                 body["sparse_vectors"] = {self._sparse_vector_name: {}}
         try:
-            self._client.request("PUT", self._path(name), body, params={"wait": "true"})
+            self._client.request(
+                "PUT",
+                self._path(name),
+                body,
+                params={"timeout": self._timeout_param()},
+            )
+            self._wait_collection_ready(name)
         except QdrantError as exc:
             if exc.status != 409:
                 raise
@@ -470,7 +567,11 @@ class QdrantCollection(ICollection):
     def drop(self):
         for name in (self._collection_name, self._metadata_collection_name):
             if self._exists(name):
-                self._client.request("DELETE", self._path(name), params={"timeout": 30})
+                self._client.request(
+                    "DELETE",
+                    self._path(name),
+                    params={"timeout": self._timeout_param()},
+                )
         self._schema.clear()
         return True
 
@@ -497,20 +598,22 @@ class QdrantCollection(ICollection):
                 ),
             }
             try:
-                self._client.request(
+                response = self._client.request(
                     "PUT",
                     self._path(self._collection_name, "/index"),
                     body,
                     params={"wait": "true"},
                 )
+                self._require_completed(response, f"index creation for {field!r}")
             except QdrantError as exc:
                 if exc.status != 409:
                     raise
+            self._wait_payload_index(field, present=True)
 
     def _delete_remote_indexes(self, fields: list[str]) -> None:
         for field in dict.fromkeys(fields):
             try:
-                self._client.request(
+                response = self._client.request(
                     "DELETE",
                     self._path(
                         self._collection_name,
@@ -518,9 +621,11 @@ class QdrantCollection(ICollection):
                     ),
                     params={"wait": "true"},
                 )
+                self._require_completed(response, f"index deletion for {field!r}")
             except QdrantError as exc:
                 if exc.status != 404:
                     raise
+            self._wait_payload_index(field, present=False)
 
     def create_index(self, index_name: str, meta_data: dict[str, Any]):
         self._ensure_remote_indexes(meta_data)
@@ -615,12 +720,13 @@ class QdrantCollection(ICollection):
         return True
 
     def _upsert_points(self, collection_name: str, points: list[dict[str, Any]]) -> None:
-        self._client.request(
+        response = self._client.request(
             "PUT",
             self._path(collection_name, "/points"),
             {"points": points},
-            params={"wait": "true"},
+            params=self._strong_point_params(),
         )
+        self._require_completed(response, "point upsert")
 
     def _retrieve_points(
         self,
@@ -817,21 +923,23 @@ class QdrantCollection(ICollection):
     def delete_data(self, primary_keys: list[Any]):
         if not primary_keys:
             return {"status": "ok"}
-        self._client.request(
+        response = self._client.request(
             "POST",
             self._path(self._collection_name, "/points/delete"),
             {"points": [to_qdrant_point_id(value) for value in primary_keys]},
-            params={"wait": "true"},
+            params=self._strong_point_params(),
         )
+        self._require_completed(response, "point deletion")
         return {"status": "ok"}
 
     def delete_all_data(self):
-        self._client.request(
+        response = self._client.request(
             "POST",
             self._path(self._collection_name, "/points/delete"),
             {"filter": {}},
-            params={"wait": "true"},
+            params=self._strong_point_params(),
         )
+        self._require_completed(response, "point deletion")
         return True
 
     def aggregate_data(

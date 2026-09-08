@@ -52,6 +52,7 @@ class _ScriptedTransport:
                 "method": request.method,
                 "url": request.full_url,
                 "body": body,
+                "params": dict(parse_qs(urlsplit(request.full_url).query)),
                 "timeout": timeout,
                 "headers": dict(request.header_items()),
             }
@@ -66,6 +67,30 @@ class _ScriptedTransport:
                 io.BytesIO(json.dumps(payload).encode("utf-8")),
             )
         return _Response(payload)
+
+
+def _index_request(requests):
+    remote_indexes: set[str] = set()
+
+    def request(method: str, path: str, body=None, *, params=None):
+        requests.append((method, path, body or {}, params or {}))
+        if method == "PUT" and path.endswith("/index"):
+            remote_indexes.add(str((body or {}).get("field_name")))
+            return {"result": {"status": "completed"}}
+        if method == "DELETE" and "/index/" in path:
+            remote_indexes.discard(path.rsplit("/", 1)[-1])
+            return {"result": {"status": "completed"}}
+        if method == "GET":
+            return {
+                "result": {
+                    "payload_schema": {
+                        field: {"data_type": "keyword"} for field in remote_indexes
+                    }
+                }
+            }
+        return {}
+
+    return request
 
 
 def test_path_payload_includes_self_and_ancestors() -> None:
@@ -447,11 +472,7 @@ async def test_update_collection_schema_creates_missing_qdrant_index() -> None:
     collection._write_metadata_marker = lambda: None  # type: ignore[method-assign]
     requests: list[tuple[str, str, dict[str, object], dict[str, object]]] = []
 
-    def request(method: str, path: str, body=None, *, params=None):
-        requests.append((method, path, body or {}, params or {}))
-        return {}
-
-    collection._client.request = request  # type: ignore[method-assign]
+    collection._client.request = _index_request(requests)  # type: ignore[method-assign]
     adapter = type(
         "_Adapter",
         (),
@@ -521,11 +542,7 @@ async def test_update_collection_schema_preserves_custom_qdrant_indexes() -> Non
     collection._write_metadata_marker = lambda: None  # type: ignore[method-assign]
     requests: list[tuple[str, str, dict[str, object], dict[str, object]]] = []
 
-    def request(method: str, path: str, body=None, *, params=None):
-        requests.append((method, path, body or {}, params or {}))
-        return {}
-
-    collection._client.request = request  # type: ignore[method-assign]
+    collection._client.request = _index_request(requests)  # type: ignore[method-assign]
     adapter = type(
         "_Adapter",
         (),
@@ -577,14 +594,10 @@ def test_drop_index_removes_remote_payload_indexes_and_metadata() -> None:
 
     requests: list[tuple[str, str, dict[str, object], dict[str, object]]] = []
 
-    def request(method: str, path: str, body=None, *, params=None):
-        requests.append((method, path, body or {}, params or {}))
-        return {}
-
-    collection._client.request = request  # type: ignore[method-assign]
+    collection._client.request = _index_request(requests)  # type: ignore[method-assign]
 
     assert collection.drop_index("default") is True
-    assert requests == [
+    assert [request for request in requests if request[0] != "GET"] == [
         (
             "DELETE",
             "/collections/docs/index/account_id",
@@ -627,14 +640,10 @@ def test_drop_index_keeps_shared_uri_indexes_for_remaining_indexes() -> None:
     collection._write_metadata_marker = lambda: None  # type: ignore[method-assign]
     requests: list[tuple[str, str, dict[str, object], dict[str, object]]] = []
 
-    def request(method: str, path: str, body=None, *, params=None):
-        requests.append((method, path, body or {}, params or {}))
-        return {}
-
-    collection._client.request = request  # type: ignore[method-assign]
+    collection._client.request = _index_request(requests)  # type: ignore[method-assign]
 
     assert collection.drop_index("one") is True
-    assert requests == [
+    assert [request for request in requests if request[0] != "GET"] == [
         (
             "DELETE",
             "/collections/docs/index/account_id",
@@ -660,11 +669,7 @@ def test_update_index_removes_remote_fields_removed_from_metadata() -> None:
     collection._write_metadata_marker = lambda: None  # type: ignore[method-assign]
     requests: list[tuple[str, str, dict[str, object], dict[str, object]]] = []
 
-    def request(method: str, path: str, body=None, *, params=None):
-        requests.append((method, path, body or {}, params or {}))
-        return {}
-
-    collection._client.request = request  # type: ignore[method-assign]
+    collection._client.request = _index_request(requests)  # type: ignore[method-assign]
 
     assert collection.update_index("default", scalar_index=["account_id"]) == {
         "ScalarIndex": ["account_id"]
@@ -694,11 +699,7 @@ def test_update_index_ignores_missing_indexes() -> None:
     )
     requests: list[tuple[str, str, dict[str, object], dict[str, object]]] = []
 
-    def request(method: str, path: str, body=None, *, params=None):
-        requests.append((method, path, body or {}, params or {}))
-        return {}
-
-    collection._client.request = request  # type: ignore[method-assign]
+    collection._client.request = _index_request(requests)  # type: ignore[method-assign]
     collection._write_metadata_marker = lambda: pytest.fail(  # type: ignore[method-assign]
         "missing index must not publish metadata"
     )
@@ -761,7 +762,7 @@ def test_drop_index_keeps_retryable_metadata_when_marker_write_fails() -> None:
             raise QdrantError("marker failed", status=503)
 
     collection._write_metadata_marker = write_marker  # type: ignore[method-assign]
-    collection._client.request = lambda *_args, **_kwargs: {}  # type: ignore[method-assign]
+    collection._client.request = _index_request([])  # type: ignore[method-assign]
 
     with pytest.raises(QdrantError, match="marker failed"):
         collection.drop_index("default")
@@ -794,7 +795,7 @@ def test_update_index_keeps_retryable_metadata_when_marker_write_fails() -> None
             raise QdrantError("marker failed", status=503)
 
     collection._write_metadata_marker = write_marker  # type: ignore[method-assign]
-    collection._client.request = lambda *_args, **_kwargs: {}  # type: ignore[method-assign]
+    collection._client.request = _index_request([])  # type: ignore[method-assign]
 
     with pytest.raises(QdrantError, match="marker failed"):
         collection.update_index("default", scalar_index=["account_id"])
@@ -832,7 +833,7 @@ def test_create_index_keeps_retryable_metadata_when_marker_write_fails() -> None
             raise QdrantError("marker failed", status=503)
 
     collection._write_metadata_marker = write_marker  # type: ignore[method-assign]
-    collection._client.request = lambda *_args, **_kwargs: {}  # type: ignore[method-assign]
+    collection._client.request = _index_request([])  # type: ignore[method-assign]
 
     with pytest.raises(QdrantError, match="marker failed"):
         collection.create_index("default", {"ScalarIndex": ["account_id"]})
@@ -959,13 +960,83 @@ def test_rest_client_sends_json_and_api_key() -> None:
     assert request["headers"]["Api-key"] == "secret"
 
 
+def test_rest_client_exposes_and_applies_timeout() -> None:
+    transport = _ScriptedTransport((200, {"result": True}))
+    client = QdrantRestClient(
+        "http://qdrant.local",
+        timeout_seconds=17,
+        opener=transport,
+    )
+
+    client.request("GET", "/collections/demo")
+
+    assert client.timeout_seconds == 17.0
+    assert transport.requests[0]["timeout"] == 17.0
+
+
+@pytest.mark.parametrize("timeout", [True, False, 0, -1, math.nan, math.inf])
+def test_rest_client_rejects_invalid_timeout(timeout: object) -> None:
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        QdrantRestClient("http://qdrant.local", timeout_seconds=timeout)  # type: ignore[arg-type]
+
+
+def test_point_mutations_use_wait_and_strong_ordering() -> None:
+    transport = _ScriptedTransport(
+        (200, {"result": {"status": "completed"}}),
+        (200, {"result": {"status": "completed"}}),
+    )
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=transport),
+        collection_name="docs",
+        metadata_collection_name="docs__meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+    )
+
+    collection.upsert_data(
+        [{"id": "doc-1", "uri": "viking://resources/doc.md", "vector": [0.1, 0.2]}]
+    )
+    collection.delete_data(["doc-1"])
+
+    assert all(
+        request["params"] == {"wait": ["true"], "ordering": ["strong"]}
+        for request in transport.requests
+    )
+
+
+def test_point_mutations_require_completed_result() -> None:
+    transport = _ScriptedTransport((200, {"result": {"status": "acknowledged"}}))
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=transport),
+        collection_name="docs",
+        metadata_collection_name="docs__meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+    )
+
+    with pytest.raises(QdrantError, match="did not complete"):
+        collection.upsert_data(
+            [{"id": "doc-1", "uri": "viking://resources/doc.md", "vector": [0.1, 0.2]}]
+        )
+
+
 def test_collection_lifecycle_writes_marker_and_payload_indexes() -> None:
     transport = _ScriptedTransport(
         (404, {}),
         (404, {}),
         (200, {"result": True}),
+        (200, {"result": {"status": "green", "optimizer_status": "ok"}}),
         (200, {"result": True}),
-        (200, {"result": True}),
+        (200, {"result": {"status": "green", "optimizer_status": "ok"}}),
+        (200, {"result": {"status": "completed"}}),
     )
     collection = QdrantCollection(
         client=QdrantRestClient("http://qdrant.local", opener=transport),
@@ -988,10 +1059,62 @@ def test_collection_lifecycle_writes_marker_and_payload_indexes() -> None:
     marker_payload = transport.requests[-1]["body"]["points"][0]["payload"]
     transport.responses.extend(
         [
-            (200, {"result": True}),
-            (200, {"result": True}),
-            (200, {"result": True}),
-            (200, {"result": True}),
+            (200, {"result": {"status": "completed"}}),
+            (
+                200,
+                {
+                    "result": {
+                        "payload_schema": {
+                            "account_id": {},
+                            "search_tags": {},
+                            "uri_depth": {},
+                            "scope_roots": {},
+                        }
+                    }
+                },
+            ),
+            (200, {"result": {"status": "completed"}}),
+            (
+                200,
+                {
+                    "result": {
+                        "payload_schema": {
+                            "account_id": {},
+                            "search_tags": {},
+                            "uri_depth": {},
+                            "scope_roots": {},
+                        }
+                    }
+                },
+            ),
+            (200, {"result": {"status": "completed"}}),
+            (
+                200,
+                {
+                    "result": {
+                        "payload_schema": {
+                            "account_id": {},
+                            "search_tags": {},
+                            "uri_depth": {},
+                            "scope_roots": {},
+                        }
+                    }
+                },
+            ),
+            (200, {"result": {"status": "completed"}}),
+            (
+                200,
+                {
+                    "result": {
+                        "payload_schema": {
+                            "account_id": {},
+                            "search_tags": {},
+                            "uri_depth": {},
+                            "scope_roots": {},
+                        }
+                    }
+                },
+            ),
             (200, {"result": True}),
             (
                 200,
@@ -1004,7 +1127,7 @@ def test_collection_lifecycle_writes_marker_and_payload_indexes() -> None:
                     ]
                 },
             ),
-            (200, {"result": True}),
+            (200, {"result": {"status": "completed"}}),
         ]
     )
     collection.create_index(
@@ -1012,30 +1135,23 @@ def test_collection_lifecycle_writes_marker_and_payload_indexes() -> None:
         {"ScalarIndex": ["account_id", "search_tags"]},
     )
 
-    assert [request["method"] for request in transport.requests] == [
-        "GET",
-        "GET",
-        "PUT",
-        "PUT",
-        "PUT",
-        "PUT",
-        "PUT",
-        "PUT",
-        "PUT",
-        "GET",
-        "POST",
-        "PUT",
-    ]
+    assert len(transport.requests) == 18
     assert urlsplit(transport.requests[2]["url"]).path == "/collections/project__docs"
     assert transport.requests[2]["body"] == {
         "vectors": {"dense": {"size": 3, "distance": "Cosine"}},
         "sparse_vectors": {"sparse": {}},
     }
-    assert urlsplit(transport.requests[3]["url"]).path == "/collections/project__docs__meta"
-    marker = transport.requests[4]["body"]["points"][0]
+    assert transport.requests[2]["params"] == {"timeout": ["10"]}
+    assert transport.requests[4]["params"] == {"timeout": ["10"]}
+    assert urlsplit(transport.requests[4]["url"]).path == "/collections/project__docs__meta"
+    marker = transport.requests[6]["body"]["points"][0]
     assert marker["vector"] == {"meta": [0.0]}
     assert marker["payload"]["_openviking_meta_version"] == 1
-    index_requests = transport.requests[5:9]
+    index_requests = [
+        request
+        for request in transport.requests
+        if urlsplit(request["url"]).path.endswith("/index")
+    ]
     assert [urlsplit(request["url"]).path for request in index_requests] == [
         "/collections/project__docs/index",
         "/collections/project__docs/index",
@@ -1048,6 +1164,17 @@ def test_collection_lifecycle_writes_marker_and_payload_indexes() -> None:
         "uri_depth",
         "scope_roots",
     ]
+    assert all(request["params"] == {"wait": ["true"]} for request in index_requests)
+    assert [
+        urlsplit(request["url"]).path
+        for request in transport.requests
+        if request["method"] == "GET"
+    ].count("/collections/project__docs") >= 2
+    assert [
+        urlsplit(request["url"]).path
+        for request in transport.requests
+        if request["method"] == "GET"
+    ].count("/collections/project__docs__meta") >= 2
 
 
 def test_collection_creation_race_fails_closed_before_metadata_marker() -> None:
@@ -1115,8 +1242,10 @@ def test_collection_lifecycle_infers_dimension_from_vector_field_type() -> None:
         (404, {}),
         (404, {}),
         (200, {"result": True}),
+        (200, {"result": {"status": "green", "optimizer_status": "ok"}}),
         (200, {"result": True}),
-        (200, {"result": True}),
+        (200, {"result": {"status": "green", "optimizer_status": "ok"}}),
+        (200, {"result": {"status": "completed"}}),
     )
     collection = QdrantCollection(
         client=QdrantRestClient("http://qdrant.local", opener=transport),
@@ -1155,7 +1284,7 @@ def test_metadata_marker_round_trips_index_metadata() -> None:
         sparse_weight=0.0,
     )
     marker: dict[str, object] = {}
-    collection._client.request = lambda *args, **kwargs: {}  # type: ignore[method-assign]
+    collection._client.request = _index_request([])  # type: ignore[method-assign]
     collection._upsert_points = lambda _name, points: marker.update(points[0]["payload"])  # type: ignore[method-assign]
     collection._schema = {"CollectionName": "docs", "Fields": []}
     collection.create_index("default", {"ScalarIndex": ["account_id"]})
@@ -1322,8 +1451,10 @@ def test_new_collection_refreshes_migration_provenance_before_update() -> None:
         (404, {}),
         (404, {}),
         (200, {"result": True}),
+        (200, {"result": {"status": "green", "optimizer_status": "ok"}}),
         (200, {"result": True}),
-        (200, {"result": True}),
+        (200, {"result": {"status": "green", "optimizer_status": "ok"}}),
+        (200, {"result": {"status": "completed"}}),
     )
     collection = QdrantCollection(
         client=QdrantRestClient("http://qdrant.local", opener=transport),
@@ -1352,7 +1483,7 @@ def test_new_collection_refreshes_migration_provenance_before_update() -> None:
     )
     transport.responses.extend(
         [
-            (200, {"result": True}),
+            (200, {"result": {"status": "completed"}}),
             (
                 200,
                 {
@@ -1364,7 +1495,7 @@ def test_new_collection_refreshes_migration_provenance_before_update() -> None:
                     ]
                 },
             ),
-            (200, {"result": True}),
+            (200, {"result": {"status": "completed"}}),
         ]
     )
 
@@ -1524,7 +1655,7 @@ def test_malformed_migration_marker_flag_is_not_loadable(setup_complete) -> None
 def test_collection_crud_search_count_and_scalar_scroll_use_qdrant_shapes() -> None:
     point_id = to_qdrant_point_id("doc-1")
     transport = _ScriptedTransport(
-        (200, {"result": True}),
+        (200, {"result": {"status": "completed"}}),
         (
             200,
             {
@@ -1540,7 +1671,7 @@ def test_collection_crud_search_count_and_scalar_scroll_use_qdrant_shapes() -> N
                 ],
             },
         ),
-        (200, {"result": True}),
+        (200, {"result": {"status": "completed"}}),
         (200, {"result": {"count": 1}}),
         (
             200,
@@ -1882,7 +2013,7 @@ def test_sparse_encoding_persists_terms_in_metadata_sidecar() -> None:
     transport = _ScriptedTransport(
         (200, {"result": {"points": []}}),
         (200, {"result": {"points": []}}),
-        (200, {"result": True}),
+        (200, {"result": {"status": "completed"}}),
         (200, {"result": {"points": []}}),
     )
     collection = QdrantCollection(

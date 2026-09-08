@@ -24,6 +24,7 @@ class FakeQdrant:
     def __init__(self) -> None:
         self.collections: dict[str, dict[str, object]] = {}
         self.requests: list[tuple[str, str, dict[str, object] | None]] = []
+        self.request_params: list[dict[str, object] | None] = []
         self.count_overrides: dict[str, int] = {}
 
     def add_collection(
@@ -54,8 +55,10 @@ class FakeQdrant:
         *,
         params: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        del params
         self.requests.append((method, path, copy.deepcopy(body)))
+        self.request_params.append(copy.deepcopy(params))
+        if method == "GET" and path == "/":
+            return {"title": "qdrant", "version": "1.19.1"}
         parts = [unquote(part) for part in urlsplit(path).path.split("/") if part]
         if parts[:1] != ["collections"] or len(parts) < 2:
             raise AssertionError(path)
@@ -69,6 +72,9 @@ class FakeQdrant:
             config = copy.deepcopy(collection["config"])
             config["points_count"] = len(collection["points"])
             config["payload_schema"] = copy.deepcopy(collection["payload_schema"])
+            config["status"] = "green"
+            config["optimizer_status"] = "ok"
+            config["update_queue"] = 0
             return {"result": config}
 
         if method == "PUT" and not suffix:
@@ -113,7 +119,7 @@ class FakeQdrant:
         if suffix == ["points"] and method == "PUT":
             for point in (body or {}).get("points", []):
                 points[str(point["id"])] = copy.deepcopy(point)
-            return {"result": True}
+            return {"result": {"status": "completed"}}
 
         if suffix == ["points"] and method == "POST":
             result = [
@@ -150,7 +156,7 @@ class FakeQdrant:
             collection["payload_schema"][field_name] = {
                 "data_type": (body or {}).get("field_schema")
             }
-            return {"result": True}
+            return {"result": {"status": "completed"}}
 
         raise AssertionError((method, path, body))
 
@@ -159,6 +165,198 @@ class _FakeHttpError(RuntimeError):
     def __init__(self, status: int) -> None:
         super().__init__(f"HTTP {status}")
         self.status = status
+
+
+class _RecordingClient:
+    timeout_seconds = 37.0
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, str, dict[str, object] | None, dict[str, object] | None]] = []
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, object] | None = None,
+        *,
+        params: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        self.requests.append((method, path, copy.deepcopy(body), copy.deepcopy(params)))
+        if path.endswith("/points") or path.endswith("/points/delete") or "/index" in path:
+            return {"result": {"status": "completed"}}
+        return {"result": True}
+
+
+class _ReadinessClient:
+    def __init__(self, responses: list[dict[str, object]], *, timeout_seconds: float = 1.0):
+        self.timeout_seconds = timeout_seconds
+        self.responses = list(responses)
+        self.requests: list[tuple[str, str, dict[str, object] | None, dict[str, object] | None]] = []
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, object] | None = None,
+        *,
+        params: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        self.requests.append((method, path, copy.deepcopy(body), copy.deepcopy(params)))
+        if not self.responses:
+            raise AssertionError("readiness response sequence exhausted")
+        return self.responses.pop(0)
+
+
+def test_migration_target_mutations_use_strong_ordering_and_timeout() -> None:
+    client = _RecordingClient()
+    migration = QdrantMigration(
+        client=client,
+        source_collection="legacy",
+        target_collection="current",
+        source_metadata_collection="legacy__meta",
+        target_metadata_collection="current__meta",
+        timeout_seconds=37,
+    )
+
+    migration._request(
+        "PUT",
+        migration._path(migration.target_collection, "/points"),
+        {"points": [{"id": "one"}]},
+        mutation=True,
+    )
+    migration._request(
+        "POST",
+        migration._path(migration.target_collection, "/points/delete"),
+        {"points": ["one"]},
+        mutation=True,
+    )
+    migration._request(
+        "PUT",
+        migration._path(migration.target_collection),
+        {"vectors": {"vector": {"size": 2, "distance": "Cosine"}}},
+        mutation=True,
+    )
+    migration._request(
+        "PUT",
+        migration._path(migration.target_collection, "/index"),
+        {"field_name": "account_id", "field_schema": "keyword"},
+        mutation=True,
+    )
+
+    point_params = client.requests[0][3]
+    delete_params = client.requests[1][3]
+    collection_params = client.requests[2][3]
+    index_params = client.requests[3][3]
+    assert point_params == {"wait": "true", "ordering": "strong"}
+    assert delete_params == {"wait": "true", "ordering": "strong"}
+    assert collection_params == {"timeout": 37}
+    assert index_params == {"wait": "true", "timeout": 37}
+
+
+def test_migration_point_mutation_rejects_acknowledged_result() -> None:
+    client = _RecordingClient()
+    client.request = lambda *args, **kwargs: {"result": {"status": "acknowledged"}}  # type: ignore[method-assign]
+    migration = QdrantMigration(
+        client=client,
+        source_collection="legacy",
+        target_collection="current",
+        source_metadata_collection="legacy__meta",
+        target_metadata_collection="current__meta",
+        timeout_seconds=37,
+    )
+
+    with pytest.raises(MigrationError, match="did not complete"):
+        migration._request(
+            "PUT",
+            migration._path(migration.target_collection, "/points"),
+            {"points": [{"id": "one"}]},
+            mutation=True,
+        )
+
+
+def test_migration_rejects_qdrant_versions_below_strong_ordering_floor() -> None:
+    client = _ReadinessClient([{"title": "qdrant", "version": "1.9.5"}])
+    migration = QdrantMigration(
+        client=client,
+        source_collection="legacy",
+        target_collection="current",
+        source_metadata_collection="legacy__meta",
+        target_metadata_collection="current__meta",
+        timeout_seconds=1.0,
+    )
+
+    with pytest.raises(MigrationError, match="minimum 1.10.0"):
+        migration._assert_strong_ordering_support()
+
+
+def test_migration_readiness_polls_until_green_and_indexes_visible() -> None:
+    client = _ReadinessClient(
+        [
+            {"result": {"status": "yellow", "optimizer_status": "ok"}},
+            {
+                "result": {
+                    "status": "green",
+                    "optimizer_status": "ok",
+                    "payload_schema": {},
+                }
+            },
+            {
+                "result": {
+                    "status": "green",
+                    "optimizer_status": "ok",
+                    "payload_schema": {"account_id": {"data_type": "keyword"}},
+                }
+            },
+        ],
+        timeout_seconds=0.2,
+    )
+    migration = QdrantMigration(
+        client=client,
+        source_collection="legacy",
+        target_collection="current",
+        source_metadata_collection="legacy__meta",
+        target_metadata_collection="current__meta",
+        timeout_seconds=0.2,
+    )
+
+    migration._wait_collection_ready("current", payload_fields={"account_id"})
+
+    assert len(client.requests) == 3
+
+
+def test_migration_readiness_rejects_red_collection() -> None:
+    client = _ReadinessClient(
+        [{"result": {"status": "red", "optimizer_status": "ok"}}]
+    )
+    migration = QdrantMigration(
+        client=client,
+        source_collection="legacy",
+        target_collection="current",
+        source_metadata_collection="legacy__meta",
+        target_metadata_collection="current__meta",
+        timeout_seconds=1.0,
+    )
+
+    with pytest.raises(MigrationError, match="not ready"):
+        migration._wait_collection_ready("current")
+
+
+def test_migration_readiness_times_out_while_collection_is_yellow() -> None:
+    client = _ReadinessClient(
+        [{"result": {"status": "yellow", "optimizer_status": "ok"}}] * 100,
+        timeout_seconds=0.01,
+    )
+    migration = QdrantMigration(
+        client=client,
+        source_collection="legacy",
+        target_collection="current",
+        source_metadata_collection="legacy__meta",
+        target_metadata_collection="current__meta",
+        timeout_seconds=0.01,
+    )
+
+    with pytest.raises(MigrationError, match="did not become ready"):
+        migration._wait_collection_ready("current")
 
 
 def _point(
