@@ -312,34 +312,20 @@ class _ScanManifest:
             yield str(term)
 
     def source_fingerprint(self) -> str:
-        digest = hashlib.sha256()
         rows = self._connection.execute(
             "SELECT fingerprint FROM source_targets ORDER BY fingerprint"
         )
-        first = True
-        for (fingerprint,) in rows:
-            if not first:
-                digest.update(b"\n")
-            digest.update(str(fingerprint).encode("ascii"))
-            first = False
-        return digest.hexdigest()
+        return _fingerprint_values(str(fingerprint) for (fingerprint,) in rows)
 
     def sparse_term_count(self) -> int:
         row = self._connection.execute("SELECT COUNT(*) FROM sparse_terms").fetchone()
         return int(row[0]) if row is not None else 0
 
     def sparse_term_fingerprint(self) -> str:
-        digest = hashlib.sha256()
         rows = self._connection.execute(
             "SELECT term FROM sparse_terms ORDER BY term"
         )
-        first = True
-        for (term,) in rows:
-            if not first:
-                digest.update(b"\n")
-            digest.update(str(term).encode("utf-8"))
-            first = False
-        return digest.hexdigest()
+        return _fingerprint_values(str(term) for (term,) in rows)
 
 
 class _SparseDictionaryManifest:
@@ -453,7 +439,7 @@ class _ScrollOffsets:
         try:
             self._connection.execute(
                 "INSERT INTO offsets(offset_key) VALUES (?)",
-                (repr(value),),
+                (_cursor_key(value),),
             )
         except sqlite3.IntegrityError:
             return False
@@ -602,6 +588,17 @@ def _point_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _fingerprint_values(values: Iterable[str]) -> str:
+    digest = hashlib.sha256()
+    first = True
+    for value in sorted(values):
+        if not first:
+            digest.update(b"\n")
+        digest.update(str(value).encode("utf-8"))
+        first = False
+    return digest.hexdigest()
+
+
 def _metadata_fingerprint(metadata: LegacyMetadata) -> str:
     try:
         encoded = json.dumps(
@@ -735,6 +732,40 @@ def _sparse_term(value: Any, *, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise SparseMigrationError(f"{field_name} must be a non-empty string")
     return value
+
+
+def _cursor_key(value: int | str | None) -> str:
+    """Serialize an opaque Qdrant cursor without changing its JSON type."""
+
+    return json.dumps(
+        [type(value).__name__, value],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def _validate_cursor(
+    value: Any,
+    *,
+    field_name: str = "Qdrant page offset",
+) -> int | str | None:
+    """Validate Qdrant's unsigned-integer/string page cursor."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise MigrationError(f"{field_name} must be an unsigned integer or string")
+    if isinstance(value, int):
+        if value < 0 or value > _LEGACY_UINT64_MAX:
+            raise MigrationError(
+                f"{field_name} must be between 0 and {_LEGACY_UINT64_MAX}"
+            )
+        return value
+    if isinstance(value, str):
+        if not value or not value.strip():
+            raise MigrationError(f"{field_name} must be a non-empty string")
+        return value
+    raise MigrationError(f"{field_name} must be an unsigned integer or string")
 
 
 def _legacy_sparse_map(value: Mapping[Any, Any] | None) -> dict[int, str]:
@@ -1281,36 +1312,20 @@ class QdrantMigration:
         with_vectors: bool,
         filter: Mapping[str, Any] | None = None,
     ) -> Iterable[dict[str, Any]]:
-        offset: Any = None
+        offset: int | str | None = None
         with _ScrollOffsets() as offsets:
+            offsets.add(offset)
             while True:
-                body: dict[str, Any] = {
-                    "limit": self.batch_size,
-                    "with_payload": True,
-                    "with_vector": with_vectors,
-                }
-                if filter:
-                    body["filter"] = dict(filter)
-                if offset is not None:
-                    body["offset"] = offset
-                response = self._request(
-                    "POST",
-                    self._path(collection, "/points/scroll"),
-                    body,
-                    params={"consistency": "all"},
+                page, next_offset = self._scroll_page(
+                    collection,
+                    offset=offset,
+                    with_vectors=with_vectors,
+                    filter=filter,
                 )
-                value = _result(response)
-                if not isinstance(value, Mapping):
-                    raise MigrationError(f"invalid Qdrant scroll response for {collection}")
-                page = value.get("points")
-                if not isinstance(page, list):
-                    raise MigrationError(f"invalid Qdrant scroll points for {collection}")
                 for point in page:
-                    if isinstance(point, dict):
-                        yield point
+                    yield point
                 if not page:
                     return
-                next_offset = value.get("next_page_offset")
                 if next_offset is None:
                     return
                 if not offsets.add(next_offset):
@@ -1318,6 +1333,55 @@ class QdrantMigration:
                         f"Qdrant scroll repeated its page offset for {collection}"
                     )
                 offset = next_offset
+
+    def _scroll_page(
+        self,
+        collection: str,
+        *,
+        offset: int | str | None,
+        with_vectors: bool,
+        filter: Mapping[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], int | str | None]:
+        """Read one bounded Qdrant page and preserve its opaque cursor."""
+
+        offset = _validate_cursor(offset, field_name="Qdrant scroll offset")
+        body: dict[str, Any] = {
+            "limit": self.batch_size,
+            "with_payload": True,
+            "with_vector": with_vectors,
+        }
+        if filter:
+            body["filter"] = dict(filter)
+        if offset is not None:
+            body["offset"] = offset
+        response = self._request(
+            "POST",
+            self._path(collection, "/points/scroll"),
+            body,
+            params={"consistency": "all"},
+        )
+        value = _result(response)
+        if not isinstance(value, Mapping):
+            raise MigrationError(f"invalid Qdrant scroll response for {collection}")
+        raw_page = value.get("points")
+        if not isinstance(raw_page, list):
+            raise MigrationError(f"invalid Qdrant scroll points for {collection}")
+        if any(not isinstance(point, dict) for point in raw_page):
+            raise MigrationError(f"invalid Qdrant scroll point for {collection}")
+        page = [point for point in raw_page if isinstance(point, dict)]
+        next_offset = _validate_cursor(
+            value.get("next_page_offset"),
+            field_name="Qdrant next_page_offset",
+        )
+        if next_offset is not None and _cursor_key(next_offset) == _cursor_key(offset):
+            raise MigrationError(
+                f"Qdrant scroll repeated its page offset for {collection}"
+            )
+        if not page and next_offset is not None:
+            raise MigrationError(
+                f"Qdrant scroll returned an empty page with a next offset for {collection}"
+            )
+        return page, next_offset
 
     def _retrieve(
         self,
@@ -1668,6 +1732,49 @@ class QdrantMigration:
         }
         return logical_id, target_point, terms
 
+    def _record_source_point(
+        self,
+        manifest: _ScanManifest,
+        point: Mapping[str, Any],
+        *,
+        transformed: Mapping[str, Any],
+        terms: Iterable[str],
+    ) -> tuple[bool, str]:
+        """Record one transformed source point in the bounded scan manifest."""
+
+        raw_point_id = point.get("id")
+        if raw_point_id is None:
+            raise MigrationError("source collection contains a point without an id")
+        raw_payload = self._payload(point)
+        raw_original_id = raw_payload.get(_ORIGINAL_ID_FIELD)
+        if raw_original_id is not None:
+            expected_point_id = _legacy_qdrant_point_id(raw_original_id)
+            if str(raw_point_id) != str(expected_point_id):
+                raise MigrationError(
+                    f"source point-id does not match legacy encoding for "
+                    f"{raw_original_id!r}: expected={expected_point_id!r} "
+                    f"found={raw_point_id!r}"
+                )
+        fingerprint_payload = dict(transformed["payload"])
+        if "owner_user_id" in raw_payload:
+            fingerprint_payload["owner_user_id"] = raw_payload["owner_user_id"]
+        else:
+            fingerprint_payload.pop("owner_user_id", None)
+        fingerprint_point = dict(transformed)
+        fingerprint_point["payload"] = fingerprint_payload
+        fingerprint = _point_fingerprint(
+            source_point_id=raw_point_id,
+            transformed=fingerprint_point,
+        )
+        manifest.add_source(
+            raw_point_id=raw_point_id,
+            logical_id=str(transformed["payload"][_ORIGINAL_ID_FIELD]),
+            target_id=str(transformed["id"]),
+            fingerprint=fingerprint,
+            terms=terms,
+        )
+        return _acl_complete(transformed["payload"]), fingerprint
+
     def _scan_source(
         self,
         *,
@@ -1684,40 +1791,15 @@ class QdrantMigration:
         try:
             for point in self._scroll(self.source_collection, with_vectors=True):
                 source_scanned += 1
-                raw_point_id = point.get("id")
-                if raw_point_id is None:
-                    raise MigrationError("source collection contains a point without an id")
-                raw_payload = self._payload(point)
-                raw_original_id = raw_payload.get(_ORIGINAL_ID_FIELD)
-                if raw_original_id is not None:
-                    expected_point_id = _legacy_qdrant_point_id(raw_original_id)
-                    if str(raw_point_id) != str(expected_point_id):
-                        raise MigrationError(
-                            f"source point-id does not match legacy encoding for "
-                            f"{raw_original_id!r}: expected={expected_point_id!r} "
-                            f"found={raw_point_id!r}"
-                        )
-                logical_id, transformed, terms = self._transform_point(
+                _, transformed, terms = self._transform_point(
                     point,
                     layout=layout,
                     schema=schema,
                 )
-                fingerprint_payload = dict(transformed["payload"])
-                if "owner_user_id" in raw_payload:
-                    fingerprint_payload["owner_user_id"] = raw_payload["owner_user_id"]
-                else:
-                    fingerprint_payload.pop("owner_user_id", None)
-                fingerprint_point = dict(transformed)
-                fingerprint_point["payload"] = fingerprint_payload
-                fingerprint = _point_fingerprint(
-                    source_point_id=raw_point_id,
-                    transformed=fingerprint_point,
-                )
-                scan.add_source(
-                    raw_point_id=raw_point_id,
-                    logical_id=logical_id,
-                    target_id=str(transformed["id"]),
-                    fingerprint=fingerprint,
+                self._record_source_point(
+                    scan,
+                    point,
+                    transformed=transformed,
                     terms=terms,
                 )
                 payload = transformed["payload"]
@@ -2056,15 +2138,15 @@ class QdrantMigration:
                 "target current marker has an invalid backfill_complete flag"
             )
         cursor = marker.get("last_source_cursor")
-        if cursor is not None and (
-            isinstance(cursor, bool)
-            or not isinstance(cursor, (int, str))
-            or (isinstance(cursor, int) and cursor < 0)
-            or (isinstance(cursor, str) and not cursor)
-        ):
+        try:
+            _validate_cursor(
+                cursor,
+                field_name="target current marker last_source_cursor",
+            )
+        except MigrationError as exc:
             raise MigrationError(
                 "target current marker has an invalid last_source_cursor"
-            )
+            ) from exc
         if not isinstance(marker.get("source_fingerprint"), str) or not marker["source_fingerprint"]:
             raise MigrationError(
                 "target current marker has no valid source fingerprint"
@@ -3568,6 +3650,194 @@ class QdrantMigration:
                 "target current marker sparse-map fingerprint changed after preflight"
             )
 
+    def backfill(
+        self,
+        *,
+        confirm: bool,
+        plan: MigrationPlan,
+        allow_acl_fail_open: bool = False,
+        lock_held: bool = False,
+        _source_frozen: bool = False,
+    ) -> dict[str, Any]:
+        """Copy bounded source pages and durably advance the opaque cursor."""
+
+        if not confirm:
+            raise MigrationError("backfill requires explicit confirm=True / --confirm")
+        if not lock_held:
+            raise MigrationError(
+                "backfill requires external source lock acknowledgement via "
+                "lock_held=True / --lock-held"
+            )
+        if not isinstance(plan, MigrationPlan):
+            raise MigrationError("backfill requires a reviewed migration plan")
+
+        self._assert_prepare_plan_identity(plan)
+        layout = self._layout_from_plan(plan)
+        metadata = self._legacy_metadata()
+        self._validate_source_metadata_layout(metadata.schema, layout)
+        marker = self._load_current_marker()
+        if marker is None:
+            raise MigrationError("backfill requires an owned prepared target marker")
+        self._validate_owned_prepare_marker(
+            marker=marker,
+            layout=layout,
+            metadata=metadata,
+        )
+        for field_name in ("metadata_fingerprint", "sparse_map_fingerprint"):
+            if marker.get(field_name) != getattr(plan, field_name):
+                raise MigrationError(
+                    f"target current marker {field_name} changed after prepare"
+                )
+        if marker.get("backfill_complete") is True:
+            return {
+                "source_count": marker["source_count"],
+                "migrated_count": 0,
+                "skipped_count": 0,
+                "target_count": marker["target_count"],
+                "target_collection": self.target_collection,
+                "last_source_cursor": marker["last_source_cursor"],
+                "backfill_complete": True,
+                "migration_state": marker["migration_state"],
+            }
+        if marker.get("acl_incomplete_count") and not allow_acl_fail_open:
+            raise MigrationError(
+                f"{marker['acl_incomplete_count']} records lack ACL fields; "
+                "refusing backfill without --allow-acl-fail-open"
+            )
+
+        cursor = _validate_cursor(
+            marker.get("last_source_cursor"),
+            field_name="target current marker last_source_cursor",
+        )
+        migrated = 0
+        skipped = 0
+        with _ScanManifest() as manifest, _ScrollOffsets() as offsets:
+            if not offsets.add(cursor):
+                raise MigrationError("Qdrant backfill repeated its page offset")
+            while True:
+                page, next_cursor = self._scroll_page(
+                    self.source_collection,
+                    offset=cursor,
+                    with_vectors=True,
+                )
+                next_cursor = _validate_cursor(
+                    next_cursor,
+                    field_name="Qdrant next_page_offset",
+                )
+                if next_cursor is not None and _cursor_key(next_cursor) == _cursor_key(cursor):
+                    raise MigrationError("Qdrant backfill repeated its page offset")
+                pending: list[dict[str, Any]] = []
+                page_fingerprints: list[str] = []
+                page_terms: set[str] = set()
+                page_acl_incomplete = 0
+                for point in page:
+                    _, transformed, terms = self._transform_point(
+                        point,
+                        layout=layout,
+                        schema=metadata.schema,
+                    )
+                    if not _acl_complete(transformed["payload"]) and not allow_acl_fail_open:
+                        raise MigrationError(
+                            f"point {point.get('id')!r} lacks complete ACL fields"
+                        )
+                    acl_complete, fingerprint = self._record_source_point(
+                        manifest,
+                        point,
+                        transformed=transformed,
+                        terms=terms,
+                    )
+                    page_fingerprints.append(fingerprint)
+                    page_terms.update(terms)
+                    if not acl_complete:
+                        page_acl_incomplete += 1
+                    pending.append(transformed)
+                    if len(pending) >= self.batch_size:
+                        self._validate_sparse_terms(manifest.iter_sparse_terms())
+                        migrated_batch, skipped_batch = self._upsert_target_batch(pending)
+                        migrated += migrated_batch
+                        skipped += skipped_batch
+                        pending.clear()
+                if pending:
+                    self._validate_sparse_terms(manifest.iter_sparse_terms())
+                    migrated_batch, skipped_batch = self._upsert_target_batch(pending)
+                    migrated += migrated_batch
+                    skipped += skipped_batch
+
+                if next_cursor is not None and not offsets.add(next_cursor):
+                    raise MigrationError("Qdrant backfill repeated its page offset")
+                updated = dict(marker)
+                if not _source_frozen:
+                    if cursor is None:
+                        source_count = 0
+                        acl_incomplete_count = 0
+                        source_fingerprint = ""
+                        sparse_term_count = 0
+                        sparse_term_fingerprint = ""
+                    else:
+                        source_count = int(marker["source_count"])
+                        acl_incomplete_count = int(marker["acl_incomplete_count"])
+                        source_fingerprint = str(marker["source_fingerprint"])
+                        sparse_term_count = int(marker["sparse_term_count"])
+                        sparse_term_fingerprint = str(marker["sparse_term_fingerprint"])
+                    page_fingerprint = _fingerprint_values(page_fingerprints)
+                    source_fingerprint = _fingerprint_values(
+                        [source_fingerprint, page_fingerprint]
+                    )
+                    sparse_term_fingerprint = _fingerprint_values(
+                        [sparse_term_fingerprint, _fingerprint_values(page_terms)]
+                    )
+                    updated.update(
+                        {
+                            "source_count": source_count + len(page),
+                            "source_fingerprint": source_fingerprint,
+                            "acl_incomplete_count": acl_incomplete_count + page_acl_incomplete,
+                            "sparse_term_count": sparse_term_count + len(page_terms),
+                            "sparse_term_fingerprint": sparse_term_fingerprint,
+                        }
+                    )
+                updated.update(
+                    {
+                        "migration_state": "building",
+                        "setup_complete": False,
+                        "last_source_cursor": next_cursor,
+                        "backfill_complete": next_cursor is None,
+                        "target_count": self._count(self.target_collection),
+                    }
+                )
+                self._write_marker(updated)
+                persisted = self._load_current_marker()
+                if persisted is None:
+                    raise MigrationError("target marker disappeared after backfill batch")
+                self._validate_owned_prepare_marker(
+                    marker=persisted,
+                    layout=layout,
+                    metadata=metadata,
+                )
+                if (
+                    _cursor_key(persisted.get("last_source_cursor"))
+                    != _cursor_key(next_cursor)
+                    or persisted.get("backfill_complete") is not (next_cursor is None)
+                ):
+                    raise MigrationError("backfill cursor was not persisted")
+                marker = persisted
+                if marker["backfill_complete"]:
+                    break
+                cursor = _validate_cursor(
+                    marker.get("last_source_cursor"),
+                    field_name="target current marker last_source_cursor",
+                )
+
+        return {
+            "source_count": marker["source_count"],
+            "migrated_count": migrated,
+            "skipped_count": skipped,
+            "target_count": marker["target_count"],
+            "target_collection": self.target_collection,
+            "last_source_cursor": marker["last_source_cursor"],
+            "backfill_complete": marker["backfill_complete"],
+            "migration_state": marker["migration_state"],
+        }
+
     def apply(
         self,
         *,
@@ -3682,36 +3952,17 @@ class QdrantMigration:
             metadata=metadata,
         )
         self._assert_marker_fingerprints(marker_incomplete, plan)
-        marker_complete = dict(marker_incomplete)
-        marker_complete["setup_complete"] = True
-        marker_complete["migration_state"] = "ready"
-        marker_complete["target_count"] = plan.source_count
 
         try:
-            migrated = 0
-            skipped = 0
-            pending: list[dict[str, Any]] = []
-
-            def copy_point(transformed: dict[str, Any]) -> None:
-                nonlocal migrated, skipped, pending
-                pending.append(transformed)
-                if len(pending) < self.batch_size:
-                    return
-                migrated_batch, skipped_batch = self._apply_batch(pending)
-                migrated += migrated_batch
-                skipped += skipped_batch
-                pending = []
-
-            written_source = self._scan_source(
-                layout=layout,
-                schema=metadata.schema,
-                point_callback=copy_point,
+            backfill_result = self.backfill(
+                confirm=confirm,
+                plan=plan,
+                allow_acl_fail_open=allow_acl_fail_open,
+                lock_held=lock_held,
+                _source_frozen=True,
             )
-            if pending:
-                migrated_batch, skipped_batch = self._apply_batch(pending)
-                migrated += migrated_batch
-                skipped += skipped_batch
-            self._assert_source_snapshot(plan, written_source, phase="backfill")
+            migrated = int(backfill_result["migrated_count"])
+            skipped = int(backfill_result["skipped_count"])
 
             self._assert_source_layout(layout, phase="final verification")
             final_source = self._scan_source(layout=layout, schema=metadata.schema)
@@ -3728,9 +3979,17 @@ class QdrantMigration:
                 schema=metadata.schema,
                 allow_acl_fail_open=allow_acl_fail_open,
             )
+            marker_after_backfill = self._load_current_marker()
+            if marker_after_backfill is None:
+                raise MigrationError("target marker disappeared after backfill")
+            self._validate_owned_prepare_marker(
+                marker=marker_after_backfill,
+                layout=layout,
+                metadata=metadata,
+            )
             self._validate_existing_target(
                 target_info=self._collection_info(self.target_collection),
-                marker=marker_incomplete,
+                marker=marker_after_backfill,
                 layout=layout,
                 metadata=metadata,
             )
@@ -3739,6 +3998,10 @@ class QdrantMigration:
                 raise MigrationError("target marker disappeared before completion")
             self._assert_marker_fingerprints(final_marker, plan)
             self._assert_source_layout(layout, phase="completion")
+            marker_complete = dict(final_marker)
+            marker_complete["setup_complete"] = True
+            marker_complete["migration_state"] = "ready"
+            marker_complete["target_count"] = target_count
             self._write_marker(marker_complete)
             completed_marker = self._load_current_marker()
             if completed_marker is None or completed_marker.get("setup_complete") is not True:
@@ -3754,6 +4017,9 @@ class QdrantMigration:
             target_count=target_count,
             target_collection=self.target_collection,
         )
+
+    def _upsert_target_batch(self, points: list[dict[str, Any]]) -> tuple[int, int]:
+        return self._apply_batch(points)
 
     def _apply_batch(self, points: list[dict[str, Any]]) -> tuple[int, int]:
         existing = {
@@ -3981,6 +4247,18 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="reviewed JSON plan produced by the preflight command",
     )
+    backfill_parser = subparsers.add_parser(
+        "backfill",
+        help="copy source pages into an owned building target",
+    )
+    backfill_parser.add_argument("--confirm", action="store_true")
+    backfill_parser.add_argument("--lock-held", action="store_true")
+    backfill_parser.add_argument("--allow-acl-fail-open", action="store_true")
+    backfill_parser.add_argument(
+        "--plan",
+        required=True,
+        help="reviewed JSON plan produced by the preflight command",
+    )
     apply_parser = subparsers.add_parser("apply", help="copy records into the target")
     apply_parser.add_argument(
         "--confirm",
@@ -4038,6 +4316,19 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 json.dumps(
                     migration.prepare(
+                        confirm=args.confirm,
+                        plan=reviewed_plan,
+                        allow_acl_fail_open=args.allow_acl_fail_open,
+                        lock_held=args.lock_held,
+                    ),
+                    sort_keys=True,
+                )
+            )
+        elif args.command == "backfill":
+            reviewed_plan = _load_plan(args.plan)
+            print(
+                json.dumps(
+                    migration.backfill(
                         confirm=args.confirm,
                         plan=reviewed_plan,
                         allow_acl_fail_open=args.allow_acl_fail_open,

@@ -1402,6 +1402,333 @@ def test_source_count_must_match_pagination() -> None:
         _migration(qdrant).preflight()
 
 
+def _prepare_backfill(
+    qdrant: FakeQdrant,
+    *,
+    batch_size: int = 1,
+) -> tuple[QdrantMigration, object]:
+    migration = _migration(qdrant, batch_size=batch_size)
+    plan = migration.preflight()
+    migration.prepare(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+    return migration, plan
+
+
+def test_backfill_persists_integer_cursor_after_each_batch() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_backfill(qdrant, batch_size=1)
+    written_markers: list[dict[str, object]] = []
+    original_write_marker = migration._write_marker
+
+    def record_marker(marker):
+        written_markers.append(copy.deepcopy(marker))
+        return original_write_marker(marker)
+
+    migration._write_marker = record_marker  # type: ignore[method-assign]
+
+    result = migration.backfill(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+
+    assert result["backfill_complete"] is True
+    assert [marker["last_source_cursor"] for marker in written_markers] == [1, None]
+    assert written_markers[0]["backfill_complete"] is False
+    assert written_markers[-1]["backfill_complete"] is True
+
+
+def test_backfill_persists_string_cursor_without_coercion(monkeypatch) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_backfill(qdrant, batch_size=1)
+    source_points = list(
+        qdrant.collections[migration.source_collection]["points"].values()
+    )
+    original_scroll_page = migration._scroll_page
+    cursor = "550e8400-e29b-41d4-a716-446655440001"
+    pages = {
+        None: ([copy.deepcopy(source_points[0])], cursor),
+        cursor: ([copy.deepcopy(source_points[1])], None),
+    }
+
+    def scroll_page(collection, *, offset, with_vectors, filter=None):
+        if collection != migration.source_collection:
+            return original_scroll_page(
+                collection,
+                offset=offset,
+                with_vectors=with_vectors,
+                filter=filter,
+            )
+        assert with_vectors is True
+        return pages[offset]
+
+    monkeypatch.setattr(migration, "_scroll_page", scroll_page)
+
+    result = migration.backfill(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+
+    assert result["backfill_complete"] is True
+    assert result["last_source_cursor"] is None
+    assert qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]["last_source_cursor"] is None
+
+
+def test_backfill_rejects_malformed_or_repeated_cursor(monkeypatch) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_backfill(qdrant, batch_size=1)
+    source_point = next(
+        iter(qdrant.collections[migration.source_collection]["points"].values())
+    )
+    original_scroll_page = migration._scroll_page
+
+    def malformed(collection, *, offset, with_vectors, filter=None):
+        if collection != migration.source_collection:
+            return original_scroll_page(
+                collection,
+                offset=offset,
+                with_vectors=with_vectors,
+                filter=filter,
+            )
+        return [copy.deepcopy(source_point)], {"not": "an offset"}
+
+    monkeypatch.setattr(migration, "_scroll_page", malformed)
+    with pytest.raises(MigrationError, match="offset"):
+        migration.backfill(
+            confirm=True,
+            plan=plan,
+            allow_acl_fail_open=True,
+            lock_held=True,
+        )
+
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    marker["last_source_cursor"] = 0
+    marker["backfill_complete"] = False
+
+    def repeated(collection, *, offset, with_vectors, filter=None):
+        if collection != migration.source_collection:
+            return original_scroll_page(
+                collection,
+                offset=offset,
+                with_vectors=with_vectors,
+                filter=filter,
+            )
+        assert offset == 0
+        return [copy.deepcopy(source_point)], 0
+
+    monkeypatch.setattr(migration, "_scroll_page", repeated)
+    with pytest.raises(MigrationError, match="repeated"):
+        migration.backfill(
+            confirm=True,
+            plan=plan,
+            allow_acl_fail_open=True,
+            lock_held=True,
+        )
+
+
+def test_failed_batch_can_be_retried_without_source_mutation(monkeypatch) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_backfill(qdrant, batch_size=1)
+    source_before = copy.deepcopy(qdrant.collections[migration.source_collection])
+    original_write_points = migration._write_points
+    failed = False
+
+    def fail_once(collection, points):
+        nonlocal failed
+        if collection == migration.target_collection and not failed:
+            failed = True
+            raise MigrationError("target write failed")
+        return original_write_points(collection, points)
+
+    monkeypatch.setattr(migration, "_write_points", fail_once)
+    with pytest.raises(MigrationError, match="target write failed"):
+        migration.backfill(
+            confirm=True,
+            plan=plan,
+            allow_acl_fail_open=True,
+            lock_held=True,
+        )
+
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    assert marker["last_source_cursor"] is None
+    assert marker["backfill_complete"] is False
+    assert qdrant.collections[migration.source_collection] == source_before
+
+    result = migration.backfill(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+    assert result["backfill_complete"] is True
+
+
+def test_backfill_holds_one_page_and_one_write_batch(monkeypatch) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_backfill(qdrant, batch_size=1)
+    source_points = list(
+        qdrant.collections[migration.source_collection]["points"].values()
+    )
+    pages = {
+        None: ([copy.deepcopy(source_points[0])], 1),
+        1: ([copy.deepcopy(source_points[1])], None),
+    }
+    original_scroll_page = migration._scroll_page
+    page_sizes: list[int] = []
+    batch_sizes: list[int] = []
+    original_upsert = migration._upsert_target_batch
+
+    def scroll_page(collection, *, offset, with_vectors, filter=None):
+        if collection != migration.source_collection:
+            return original_scroll_page(
+                collection,
+                offset=offset,
+                with_vectors=with_vectors,
+                filter=filter,
+            )
+        page = pages[offset]
+        page_sizes.append(len(page[0]))
+        return page
+
+    def upsert(points):
+        batch_sizes.append(len(points))
+        return original_upsert(points)
+
+    monkeypatch.setattr(migration, "_scroll_page", scroll_page)
+    monkeypatch.setattr(migration, "_upsert_target_batch", upsert)
+    migration.backfill(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+
+    assert page_sizes == [1, 1]
+    assert batch_sizes == [1, 1]
+
+
+def test_completed_backfill_resume_does_not_scan_source(monkeypatch) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_backfill(qdrant, batch_size=1)
+    migration.backfill(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+    original_scroll_page = migration._scroll_page
+
+    def reject_source_scan(collection, *, offset, with_vectors, filter=None):
+        if collection == migration.source_collection:
+            raise AssertionError("completed backfill scanned the source")
+        return original_scroll_page(
+            collection,
+            offset=offset,
+            with_vectors=with_vectors,
+            filter=filter,
+        )
+
+    monkeypatch.setattr(migration, "_scroll_page", reject_source_scan)
+    result = migration.backfill(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+
+    assert result["backfill_complete"] is True
+    assert result["migrated_count"] == 0
+
+
+def test_marker_failure_after_target_write_retries_same_page(monkeypatch) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_backfill(qdrant, batch_size=1)
+    original_write_marker = migration._write_marker
+    failed = False
+
+    def fail_once(marker):
+        nonlocal failed
+        if marker["last_source_cursor"] == 1 and not failed:
+            failed = True
+            raise MigrationError("marker write failed")
+        return original_write_marker(marker)
+
+    monkeypatch.setattr(migration, "_write_marker", fail_once)
+    with pytest.raises(MigrationError, match="marker write failed"):
+        migration.backfill(
+            confirm=True,
+            plan=plan,
+            allow_acl_fail_open=True,
+            lock_held=True,
+        )
+
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    assert marker["last_source_cursor"] is None
+    assert marker["backfill_complete"] is False
+    assert to_qdrant_point_id("1") in qdrant.collections[
+        migration.target_collection
+    ]["points"]
+
+    result = migration.backfill(
+        confirm=True,
+        plan=plan,
+        allow_acl_fail_open=True,
+        lock_held=True,
+    )
+    assert result["backfill_complete"] is True
+
+
+def test_cross_page_duplicate_source_point_fails_closed(monkeypatch) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _prepare_backfill(qdrant, batch_size=1)
+    source_point = next(
+        iter(qdrant.collections[migration.source_collection]["points"].values())
+    )
+    original_scroll_page = migration._scroll_page
+
+    def duplicate_page(collection, *, offset, with_vectors, filter=None):
+        if collection != migration.source_collection:
+            return original_scroll_page(
+                collection,
+                offset=offset,
+                with_vectors=with_vectors,
+                filter=filter,
+            )
+        if offset is None:
+            return [copy.deepcopy(source_point)], 1
+        return [copy.deepcopy(source_point)], None
+
+    monkeypatch.setattr(migration, "_scroll_page", duplicate_page)
+    with pytest.raises(MigrationError, match="duplicate point id"):
+        migration.backfill(
+            confirm=True,
+            plan=plan,
+            allow_acl_fail_open=True,
+            lock_held=True,
+        )
+
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    assert marker["last_source_cursor"] == 1
+    assert marker["backfill_complete"] is False
+
+
 def test_target_count_must_match_pagination() -> None:
     qdrant = _legacy_fixture(sparse=False)
     migration = _migration(qdrant)
