@@ -170,7 +170,6 @@ class SourceSnapshot:
     sparse_term_fingerprint: str
     transformed_source_fingerprint: str = ""
     target_content_fingerprint: str = ""
-    target_count: int = 0
 
 
 class _ScanManifest:
@@ -2344,7 +2343,7 @@ class QdrantMigration:
         updated = dict(marker)
         updated["migration_state"] = target_state
         updated["setup_complete"] = setup_complete
-        self._write_marker(updated)
+        self._write_marker(updated, expected_state=previous_state)
         verified = self._load_current_marker()
         if verified is None:
             raise MigrationError("migration state marker disappeared after write")
@@ -2642,10 +2641,16 @@ class QdrantMigration:
                 f"source physical layout changed {phase}; rerun preflight with source writes frozen"
             )
 
-    def _delete_points(self, collection: str, point_ids: list[str]) -> None:
+    def _delete_points(
+        self,
+        collection: str,
+        point_ids: list[str],
+        *,
+        expected_state: str,
+    ) -> None:
         if not point_ids:
             return
-        self._assert_owned_target_mutation(collection)
+        self._assert_owned_target_mutation(collection, expected_state=expected_state)
         self._request(
             "POST",
             self._path(collection, "/points/delete"),
@@ -2663,7 +2668,7 @@ class QdrantMigration:
     ) -> SourceSnapshot:
         """Rebuild the target from one bounded, source-authoritative scan."""
 
-        del metadata, state  # The caller pins these values around the round.
+        del metadata  # The caller pins these values around the round.
         stats = {"migrated_count": 0, "skipped_count": 0, "deleted_count": 0}
         with _ScanManifest() as scan:
             pending: list[dict[str, Any]] = []
@@ -2671,7 +2676,10 @@ class QdrantMigration:
             def upsert_pending() -> None:
                 if not pending:
                     return
-                migrated, skipped = self._upsert_target_batch(pending)
+                migrated, skipped = self._upsert_target_batch(
+                    pending,
+                    expected_state=state,
+                )
                 stats["migrated_count"] += migrated
                 stats["skipped_count"] += skipped
                 pending.clear()
@@ -2697,7 +2705,10 @@ class QdrantMigration:
 
             # The map is input-sized and therefore bounded independently of
             # the point count; write only terms from the authoritative policy.
-            self._write_sparse_dictionary(self._sparse_map.values())
+            self._write_sparse_dictionary(
+                self._sparse_map.values(),
+                expected_state=state,
+            )
 
             pending_deletes: list[str] = []
             for point in self._scroll(self.target_collection, with_vectors=True):
@@ -2726,6 +2737,7 @@ class QdrantMigration:
                         self._delete_points(
                             self.target_collection,
                             pending_deletes,
+                            expected_state=state,
                         )
                         for deleted_id in pending_deletes:
                             scan.remove_target(deleted_id)
@@ -2740,6 +2752,7 @@ class QdrantMigration:
                 self._delete_points(
                     self.target_collection,
                     pending_deletes,
+                    expected_state=state,
                 )
                 for deleted_id in pending_deletes:
                     scan.remove_target(deleted_id)
@@ -2754,8 +2767,47 @@ class QdrantMigration:
                 sparse_term_fingerprint=source.sparse_term_fingerprint,
                 transformed_source_fingerprint=scan.transformed_source_fingerprint(),
                 target_content_fingerprint=scan.target_content_fingerprint(),
-                target_count=self._count(self.target_collection),
             )
+
+    def _persist_reconcile_receipt(
+        self,
+        source: SourceSnapshot,
+        *,
+        target_count: int,
+        expected_state: str,
+        metadata_fingerprint: str,
+        sparse_map_fingerprint: str,
+    ) -> None:
+        marker = self._load_current_marker()
+        if marker is None:
+            raise MigrationError("target marker disappeared before reconcile receipt")
+        self._validate_marker_ownership(marker)
+        if (
+            marker.get("migration_state") != expected_state
+            or marker.get("setup_complete") is not _MIGRATION_STATE_SETUP[expected_state]
+        ):
+            raise MigrationError("target marker state changed before reconcile receipt")
+        if (
+            marker.get("metadata_fingerprint") != metadata_fingerprint
+            or marker.get("sparse_map_fingerprint") != sparse_map_fingerprint
+        ):
+            raise MigrationError("target marker fingerprints changed before reconcile receipt")
+        updated = dict(marker)
+        updated.update(
+            {
+                "source_count": source.source_count,
+                "source_fingerprint": source.fingerprint,
+                "acl_incomplete_count": source.acl_incomplete_count,
+                "sparse_term_count": source.sparse_term_count,
+                "sparse_term_fingerprint": source.sparse_term_fingerprint,
+                "target_count": target_count,
+                "transformed_source_fingerprint": source.transformed_source_fingerprint,
+                "target_content_fingerprint": source.target_content_fingerprint,
+                "migration_state": expected_state,
+                "setup_complete": _MIGRATION_STATE_SETUP[expected_state],
+            }
+        )
+        self._write_marker(updated, expected_state=expected_state)
 
     def reconcile(
         self,
@@ -2874,6 +2926,13 @@ class QdrantMigration:
                         "authoritative sparse map fingerprint changed during reconcile"
                     )
                 target_count = self._count(self.target_collection)
+                self._persist_reconcile_receipt(
+                    source,
+                    target_count=target_count,
+                    expected_state=expected_state,
+                    metadata_fingerprint=pinned_metadata_fingerprint,
+                    sparse_map_fingerprint=pinned_sparse_map_fingerprint,
+                )
                 if (
                     previous is not None
                     and source.source_count == previous.source_count
@@ -2912,29 +2971,7 @@ class QdrantMigration:
                 raise MigrationError(
                     "target marker fingerprints changed before reconcile completion"
                 )
-            updated = dict(current_marker)
-            updated.update(
-                {
-                    "source_count": final_source.source_count,
-                    "source_fingerprint": final_source.fingerprint,
-                    "acl_incomplete_count": final_source.acl_incomplete_count,
-                    "sparse_term_count": final_source.sparse_term_count,
-                    "sparse_term_fingerprint": final_source.sparse_term_fingerprint,
-                    "target_count": target_count,
-                    "transformed_source_fingerprint": final_source.transformed_source_fingerprint,
-                    "target_content_fingerprint": final_source.target_content_fingerprint,
-                }
-            )
-            if barrier_held:
-                updated["migration_state"] = "cutting_over"
-                updated["setup_complete"] = True
-                self._write_marker(updated)
-                final_state = "cutting_over"
-            else:
-                updated["migration_state"] = "building"
-                updated["setup_complete"] = False
-                self._write_marker(updated)
-                final_state = "building"
+            final_state = expected_final_state
             return {
                 "source_count": final_source.source_count,
                 "target_count": target_count,
@@ -2958,7 +2995,7 @@ class QdrantMigration:
                             failed = dict(current)
                             failed["migration_state"] = "failed"
                             failed["setup_complete"] = False
-                            self._write_marker(failed)
+                            self._write_marker(failed, expected_state="building")
                 except Exception:
                     pass
             raise
@@ -3406,7 +3443,12 @@ class QdrantMigration:
             raise MigrationError(f"Qdrant collection creation did not complete for {name}")
         return True
 
-    def _assert_owned_target_mutation(self, collection: str) -> dict[str, Any]:
+    def _assert_owned_target_mutation(
+        self,
+        collection: str,
+        *,
+        expected_state: str,
+    ) -> dict[str, Any]:
         """Re-read ownership immediately before a target mutation."""
 
         if collection not in {
@@ -3418,6 +3460,12 @@ class QdrantMigration:
         if marker is None:
             raise MigrationError("target migration marker disappeared before mutation")
         self._validate_marker_ownership(marker)
+        if marker["migration_state"] != expected_state:
+            raise MigrationError(
+                "target migration state changed before mutation: "
+                f"expected state={expected_state!r} "
+                f"observed state={marker['migration_state']!r}"
+            )
         return marker
 
     def _delete_collection(
@@ -3425,10 +3473,12 @@ class QdrantMigration:
         name: str,
         *,
         allow_unmarked: bool = False,
-        require_owned: bool = False,
+        expected_state: str | None = None,
     ) -> None:
-        if require_owned and not allow_unmarked:
-            self._assert_owned_target_mutation(name)
+        if not allow_unmarked:
+            if expected_state is None:
+                raise MigrationError("owned collection deletion requires an expected state")
+            self._assert_owned_target_mutation(name, expected_state=expected_state)
         try:
             response = self._request(
                 "DELETE",
@@ -3448,10 +3498,11 @@ class QdrantMigration:
         points: list[dict[str, Any]],
         *,
         allow_unmarked: bool = False,
+        expected_state: str | None = None,
     ) -> None:
         if not points:
             return
-        if allow_unmarked or getattr(self, "_allow_unmarked_target_write", False):
+        if allow_unmarked:
             self._assert_collection_layout(
                 self.target_collection,
                 layout=self._layout(
@@ -3466,7 +3517,9 @@ class QdrantMigration:
             self._assert_empty_collection(self.target_collection)
             self._assert_empty_collection(self.target_metadata_collection)
         else:
-            self._assert_owned_target_mutation(collection)
+            if expected_state is None:
+                raise MigrationError("owned point write requires an expected state")
+            self._assert_owned_target_mutation(collection, expected_state=expected_state)
         self._request(
             "PUT",
             self._path(collection, "/points"),
@@ -3479,6 +3532,7 @@ class QdrantMigration:
         marker: Mapping[str, Any],
         *,
         allow_unmarked: bool = False,
+        expected_state: str | None = None,
     ) -> None:
         points = [
             {
@@ -3487,20 +3541,25 @@ class QdrantMigration:
                 "payload": dict(marker),
             }
         ]
-        if allow_unmarked:
-            self._allow_unmarked_target_write = True
-            try:
-                self._write_points(self.target_metadata_collection, points)
-            finally:
-                self._allow_unmarked_target_write = False
-        else:
-            self._write_points(self.target_metadata_collection, points)
+        self._write_points(
+            self.target_metadata_collection,
+            points,
+            allow_unmarked=allow_unmarked,
+            expected_state=expected_state,
+        )
 
     def _write_indexes(
-        self, schema: Mapping[str, Any], indexes: Mapping[str, Mapping[str, Any]]
+        self,
+        schema: Mapping[str, Any],
+        indexes: Mapping[str, Mapping[str, Any]],
+        *,
+        expected_state: str,
     ) -> None:
         for field_name, field_schema in self._expected_payload_indexes(schema, indexes).items():
-            self._assert_owned_target_mutation(self.target_collection)
+            self._assert_owned_target_mutation(
+                self.target_collection,
+                expected_state=expected_state,
+            )
             try:
                 self._request(
                     "PUT",
@@ -3520,7 +3579,7 @@ class QdrantMigration:
         )
         self._validate_payload_indexes(schema, indexes)
 
-    def _write_sparse_dictionary(self, terms: Iterable[str]) -> None:
+    def _write_sparse_dictionary(self, terms: Iterable[str], *, expected_state: str) -> None:
         term_list = sorted(set(terms))
         if not term_list:
             return
@@ -3542,7 +3601,11 @@ class QdrantMigration:
                 }
                 for term in missing[offset : offset + self.batch_size]
             ]
-            self._write_points(self.target_metadata_collection, points)
+            self._write_points(
+                self.target_metadata_collection,
+                points,
+                expected_state=expected_state,
+            )
         self._assert_sparse_dictionary_complete(term_list)
 
     @staticmethod
@@ -4002,7 +4065,7 @@ class QdrantMigration:
                 }
             )
             if updated != marker:
-                self._write_marker(updated)
+                self._write_marker(updated, expected_state=marker["migration_state"])
 
         marker = self._load_current_marker()
         if marker is None:
@@ -4016,8 +4079,15 @@ class QdrantMigration:
         marker_indexes = marker.get("indexes")
         if not isinstance(marker_schema, Mapping) or not isinstance(marker_indexes, Mapping):
             raise MigrationError("target marker has invalid index metadata")
-        self._write_indexes(marker_schema, marker_indexes)
-        self._write_sparse_dictionary(self._sparse_map.values())
+        self._write_indexes(
+            marker_schema,
+            marker_indexes,
+            expected_state="building",
+        )
+        self._write_sparse_dictionary(
+            self._sparse_map.values(),
+            expected_state="building",
+        )
         self._wait_collection_ready(self.target_collection)
         self._wait_collection_ready(self.target_metadata_collection)
         final_marker = self._load_current_marker()
@@ -4645,7 +4715,7 @@ class QdrantMigration:
                     "target_content_fingerprint": target_content_fingerprint,
                 }
             )
-            self._write_marker(updated)
+            self._write_marker(updated, expected_state=state)
             result_state = "ready"
         elif final:
             updated = dict(current)
@@ -4660,7 +4730,7 @@ class QdrantMigration:
                     "target_content_fingerprint": target_content_fingerprint,
                 }
             )
-            self._write_marker(updated)
+            self._write_marker(updated, expected_state="cutting_over")
             result_state = "cutting_over"
 
         verified = self._load_current_marker()
@@ -4947,7 +5017,7 @@ class QdrantMigration:
                 target_exists=True,
             )
             hooks.assert_target_not_served(self)
-            self._delete_collection(self.target_collection, require_owned=True)
+            self._delete_collection(self.target_collection, expected_state="retained")
             if self._exists(self.target_collection):
                 raise MigrationError(
                     "target data collection remains after a successful delete receipt"
@@ -4971,7 +5041,10 @@ class QdrantMigration:
         hooks.assert_target_not_served(self)
         if self._exists(self.target_collection):
             raise MigrationError("target data collection reappeared before metadata deletion")
-        self._delete_collection(self.target_metadata_collection, require_owned=True)
+        self._delete_collection(
+            self.target_metadata_collection,
+            expected_state="retained",
+        )
         if self._exists(self.target_metadata_collection):
             raise MigrationError(
                 "target metadata collection remains after a successful delete receipt"
@@ -5089,12 +5162,18 @@ class QdrantMigration:
                     )
                     pending.append(transformed)
                     if len(pending) >= self.batch_size:
-                        migrated_batch, skipped_batch = self._upsert_target_batch(pending)
+                        migrated_batch, skipped_batch = self._upsert_target_batch(
+                            pending,
+                            expected_state="building",
+                        )
                         migrated += migrated_batch
                         skipped += skipped_batch
                         pending.clear()
                 if pending:
-                    migrated_batch, skipped_batch = self._upsert_target_batch(pending)
+                    migrated_batch, skipped_batch = self._upsert_target_batch(
+                        pending,
+                        expected_state="building",
+                    )
                     migrated += migrated_batch
                     skipped += skipped_batch
 
@@ -5110,7 +5189,7 @@ class QdrantMigration:
                         "target_count": self._count(self.target_collection),
                     }
                 )
-                self._write_marker(updated)
+                self._write_marker(updated, expected_state="building")
                 persisted = self._load_current_marker()
                 if persisted is None:
                     raise MigrationError("target marker disappeared after backfill batch")
@@ -5288,10 +5367,20 @@ class QdrantMigration:
             target_collection=self.target_collection,
         )
 
-    def _upsert_target_batch(self, points: list[dict[str, Any]]) -> tuple[int, int]:
-        return self._apply_batch(points)
+    def _upsert_target_batch(
+        self,
+        points: list[dict[str, Any]],
+        *,
+        expected_state: str,
+    ) -> tuple[int, int]:
+        return self._apply_batch(points, expected_state=expected_state)
 
-    def _apply_batch(self, points: list[dict[str, Any]]) -> tuple[int, int]:
+    def _apply_batch(
+        self,
+        points: list[dict[str, Any]],
+        *,
+        expected_state: str,
+    ) -> tuple[int, int]:
         existing = {
             str(point.get("id")): point
             for point in self._retrieve(
@@ -5330,7 +5419,11 @@ class QdrantMigration:
                 skipped += 1
             else:
                 write.append(point)
-        self._write_points(self.target_collection, write)
+        self._write_points(
+            self.target_collection,
+            write,
+            expected_state=expected_state,
+        )
         return len(write), skipped
 
 

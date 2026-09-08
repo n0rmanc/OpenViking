@@ -76,6 +76,40 @@ def _collection_params(info: Mapping[str, Any]) -> Mapping[str, Any]:
     return params
 
 
+def _seed_legacy_collections(
+    client: QdrantRestClient,
+    source: str,
+    source_metadata: str,
+    *,
+    source_body: Mapping[str, Any],
+    metadata_body: Mapping[str, Any],
+    source_points: list[Mapping[str, Any]],
+    metadata_points: list[Mapping[str, Any]],
+) -> None:
+    for collection, body in (
+        (source, source_body),
+        (source_metadata, metadata_body),
+    ):
+        client.request(
+            "PUT",
+            f"/collections/{collection}",
+            dict(body),
+            params={"wait": "true"},
+        )
+    client.request(
+        "PUT",
+        f"/collections/{source}/points",
+        {"points": source_points},
+        params={"wait": "true"},
+    )
+    client.request(
+        "PUT",
+        f"/collections/{source_metadata}/points",
+        {"points": metadata_points},
+        params={"wait": "true"},
+    )
+
+
 @requires_qdrant
 @pytest.mark.integration
 def test_cli_subprocess_phase_chain_round_trips_through_local_qdrant(tmp_path) -> None:
@@ -103,86 +137,71 @@ def test_cli_subprocess_phase_chain_round_trips_through_local_qdrant(tmp_path) -
         {"FieldName": "acl_inherited_grants", "FieldType": "array"},
         {"FieldName": "vector", "FieldType": "vector", "Dim": 2},
     ]
-    try:
-        client.request(
-            "PUT",
-            f"/collections/{source}",
-            {"vectors": {"vector": {"size": 2, "distance": "Cosine"}}},
-            params={"wait": "true"},
-        )
-        client.request(
-            "PUT",
-            f"/collections/{source_metadata}",
-            {"vectors": {"meta": {"size": 1, "distance": "Dot"}}},
-            params={"wait": "true"},
-        )
-        client.request(
-            "PUT",
-            f"/collections/{source}/points",
-            {
-                "points": [
-                    {
-                        "id": 1,
-                        "vector": {"vector": [1.0, 0.0]},
-                        "payload": {
-                            "_openviking_original_id": 1,
-                            "uri": "/resources/cli.md",
-                            "level": 2,
-                            "context_type": "resource",
-                            "owner_user_id": "alice",
-                            "account_id": "acct",
-                            "name": "cli",
-                            "acl_enabled": False,
-                            "acl_direct_grants": [],
-                            "acl_inherited_grants": [],
-                        },
-                    }
-                ]
+    schema = {
+        "CollectionName": "context",
+        "Fields": fields,
+        "ScalarIndex": ["uri", "level", "account_id", "owner_user_id"],
+    }
+    source_points = [
+        {
+            "id": 1,
+            "vector": {"vector": [1.0, 0.0]},
+            "payload": {
+                "_openviking_original_id": 1,
+                "uri": "/resources/cli.md",
+                "level": 2,
+                "context_type": "resource",
+                "owner_user_id": "alice",
+                "account_id": "acct",
+                "name": "cli",
+                "acl_enabled": False,
+                "acl_direct_grants": [],
+                "acl_inherited_grants": [],
             },
-            params={"wait": "true"},
-        )
-        schema = {
-            "CollectionName": "context",
-            "Fields": fields,
-            "ScalarIndex": ["uri", "level", "account_id", "owner_user_id"],
         }
-        client.request(
-            "PUT",
-            f"/collections/{source_metadata}/points",
-            {
-                "points": [
-                    {
-                        "id": _legacy_collection_metadata_id(source),
-                        "vector": {"meta": [0.0]},
-                        "payload": {
-                            "kind": "collection",
-                            "collection_key": source,
-                            "logical_collection_name": "context",
-                            "project_name": "legacy",
-                            "meta": schema,
-                        },
-                    },
-                    {
-                        "id": _legacy_index_metadata_id(source, "default"),
-                        "vector": {"meta": [0.0]},
-                        "payload": {
-                            "kind": "index",
-                            "collection_key": source,
-                            "index_name": "default",
-                            "meta": {
-                                "IndexName": "default",
-                                "VectorIndex": {
-                                    "IndexType": "hnsw",
-                                    "Distance": "Cosine",
-                                },
-                                "ScalarIndex": ["uri", "level", "account_id"],
-                            },
-                        },
-                    },
-                ]
+    ]
+    metadata_points = [
+        {
+            "id": _legacy_collection_metadata_id(source),
+            "vector": {"meta": [0.0]},
+            "payload": {
+                "kind": "collection",
+                "collection_key": source,
+                "logical_collection_name": "context",
+                "project_name": "legacy",
+                "meta": schema,
             },
-            params={"wait": "true"},
+        },
+        {
+            "id": _legacy_index_metadata_id(source, "default"),
+            "vector": {"meta": [0.0]},
+            "payload": {
+                "kind": "index",
+                "collection_key": source,
+                "index_name": "default",
+                "meta": {
+                    "IndexName": "default",
+                    "VectorIndex": {
+                        "IndexType": "hnsw",
+                        "Distance": "Cosine",
+                    },
+                    "ScalarIndex": ["uri", "level", "account_id"],
+                },
+            },
+        },
+    ]
+    try:
+        _seed_legacy_collections(
+            client,
+            source,
+            source_metadata,
+            source_body={"vectors": {"vector": {"size": 2, "distance": "Cosine"}}},
+            metadata_body={"vectors": {"meta": {"size": 1, "distance": "Dot"}}},
+            source_points=source_points,
+            metadata_points=metadata_points,
         )
+        source_before = _scroll_all(client, source)
+        metadata_before = _scroll_all(client, source_metadata)
 
         common = [
             sys.executable,
@@ -249,6 +268,8 @@ def test_cli_subprocess_phase_chain_round_trips_through_local_qdrant(tmp_path) -
         verified = run_phase("verify", *phase_args)
         assert verified["migration_state"] == "ready"
         assert verified["source_count"] == verified["target_count"] == 1
+        assert _scroll_all(client, source) == source_before
+        assert _scroll_all(client, source_metadata) == metadata_before
     finally:
         for collection in reversed(collections):
             _delete_collection(client, collection)
@@ -388,10 +409,11 @@ def test_pre3872_migration_round_trips_through_current_adapter() -> None:
     ]
     collection_names = (source, source_metadata, target, target_metadata)
     try:
-        client.request(
-            "PUT",
-            f"/collections/{source}",
-            {
+        _seed_legacy_collections(
+            client,
+            source,
+            source_metadata,
+            source_body={
                 "vectors": {"size": 2, "distance": "Cosine", "datatype": "float32"},
                 "sparse_vectors": {
                     "sparse_vector": {
@@ -400,25 +422,9 @@ def test_pre3872_migration_round_trips_through_current_adapter() -> None:
                     }
                 },
             },
-            params={"wait": "true"},
-        )
-        client.request(
-            "PUT",
-            f"/collections/{source_metadata}",
-            {"vectors": {"size": 1, "distance": "Dot"}},
-            params={"wait": "true"},
-        )
-        client.request(
-            "PUT",
-            f"/collections/{source}/points",
-            {"points": source_points},
-            params={"wait": "true"},
-        )
-        client.request(
-            "PUT",
-            f"/collections/{source_metadata}/points",
-            {"points": metadata_points},
-            params={"wait": "true"},
+            metadata_body={"vectors": {"size": 1, "distance": "Dot"}},
+            source_points=source_points,
+            metadata_points=metadata_points,
         )
         source_before = _scroll_all(client, source)
         metadata_before = _scroll_all(client, source_metadata)
