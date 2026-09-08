@@ -3591,12 +3591,36 @@ class QdrantMigration:
             target_exists = self._exists(self.target_collection)
             target_metadata_exists = self._exists(self.target_metadata_collection)
             if target_exists or target_metadata_exists:
-                if (
-                    target_metadata_exists
-                    and self._load_current_marker() is not None
-                ):
-                    pass
-                else:
+                existing_marker = (
+                    self._load_current_marker()
+                    if target_metadata_exists
+                    else None
+                )
+                if existing_marker is None:
+                    # preflight cannot inspect an unmarked pair. Prove the
+                    # reviewed source is still frozen before destructive
+                    # orphan cleanup instead of deleting first and discovering
+                    # a stale plan afterward.
+                    self._assert_prepare_plan_identity(plan)
+                    layout = self._layout_from_plan(plan)
+                    metadata = self._legacy_metadata()
+                    self._validate_source_metadata_layout(metadata.schema, layout)
+                    if _metadata_fingerprint(metadata) != plan.metadata_fingerprint:
+                        raise MigrationError(
+                            "legacy metadata changed after preflight; "
+                            "rerun preflight with writes frozen"
+                        )
+                    self._assert_source_layout(layout, phase="preflight")
+                    source = self._scan_source(
+                        layout=layout,
+                        schema=metadata.schema,
+                    )
+                    self._assert_source_snapshot(plan, source, phase="preflight")
+                    if plan.acl_incomplete_count and not allow_acl_fail_open:
+                        raise MigrationError(
+                            f"{plan.acl_incomplete_count} records lack ACL fields; "
+                            "refusing cutover without --allow-acl-fail-open"
+                        )
                     self._cleanup_pre_marker_orphan(
                         reviewed_plan=plan,
                         confirm=confirm,
@@ -3608,6 +3632,11 @@ class QdrantMigration:
                 "provided migration plan is stale; rerun preflight before apply"
             )
         plan = current_plan
+        if plan.target_state == "ready":
+            raise MigrationError(
+                "apply refuses a ready target; use the explicit migration "
+                "reconciliation/verification phases instead"
+            )
         layout = CollectionLayout(
             dense_vector_name=plan.dense_vector_name,
             sparse_vector_name=plan.sparse_vector_name,

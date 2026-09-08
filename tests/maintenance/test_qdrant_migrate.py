@@ -645,6 +645,17 @@ def _add_current_marker(
     )
 
 
+def _mark_current_target_building(
+    qdrant: FakeQdrant,
+    migration: QdrantMigration,
+) -> None:
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    marker["migration_state"] = "building"
+    marker["setup_complete"] = False
+
+
 def test_preflight_plan_is_compact_and_binds_identity() -> None:
     plan = _migration(
         _legacy_fixture(sparse=False),
@@ -906,6 +917,38 @@ def test_pre_marker_orphan_cleanup_requires_target_absent_review_and_confirm() -
     assert migration.target_metadata_collection not in qdrant.collections
 
 
+def test_apply_checks_frozen_source_before_pre_marker_orphan_cleanup() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    plan = migration.preflight()
+    layout = migration._layout(
+        migration._collection_info(migration.source_collection),
+    )
+    target_body = migration._target_collection_body(layout)
+    qdrant.add_collection(
+        migration.target_collection,
+        vectors=target_body["vectors"],
+    )
+    qdrant.add_collection(
+        migration.target_metadata_collection,
+        vectors={"meta": {"size": 1, "distance": "Dot"}},
+    )
+    qdrant.collections[migration.source_collection]["points"]["1"]["payload"][
+        "name"
+    ] = "changed-after-review"
+
+    with pytest.raises(MigrationError, match="stale|source changed"):
+        migration.apply(
+            confirm=True,
+            plan=plan,
+            allow_acl_fail_open=True,
+            lock_held=True,
+        )
+
+    assert migration.target_collection in qdrant.collections
+    assert migration.target_metadata_collection in qdrant.collections
+
+
 def test_prepare_race_re_reads_409_and_accepts_only_same_migration_marker() -> None:
     qdrant = _legacy_fixture(sparse=False)
     migration = _migration(qdrant)
@@ -968,7 +1011,50 @@ def test_prepare_rejects_rolled_back_creation_race() -> None:
     qdrant = _legacy_fixture(sparse=False)
     migration = _migration(qdrant)
     plan = migration.preflight()
-    _add_current_marker(qdrant, migration_state="rolled_back")
+
+    original_request = qdrant.request
+    raced = False
+
+    def race_to_rolled_back_marker(method, path, body=None, *, params=None):
+        nonlocal raced
+        if (
+            not raced
+            and method == "PUT"
+            and path == migration._path(migration.target_collection)
+        ):
+            raced = True
+            original_request(method, path, body, params=params)
+            metadata = migration._legacy_metadata()
+            layout = migration._layout(
+                migration._collection_info(migration.source_collection),
+            )
+            qdrant.add_collection(
+                migration.target_metadata_collection,
+                vectors={"meta": {"size": 1, "distance": "Dot"}},
+                points=[
+                    {
+                        "id": to_qdrant_point_id("openviking:metadata"),
+                        "vector": {"meta": [0.0]},
+                        "payload": migration._marker_payload(
+                            layout=layout,
+                            metadata=metadata,
+                            sparse_weight=plan.sparse_weight,
+                            source_fingerprint=plan.source_fingerprint,
+                            metadata_fingerprint=plan.metadata_fingerprint,
+                            sparse_map_fingerprint=plan.sparse_map_fingerprint,
+                            setup_complete=False,
+                            migration_state="rolled_back",
+                            acl_incomplete_count=plan.acl_incomplete_count,
+                            source_count=plan.source_count,
+                            target_count=0,
+                        ),
+                    }
+                ],
+            )
+            raise _FakeHttpError(409)
+        return original_request(method, path, body, params=params)
+
+    qdrant.request = race_to_rolled_back_marker  # type: ignore[method-assign]
 
     with pytest.raises(MigrationError, match="rolled_back"):
         migration.prepare(
@@ -977,6 +1063,14 @@ def test_prepare_rejects_rolled_back_creation_race() -> None:
             allow_acl_fail_open=True,
             lock_held=True,
         )
+    assert raced is True
+    assert migration.target_collection in qdrant.collections
+    assert (
+        qdrant.collections[migration.target_metadata_collection]["points"][
+            to_qdrant_point_id("openviking:metadata")
+        ]["payload"]["migration_state"]
+        == "rolled_back"
+    )
 
 
 def test_sparse_dictionary_write_is_chunked_and_verified() -> None:
@@ -1100,6 +1194,7 @@ def test_apply_reconciles_existing_target_records_from_source() -> None:
     target = qdrant.collections["current__context"]["points"]
     existing_id = to_qdrant_point_id("1")
     target[existing_id]["payload"]["name"] = "newer-target-value"
+    _mark_current_target_building(qdrant, migration)
     data_writes_before = len(
         [
             request
@@ -1131,6 +1226,7 @@ def test_reviewed_plan_can_be_reused_after_target_creation() -> None:
     plan = migration.preflight()
 
     first = _apply(migration, confirm=True, plan=plan, allow_acl_fail_open=True)
+    _mark_current_target_building(qdrant, migration)
     second = _apply(migration, confirm=True, plan=plan, allow_acl_fail_open=True)
 
     assert first.migrated_count == 2
@@ -1182,6 +1278,7 @@ def test_resume_reconciles_newer_target_vectors() -> None:
         9.0,
         9.0,
     ]
+    _mark_current_target_building(qdrant, migration)
 
     result = _apply(_migration(qdrant), confirm=True, allow_acl_fail_open=True)
 
@@ -1199,6 +1296,7 @@ def test_resume_repairs_malformed_existing_target_vectors() -> None:
     _apply(migration, confirm=True, allow_acl_fail_open=True)
     existing_id = to_qdrant_point_id("1")
     qdrant.collections["current__context"]["points"][existing_id]["vector"].pop("vector")
+    _mark_current_target_building(qdrant, migration)
 
     result = _apply(_migration(qdrant), confirm=True, allow_acl_fail_open=True)
 
@@ -1217,6 +1315,7 @@ def test_resume_repairs_sparse_indexes_missing_from_dictionary() -> None:
     qdrant.collections["current__context"]["points"][existing_id]["vector"][
         "sparse_vector"
     ]["indices"] = [7]
+    _mark_current_target_building(qdrant, migration)
 
     result = _apply(
         _migration(qdrant, sparse_map={111: "hello", 222: "world"}),
@@ -1249,6 +1348,7 @@ def test_resume_repairs_missing_acl_on_existing_complete_target() -> None:
     qdrant.collections["current__context"]["points"][existing_id]["payload"].pop(
         "acl_enabled"
     )
+    _mark_current_target_building(qdrant, migration)
 
     result = _apply(_migration(qdrant), confirm=True)
 
@@ -1453,29 +1553,39 @@ def test_dense_vector_size_must_be_a_positive_integer(size: object) -> None:
         _migration(qdrant).preflight()
 
 
-def test_resume_preserves_target_marker_extensions() -> None:
+def test_apply_rejects_ready_target_before_copy() -> None:
     qdrant = _legacy_fixture(sparse=False)
     migration = _migration(qdrant)
     _apply(migration, confirm=True, allow_acl_fail_open=True)
     marker = qdrant.collections["current__context__openviking_meta"]["points"][
         to_qdrant_point_id("openviking:metadata")
     ]["payload"]
-    marker["schema"]["Fields"].append({"FieldName": "acl_enabled", "FieldType": "bool"})
-    marker["sparse_weight"] = 0.9
     marker["operator_extension"] = {"retention": "audit"}
+    marker_before = copy.deepcopy(marker)
+    target_before = copy.deepcopy(qdrant.collections["current__context"]["points"])
+    data_writes_before = len(
+        [
+            request
+            for request in qdrant.requests
+            if request[0] == "PUT" and request[1].endswith("/current__context/points")
+        ]
+    )
 
-    result = _apply(_migration(qdrant), confirm=True, allow_acl_fail_open=True)
+    with pytest.raises(MigrationError, match="ready"):
+        _apply(_migration(qdrant), confirm=True, allow_acl_fail_open=True)
 
-    resumed_marker = qdrant.collections["current__context__openviking_meta"]["points"][
-        to_qdrant_point_id("openviking:metadata")
-    ]["payload"]
-    assert result.target_count == 2
-    assert resumed_marker["setup_complete"] is True
-    assert resumed_marker["sparse_weight"] == 0.9
-    assert resumed_marker["operator_extension"] == {"retention": "audit"}
-    assert any(
-        field["FieldName"] == "acl_enabled"
-        for field in resumed_marker["schema"]["Fields"]
+    assert marker == marker_before
+    assert qdrant.collections["current__context"]["points"] == target_before
+    assert (
+        len(
+            [
+                request
+                for request in qdrant.requests
+                if request[0] == "PUT"
+                and request[1].endswith("/current__context/points")
+            ]
+        )
+        == data_writes_before
     )
 
 
@@ -1570,6 +1680,7 @@ def test_ownerless_uri_does_not_require_owner_user_id() -> None:
         to_qdrant_point_id("1")
     ]["payload"]
     assert "owner_user_id" not in target_payload
+    _mark_current_target_building(qdrant, migration)
     result = _apply(migration, confirm=True, allow_acl_fail_open=True)
     assert result.migrated_count == 0
 
@@ -1618,6 +1729,7 @@ def test_owner_normalization_resumes_legacy_target(monkeypatch) -> None:
     _apply(migration, confirm=True, allow_acl_fail_open=True)
     monkeypatch.undo()
 
+    _mark_current_target_building(qdrant, migration)
     plan = migration.preflight()
     result = migration.apply(
         confirm=True,
@@ -1933,6 +2045,7 @@ def test_existing_target_records_absent_from_source_remain_for_reconcile() -> No
     qdrant = _legacy_fixture(sparse=False)
     migration = _migration(qdrant)
     _apply(migration, confirm=True, allow_acl_fail_open=True)
+    _mark_current_target_building(qdrant, migration)
     extra_id = to_qdrant_point_id("extra")
     qdrant.collections["current__context"]["points"][extra_id] = _point(
         extra_id,
@@ -2124,22 +2237,17 @@ def test_marker_fingerprint_change_after_preflight_is_rejected(monkeypatch) -> N
     qdrant = _legacy_fixture(sparse=False)
     _apply(_migration(qdrant), confirm=True, allow_acl_fail_open=True)
     migration = _migration(qdrant)
+    _mark_current_target_building(qdrant, migration)
     plan = migration.preflight()
-    original_load = migration._load_current_marker
-    calls = 0
+    original_write_indexes = migration._write_indexes
 
-    def load_marker():
-        nonlocal calls
-        marker = original_load()
-        calls += 1
-        if calls == 2 and marker is not None:
-            marker["source_fingerprint"] = "changed-after-preflight"
-            qdrant.collections[migration.target_metadata_collection]["points"][
-                to_qdrant_point_id("openviking:metadata")
-            ]["payload"]["source_fingerprint"] = "changed-after-preflight"
-        return marker
+    def write_indexes(schema, indexes):
+        original_write_indexes(schema, indexes)
+        qdrant.collections[migration.target_metadata_collection]["points"][
+            to_qdrant_point_id("openviking:metadata")
+        ]["payload"]["source_fingerprint"] = "changed-after-preflight"
 
-    monkeypatch.setattr(migration, "_load_current_marker", load_marker)
+    monkeypatch.setattr(migration, "_write_indexes", write_indexes)
 
     with pytest.raises(MigrationError, match="fingerprint changed"):
         migration.apply(
