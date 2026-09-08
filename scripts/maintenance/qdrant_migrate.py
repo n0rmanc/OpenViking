@@ -4202,31 +4202,11 @@ class QdrantMigration:
                 raise MigrationError(
                     "final verify requires a cutting_over target with setup_complete=true"
                 )
-            if not confirm:
-                raise MigrationError(
-                    "final verify requires explicit confirm=True / --confirm"
-                )
-            if not lock_held:
-                raise MigrationError(
-                    "final verify requires external source lock acknowledgement via "
-                    "lock_held=True / --lock-held"
-                )
         elif state == "cutting_over":
             raise MigrationError(
                 "cutting_over verification requires final=True"
             )
-        elif state == "building":
-            if not confirm:
-                raise MigrationError(
-                    "verify requires explicit confirm=True / --confirm when "
-                    "publishing ready"
-                )
-            if not lock_held:
-                raise MigrationError(
-                    "verify requires external source lock acknowledgement via "
-                    "lock_held=True / --lock-held when publishing ready"
-                )
-        elif state not in {"ready", "failed", "active", "retained", "rolled_back"}:
+        elif state not in {"building", "ready", "failed", "active", "retained", "rolled_back"}:
             raise MigrationError(f"verify does not support target state {state!r}")
 
         self._validate_metadata_layout(self.target_metadata_collection)
@@ -4287,6 +4267,16 @@ class QdrantMigration:
 
         result_state = state
         if state == "building" and not final:
+            if not confirm:
+                raise MigrationError(
+                    "verify requires explicit confirm=True / --confirm when "
+                    "publishing ready"
+                )
+            if not lock_held:
+                raise MigrationError(
+                    "verify requires external source lock acknowledgement via "
+                    "lock_held=True / --lock-held when publishing ready"
+                )
             updated = dict(current)
             updated.update(
                 {
@@ -4300,6 +4290,15 @@ class QdrantMigration:
             self._write_marker(updated)
             result_state = "ready"
         elif final:
+            if not confirm:
+                raise MigrationError(
+                    "final verify requires explicit confirm=True / --confirm"
+                )
+            if not lock_held:
+                raise MigrationError(
+                    "final verify requires external source lock acknowledgement via "
+                    "lock_held=True / --lock-held"
+                )
             updated = dict(current)
             updated.update(
                 {
