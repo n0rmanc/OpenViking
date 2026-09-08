@@ -966,11 +966,6 @@ def test_collection_lifecycle_writes_marker_and_payload_indexes() -> None:
         (200, {"result": True}),
         (200, {"result": True}),
         (200, {"result": True}),
-        (200, {"result": True}),
-        (200, {"result": True}),
-        (200, {"result": True}),
-        (200, {"result": True}),
-        (200, {"result": True}),
     )
     collection = QdrantCollection(
         client=QdrantRestClient("http://qdrant.local", opener=transport),
@@ -990,6 +985,28 @@ def test_collection_lifecycle_writes_marker_and_payload_indexes() -> None:
             "Fields": [{"FieldName": "vector", "Dim": 3}],
         }
     )
+    marker_payload = transport.requests[-1]["body"]["points"][0]["payload"]
+    transport.responses.extend(
+        [
+            (200, {"result": True}),
+            (200, {"result": True}),
+            (200, {"result": True}),
+            (200, {"result": True}),
+            (200, {"result": True}),
+            (
+                200,
+                {
+                    "result": [
+                        {
+                            "id": to_qdrant_point_id("openviking:metadata"),
+                            "payload": marker_payload,
+                        }
+                    ]
+                },
+            ),
+            (200, {"result": True}),
+        ]
+    )
     collection.create_index(
         "default",
         {"ScalarIndex": ["account_id", "search_tags"]},
@@ -1005,6 +1022,8 @@ def test_collection_lifecycle_writes_marker_and_payload_indexes() -> None:
         "PUT",
         "PUT",
         "PUT",
+        "GET",
+        "POST",
         "PUT",
     ]
     assert urlsplit(transport.requests[2]["url"]).path == "/collections/project__docs"
@@ -1298,6 +1317,65 @@ def test_metadata_rewrite_preserves_latest_migration_provenance() -> None:
     assert marker["target_count"] == 2
 
 
+def test_new_collection_refreshes_migration_provenance_before_update() -> None:
+    transport = _ScriptedTransport(
+        (404, {}),
+        (404, {}),
+        (200, {"result": True}),
+        (200, {"result": True}),
+        (200, {"result": True}),
+    )
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=transport),
+        collection_name="generation-data",
+        metadata_collection_name="generation-meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+        logical_collection="project/docs",
+    )
+
+    collection.create_remote_collection({"CollectionName": "docs", "Fields": []})
+    external_marker = dict(transport.requests[-1]["body"]["points"][0]["payload"])
+    external_marker.update(
+        {
+            "migration_id": "migration-1",
+            "migration_state": "active",
+            "source_fingerprint": "source",
+            "target_count": 7,
+            "setup_complete": True,
+            "vector_dimension": 2,
+        }
+    )
+    transport.responses.extend(
+        [
+            (200, {"result": True}),
+            (
+                200,
+                {
+                    "result": [
+                        {
+                            "id": to_qdrant_point_id("openviking:metadata"),
+                            "payload": external_marker,
+                        }
+                    ]
+                },
+            ),
+            (200, {"result": True}),
+        ]
+    )
+
+    collection.update(description="updated")
+
+    rewritten_marker = transport.requests[-1]["body"]["points"][0]["payload"]
+    assert rewritten_marker["migration_state"] == "active"
+    assert rewritten_marker["source_fingerprint"] == "source"
+    assert rewritten_marker["target_count"] == 7
+
+
 def test_metadata_updates_preserve_migration_provenance() -> None:
     collection = QdrantCollection(
         client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
@@ -1351,6 +1429,47 @@ def test_payload_to_record_requires_original_id() -> None:
         collection._payload_to_record(
             {"id": to_qdrant_point_id("doc-1"), "payload": {"uri": "/resources/doc.md"}}
         )
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["update_data", "fetch_data", "search_by_vector", "search_by_id", "search_by_scalar"],
+)
+def test_public_qdrant_paths_require_original_id(operation: str) -> None:
+    point = {
+        "id": to_qdrant_point_id("doc-1"),
+        "payload": {"uri": "/resources/doc.md"},
+    }
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="docs",
+        metadata_collection_name="docs__meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+    )
+
+    if operation in {"update_data", "fetch_data", "search_by_id"}:
+        collection._retrieve_points = lambda *args, **kwargs: [point]  # type: ignore[method-assign]
+    else:
+        collection._client.request = lambda *args, **kwargs: {  # type: ignore[method-assign]
+            "result": ({"points": [point]} if operation == "search_by_scalar" else [point])
+        }
+
+    with pytest.raises(ValueError, match="_openviking_original_id"):
+        if operation == "update_data":
+            collection.update_data([{"id": "doc-1", "name": "updated"}])
+        elif operation == "fetch_data":
+            collection.fetch_data(["doc-1"])
+        elif operation == "search_by_vector":
+            collection.search_by_vector("default", dense_vector=[0.1, 0.2])
+        elif operation == "search_by_id":
+            collection.search_by_id("default", "doc-1")
+        else:
+            collection.search_by_scalar("default", "updated_at")
 
 
 def test_incomplete_migration_marker_is_not_loadable() -> None:

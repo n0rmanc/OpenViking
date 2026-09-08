@@ -250,6 +250,7 @@ class QdrantCollection(ICollection):
                 }
             ],
         )
+        self._marker_loaded_from_remote = True
 
     def _load_metadata_marker(self) -> dict[str, Any] | None:
         self._marker_loaded_from_remote = True
