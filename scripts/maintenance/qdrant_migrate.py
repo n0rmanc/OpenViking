@@ -25,12 +25,14 @@ import json
 import math
 import os
 import re
+import sqlite3
 import sys
+import tempfile
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import quote, urlsplit
 
 # Make ``python scripts/maintenance/qdrant_migrate.py`` work from a checkout
@@ -73,6 +75,20 @@ _QDRANT_SPARSE_INDEX_MAX = 0x7FFF_FFFF
 _QDRANT_ID_NAMESPACE = uuid.UUID("4b6bb5a8-7f1f-5b1a-9d4c-b93f29b1d67c")
 _INTEGER_RE = re.compile(r"^[+-]?[0-9]+$")
 _QDRANT_VERSION_FLOOR = (1, 10, 0)
+MIGRATOR_VERSION = "qdrant-blue-green-v1"
+MAX_RECONCILIATION_ROUNDS = 3
+MIGRATION_STATES = frozenset(
+    {"building", "ready", "cutting_over", "active", "retained", "rolled_back", "failed"}
+)
+_MIGRATION_STATE_SETUP = {
+    "building": False,
+    "failed": False,
+    "rolled_back": False,
+    "ready": True,
+    "cutting_over": True,
+    "active": True,
+    "retained": True,
+}
 
 
 def _legacy_collection_metadata_id(collection_key: str) -> str:
@@ -131,11 +147,235 @@ class SourceSnapshot:
     """Validated source state captured at one point in time."""
 
     source_count: int
-    id_map: dict[str, str]
-    sparse_terms: set[str]
     fingerprint: str
     acl_incomplete_count: int
-    points: tuple[dict[str, Any], ...] = ()
+    sparse_term_count: int
+    sparse_term_fingerprint: str
+
+
+class _ScanManifest:
+    """Disk-backed IDs and fingerprints for one bounded source/target scan."""
+
+    def __init__(self) -> None:
+        descriptor, self._path = tempfile.mkstemp(
+            prefix="openviking-qdrant-migrate-",
+            suffix=".sqlite3",
+        )
+        os.close(descriptor)
+        self._connection = sqlite3.connect(self._path)
+        self._connection.executescript(
+            """
+            PRAGMA journal_mode=DELETE;
+            CREATE TABLE source_points (
+                raw_type TEXT NOT NULL,
+                raw_id TEXT NOT NULL,
+                PRIMARY KEY (raw_type, raw_id)
+            );
+            CREATE TABLE logical_points (
+                logical_id TEXT PRIMARY KEY,
+                raw_type TEXT NOT NULL,
+                raw_id TEXT NOT NULL
+            );
+            CREATE TABLE source_targets (
+                target_id TEXT PRIMARY KEY,
+                logical_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL
+            );
+            CREATE TABLE sparse_terms (
+                term TEXT PRIMARY KEY
+            );
+            CREATE TABLE target_points (
+                target_id TEXT PRIMARY KEY,
+                original_id TEXT
+            );
+            """
+        )
+
+    def close(self) -> None:
+        try:
+            self._connection.close()
+        finally:
+            try:
+                os.unlink(self._path)
+            except FileNotFoundError:
+                pass
+
+    def __enter__(self) -> "_ScanManifest":
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc_value: Any, _traceback: Any) -> None:
+        self.close()
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        return self._connection
+
+    def add_source(
+        self,
+        *,
+        raw_point_id: Any,
+        logical_id: str,
+        target_id: str,
+        fingerprint: str,
+        terms: Iterable[str],
+    ) -> None:
+        raw_key = (type(raw_point_id).__name__, str(raw_point_id))
+        try:
+            self._connection.execute(
+                "INSERT INTO source_points(raw_type, raw_id) VALUES (?, ?)",
+                raw_key,
+            )
+        except sqlite3.IntegrityError as exc:
+            raise MigrationError(
+                f"source pagination returned duplicate point id {raw_point_id!r}"
+            ) from exc
+        try:
+            self._connection.execute(
+                "INSERT INTO logical_points(logical_id, raw_type, raw_id) VALUES (?, ?, ?)",
+                (logical_id, *raw_key),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise MigrationError(
+                f"physical target point-id collision for duplicate logical source record id "
+                f"{logical_id!r}"
+            ) from exc
+        try:
+            self._connection.execute(
+                "INSERT INTO source_targets(target_id, logical_id, fingerprint) VALUES (?, ?, ?)",
+                (target_id, logical_id, fingerprint),
+            )
+        except sqlite3.IntegrityError as exc:
+            existing = self._connection.execute(
+                "SELECT logical_id FROM source_targets WHERE target_id = ?",
+                (target_id,),
+            ).fetchone()
+            previous = existing[0] if existing else "<unknown>"
+            raise MigrationError(
+                "physical target point-id collision between "
+                f"{previous!r} and {logical_id!r}"
+            ) from exc
+        self._connection.executemany(
+            "INSERT OR IGNORE INTO sparse_terms(term) VALUES (?)",
+            ((term,) for term in terms),
+        )
+
+    def add_target(self, point_id: Any, original_id: Any) -> None:
+        try:
+            self._connection.execute(
+                "INSERT INTO target_points(target_id, original_id) VALUES (?, ?)",
+                (str(point_id), None if original_id is None else str(original_id)),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise MigrationError(
+                f"target pagination returned duplicate point id {point_id!r}"
+            ) from exc
+
+    def target_original(self, target_id: str) -> str | None:
+        row = self._connection.execute(
+            "SELECT original_id FROM target_points WHERE target_id = ?",
+            (target_id,),
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def has_target(self, target_id: str) -> bool:
+        return (
+            self._connection.execute(
+                "SELECT 1 FROM target_points WHERE target_id = ?",
+                (target_id,),
+            ).fetchone()
+            is not None
+        )
+
+    def delete_target(self, target_id: str) -> None:
+        self._connection.execute(
+            "DELETE FROM target_points WHERE target_id = ?",
+            (target_id,),
+        )
+
+    def first_extra_target(self) -> str | None:
+        row = self._connection.execute(
+            """
+            SELECT target_id
+            FROM target_points
+            WHERE target_id NOT IN (SELECT target_id FROM source_targets)
+            ORDER BY target_id
+            LIMIT 1
+            """
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def iter_sparse_terms(self) -> Iterable[str]:
+        rows = self._connection.execute(
+            "SELECT term FROM sparse_terms ORDER BY term"
+        )
+        for (term,) in rows:
+            yield str(term)
+
+    def source_fingerprint(self) -> str:
+        digest = hashlib.sha256()
+        rows = self._connection.execute(
+            "SELECT fingerprint FROM source_targets ORDER BY fingerprint"
+        )
+        first = True
+        for (fingerprint,) in rows:
+            if not first:
+                digest.update(b"\n")
+            digest.update(str(fingerprint).encode("ascii"))
+            first = False
+        return digest.hexdigest()
+
+    def sparse_term_count(self) -> int:
+        row = self._connection.execute("SELECT COUNT(*) FROM sparse_terms").fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def sparse_term_fingerprint(self) -> str:
+        digest = hashlib.sha256()
+        rows = self._connection.execute(
+            "SELECT term FROM sparse_terms ORDER BY term"
+        )
+        first = True
+        for (term,) in rows:
+            if not first:
+                digest.update(b"\n")
+            digest.update(str(term).encode("utf-8"))
+            first = False
+        return digest.hexdigest()
+
+class _ScrollOffsets:
+    """Disk-backed cycle detection for one Qdrant scroll."""
+
+    def __init__(self) -> None:
+        descriptor, self._path = tempfile.mkstemp(
+            prefix="openviking-qdrant-scroll-",
+            suffix=".sqlite3",
+        )
+        os.close(descriptor)
+        self._connection = sqlite3.connect(self._path)
+        self._connection.execute(
+            "CREATE TABLE offsets (offset_key TEXT PRIMARY KEY)"
+        )
+
+    def __enter__(self) -> "_ScrollOffsets":
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc_value: Any, _traceback: Any) -> None:
+        try:
+            self._connection.close()
+        finally:
+            try:
+                os.unlink(self._path)
+            except FileNotFoundError:
+                pass
+
+    def add(self, value: Any) -> bool:
+        try:
+            self._connection.execute(
+                "INSERT INTO offsets(offset_key) VALUES (?)",
+                (repr(value),),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        return True
 
 
 @dataclass
@@ -146,9 +386,13 @@ class MigrationPlan:
     target_collection: str
     source_metadata_collection: str
     target_metadata_collection: str
+    logical_collection: str
+    migration_id: str
+    migrator_version: str
     source_count: int
     target_count: int
-    target_exists: bool
+    target_absent: bool
+    target_state: str | None
     dense_vector_name: str
     sparse_vector_name: str
     vector_dimension: int
@@ -157,22 +401,19 @@ class MigrationPlan:
     sparse_enabled: bool
     sparse_modifier: str | None
     sparse_weight: float
-    sparse_terms: set[str] = field(default_factory=set)
-    id_map: dict[str, str] = field(default_factory=dict)
-    existing_target_ids: set[str] = field(default_factory=set)
     source_fingerprint: str = ""
     metadata_fingerprint: str = ""
     sparse_map_fingerprint: str = ""
     acl_incomplete_count: int = 0
-    target_metadata_exists: bool = False
+    sparse_term_count: int = 0
+    sparse_term_fingerprint: str = ""
+    batch_size: int = 100
+    timeout_seconds: float = 10.0
 
     def to_dict(self) -> dict[str, Any]:
         """Return JSON-safe plan data suitable for CLI output."""
 
-        value = asdict(self)
-        value["sparse_terms"] = sorted(self.sparse_terms)
-        value["existing_target_ids"] = sorted(self.existing_target_ids)
-        return value
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -276,11 +517,6 @@ def _point_fingerprint(
         raise MigrationError(
             f"source point {source_point_id!r} is not JSON-serializable"
         ) from exc
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _snapshot_fingerprint(point_fingerprints: Iterable[str]) -> str:
-    encoded = "\n".join(sorted(point_fingerprints)).encode("ascii")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -567,7 +803,10 @@ class QdrantMigration:
         dense_vector_name: str | None = None,
         sparse_vector_name: str | None = None,
         sparse_map: Mapping[Any, Any] | None = None,
+        logical_collection: str,
+        migration_id: str,
         timeout_seconds: float = 10.0,
+        migrator_version: str = MIGRATOR_VERSION,
     ) -> None:
         self._client = client
         self.timeout_seconds = _validate_timeout_seconds(timeout_seconds)
@@ -619,6 +858,14 @@ class QdrantMigration:
         self._dense_vector_name_override = dense_vector_name
         self._sparse_vector_name_override = sparse_vector_name
         self._sparse_map = _legacy_sparse_map(sparse_map)
+        self.logical_collection = self._name(logical_collection, "logical collection")
+        self.migration_id = self._name(migration_id, "migration ID")
+        if migrator_version != MIGRATOR_VERSION:
+            raise ValueError(
+                f"migrator_version must be {MIGRATOR_VERSION!r}; "
+                f"got {migrator_version!r}"
+            )
+        self.migrator_version = MIGRATOR_VERSION
 
     @staticmethod
     def _name(value: str, description: str) -> str:
@@ -949,42 +1196,42 @@ class QdrantMigration:
         filter: Mapping[str, Any] | None = None,
     ) -> Iterable[dict[str, Any]]:
         offset: Any = None
-        seen_offsets: set[str] = set()
-        while True:
-            body: dict[str, Any] = {
-                "limit": self.batch_size,
-                "with_payload": True,
-                "with_vector": with_vectors,
-            }
-            if filter:
-                body["filter"] = dict(filter)
-            if offset is not None:
-                body["offset"] = offset
-            response = self._request(
-                "POST",
-                self._path(collection, "/points/scroll"),
-                body,
-                params={"consistency": "all"},
-            )
-            value = _result(response)
-            if not isinstance(value, Mapping):
-                raise MigrationError(f"invalid Qdrant scroll response for {collection}")
-            page = value.get("points")
-            if not isinstance(page, list):
-                raise MigrationError(f"invalid Qdrant scroll points for {collection}")
-            for point in page:
-                if isinstance(point, dict):
-                    yield point
-            if not page:
-                return
-            next_offset = value.get("next_page_offset")
-            if next_offset is None:
-                return
-            key = repr(next_offset)
-            if key in seen_offsets:
-                raise MigrationError(f"Qdrant scroll repeated its page offset for {collection}")
-            seen_offsets.add(key)
-            offset = next_offset
+        with _ScrollOffsets() as offsets:
+            while True:
+                body: dict[str, Any] = {
+                    "limit": self.batch_size,
+                    "with_payload": True,
+                    "with_vector": with_vectors,
+                }
+                if filter:
+                    body["filter"] = dict(filter)
+                if offset is not None:
+                    body["offset"] = offset
+                response = self._request(
+                    "POST",
+                    self._path(collection, "/points/scroll"),
+                    body,
+                    params={"consistency": "all"},
+                )
+                value = _result(response)
+                if not isinstance(value, Mapping):
+                    raise MigrationError(f"invalid Qdrant scroll response for {collection}")
+                page = value.get("points")
+                if not isinstance(page, list):
+                    raise MigrationError(f"invalid Qdrant scroll points for {collection}")
+                for point in page:
+                    if isinstance(point, dict):
+                        yield point
+                if not page:
+                    return
+                next_offset = value.get("next_page_offset")
+                if next_offset is None:
+                    return
+                if not offsets.add(next_offset):
+                    raise MigrationError(
+                        f"Qdrant scroll repeated its page offset for {collection}"
+                    )
+                offset = next_offset
 
     def _retrieve(
         self,
@@ -1340,99 +1587,74 @@ class QdrantMigration:
         *,
         layout: CollectionLayout,
         schema: Mapping[str, Any],
-        capture_points: bool = False,
+        manifest: _ScanManifest | None = None,
+        point_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> SourceSnapshot:
         source_count = self._count(self.source_collection)
-        id_map: dict[str, str] = {}
-        source_identities: dict[str, tuple[str, str]] = {}
-        source_point_ids: set[tuple[str, str]] = set()
-        source_logical_ids: dict[str, tuple[tuple[str, str], tuple[str, str]]] = {}
-        sparse_terms: set[str] = set()
-        point_fingerprints: list[str] = []
         acl_incomplete_count = 0
-        transformed_points: list[dict[str, Any]] = []
         source_scanned = 0
-        for point in self._scroll(self.source_collection, with_vectors=True):
-            source_scanned += 1
-            raw_point_id = point.get("id")
-            if raw_point_id is None:
-                raise MigrationError("source collection contains a point without an id")
-            source_point_key = (type(raw_point_id).__name__, str(raw_point_id))
-            if source_point_key in source_point_ids:
-                raise MigrationError(
-                    f"source pagination returned duplicate point id {raw_point_id!r}"
+        owned_manifest = manifest is None
+        scan = manifest or _ScanManifest()
+        try:
+            for point in self._scroll(self.source_collection, with_vectors=True):
+                source_scanned += 1
+                raw_point_id = point.get("id")
+                if raw_point_id is None:
+                    raise MigrationError("source collection contains a point without an id")
+                raw_payload = self._payload(point)
+                raw_original_id = raw_payload.get(_ORIGINAL_ID_FIELD)
+                if raw_original_id is not None:
+                    expected_point_id = _legacy_qdrant_point_id(raw_original_id)
+                    if str(raw_point_id) != str(expected_point_id):
+                        raise MigrationError(
+                            f"source point-id does not match legacy encoding for "
+                            f"{raw_original_id!r}: expected={expected_point_id!r} "
+                            f"found={raw_point_id!r}"
+                        )
+                logical_id, transformed, terms = self._transform_point(
+                    point,
+                    layout=layout,
+                    schema=schema,
                 )
-            source_point_ids.add(source_point_key)
-            raw_payload = self._payload(point)
-            raw_original_id = raw_payload.get(_ORIGINAL_ID_FIELD)
-            raw_identity = (
-                type(raw_original_id).__name__,
-                str(raw_original_id),
-            )
-            if raw_original_id is not None:
-                expected_point_id = _legacy_qdrant_point_id(raw_original_id)
-                if str(raw_point_id) != str(expected_point_id):
-                    raise MigrationError(
-                        f"source point-id does not match legacy encoding for "
-                        f"{raw_original_id!r}: expected={expected_point_id!r} "
-                        f"found={raw_point_id!r}"
-                    )
-            logical_id, transformed, terms = self._transform_point(
-                point,
-                layout=layout,
-                schema=schema,
-            )
-            previous_logical = source_logical_ids.get(logical_id)
-            if previous_logical is not None:
-                if previous_logical[1] != raw_identity:
-                    raise MigrationError(
-                        f"physical target point-id collision between "
-                        f"{previous_logical[0][1]!r} and {logical_id!r}"
-                    )
-                raise MigrationError(f"duplicate logical source record id {logical_id!r}")
-            source_logical_ids[logical_id] = (source_point_key, raw_identity)
-            target_id = str(transformed["id"])
-            previous_identity = source_identities.get(target_id)
-            if previous_identity is not None and previous_identity != raw_identity:
-                raise MigrationError(
-                    "physical target point-id collision between "
-                    f"{previous_identity[1]!r} and {logical_id!r}"
-                )
-            source_identities[target_id] = raw_identity
-            id_map[logical_id] = target_id
-            sparse_terms.update(terms)
-            fingerprint_payload = dict(transformed["payload"])
-            if "owner_user_id" in raw_payload:
-                fingerprint_payload["owner_user_id"] = raw_payload["owner_user_id"]
-            else:
-                fingerprint_payload.pop("owner_user_id", None)
-            fingerprint_point = dict(transformed)
-            fingerprint_point["payload"] = fingerprint_payload
-            point_fingerprints.append(
-                _point_fingerprint(
+                fingerprint_payload = dict(transformed["payload"])
+                if "owner_user_id" in raw_payload:
+                    fingerprint_payload["owner_user_id"] = raw_payload["owner_user_id"]
+                else:
+                    fingerprint_payload.pop("owner_user_id", None)
+                fingerprint_point = dict(transformed)
+                fingerprint_point["payload"] = fingerprint_payload
+                fingerprint = _point_fingerprint(
                     source_point_id=raw_point_id,
                     transformed=fingerprint_point,
                 )
+                scan.add_source(
+                    raw_point_id=raw_point_id,
+                    logical_id=logical_id,
+                    target_id=str(transformed["id"]),
+                    fingerprint=fingerprint,
+                    terms=terms,
+                )
+                payload = transformed["payload"]
+                if not _acl_complete(payload):
+                    acl_incomplete_count += 1
+                if point_callback is not None:
+                    point_callback(transformed)
+            if source_scanned != source_count:
+                raise MigrationError(
+                    "source count mismatch: "
+                    f"exact count={source_count} paginated count={source_scanned}"
+                )
+            self._validate_sparse_terms(scan.iter_sparse_terms())
+            return SourceSnapshot(
+                source_count=source_count,
+                fingerprint=scan.source_fingerprint(),
+                acl_incomplete_count=acl_incomplete_count,
+                sparse_term_count=scan.sparse_term_count(),
+                sparse_term_fingerprint=scan.sparse_term_fingerprint(),
             )
-            payload = transformed["payload"]
-            if not _acl_complete(payload):
-                acl_incomplete_count += 1
-            if capture_points:
-                transformed_points.append(transformed)
-
-        if source_scanned != source_count:
-            raise MigrationError(
-                "source count mismatch: "
-                f"exact count={source_count} paginated count={source_scanned}"
-            )
-        return SourceSnapshot(
-            source_count=source_count,
-            id_map=id_map,
-            sparse_terms=sparse_terms,
-            fingerprint=_snapshot_fingerprint(point_fingerprints),
-            acl_incomplete_count=acl_incomplete_count,
-            points=tuple(transformed_points),
-        )
+        finally:
+            if owned_manifest:
+                scan.close()
 
     def _marker_payload(
         self,
@@ -1445,21 +1667,41 @@ class QdrantMigration:
         sparse_map_fingerprint: str,
         setup_complete: bool,
         acl_incomplete_count: int,
+        migration_state: str = "building",
+        source_count: int = 0,
+        target_count: int = 0,
     ) -> dict[str, Any]:
+        if migration_state not in MIGRATION_STATES:
+            raise MigrationError(f"invalid migration state: {migration_state!r}")
+        expected_setup = _MIGRATION_STATE_SETUP[migration_state]
+        if setup_complete is not expected_setup:
+            raise MigrationError(
+                "migration_state and setup_complete disagree"
+            )
         return {
             "_openviking_meta_version": _META_VERSION,
             "collection_name": self.target_collection,
+            "metadata_collection_name": self.target_metadata_collection,
+            "logical_collection": self.logical_collection,
+            "migration_id": self.migration_id,
+            "migrator_version": self.migrator_version,
+            "migration_state": migration_state,
             "source_collection": self.source_collection,
             "source_metadata_collection": self.source_metadata_collection,
             "source_fingerprint": source_fingerprint,
             "metadata_fingerprint": metadata_fingerprint,
             "sparse_map_fingerprint": sparse_map_fingerprint,
             "setup_complete": setup_complete,
+            "last_source_cursor": None,
+            "backfill_complete": False,
+            "source_count": source_count,
+            "target_count": target_count,
             "acl_incomplete_count": acl_incomplete_count,
             "schema": metadata.schema,
             "dense_vector_name": layout.dense_vector_name,
             "sparse_vector_name": layout.sparse_vector_name,
             "vector_dim": layout.vector_dimension,
+            "vector_dimension": layout.vector_dimension,
             "distance": layout.distance,
             "dense_datatype": layout.dense_datatype,
             "sparse_enabled": layout.sparse_enabled,
@@ -1510,6 +1752,94 @@ class QdrantMigration:
         payload = points[0].get("payload")
         return dict(payload) if isinstance(payload, Mapping) else None
 
+    def _validate_marker_ownership(self, marker: Mapping[str, Any]) -> None:
+        expected_fields = {
+            "collection_name": self.target_collection,
+            "metadata_collection_name": self.target_metadata_collection,
+            "logical_collection": self.logical_collection,
+            "migration_id": self.migration_id,
+            "migrator_version": self.migrator_version,
+        }
+        for field_name, expected in expected_fields.items():
+            if marker.get(field_name) != expected:
+                label = "migration ID" if field_name == "migration_id" else field_name
+                raise MigrationError(
+                    f"target current marker {label} differs: "
+                    f"expected={expected!r} target={marker.get(field_name)!r}"
+                )
+        for field_name, expected in (
+            ("target_collection", self.target_collection),
+            ("target_metadata_collection", self.target_metadata_collection),
+        ):
+            if field_name in marker and marker[field_name] != expected:
+                raise MigrationError(
+                    f"target current marker {field_name} differs: "
+                    f"expected={expected!r} target={marker.get(field_name)!r}"
+                )
+        state = marker.get("migration_state")
+        if not isinstance(state, str) or state not in MIGRATION_STATES:
+            raise MigrationError(
+                f"target current marker has an invalid migration state: {state!r}"
+            )
+        setup_complete = marker.get("setup_complete")
+        if setup_complete is not _MIGRATION_STATE_SETUP[state]:
+            raise MigrationError(
+                "target current marker migration_state and setup_complete disagree"
+            )
+
+    def _transition(
+        self,
+        target_state: str,
+        *,
+        setup_complete: bool | None = None,
+    ) -> dict[str, Any]:
+        """Write and verify a migration state marker owned by this controller."""
+
+        if not isinstance(target_state, str) or target_state not in MIGRATION_STATES:
+            raise MigrationError(f"invalid migration state: {target_state!r}")
+        expected_setup = _MIGRATION_STATE_SETUP[target_state]
+        if setup_complete is None:
+            setup_complete = expected_setup
+        if setup_complete is not expected_setup:
+            raise MigrationError(
+                "migration_state and setup_complete disagree"
+            )
+        marker = self._load_current_marker()
+        if marker is None:
+            raise MigrationError(
+                "target metadata collection has no migration marker"
+            )
+        self._validate_marker_ownership(marker)
+        previous_state = marker["migration_state"]
+        allowed_previous = {
+            "building": {"building", "failed"},
+            "ready": {"building", "ready"},
+            "cutting_over": {"ready", "cutting_over"},
+            "active": {"cutting_over", "active"},
+            "retained": {"active", "retained"},
+            "rolled_back": {"cutting_over", "rolled_back"},
+            "failed": {"building", "ready", "cutting_over", "failed"},
+        }
+        if previous_state not in allowed_previous[target_state]:
+            raise MigrationError(
+                f"cannot transition migration state from {previous_state!r} "
+                f"to {target_state!r}"
+            )
+        updated = dict(marker)
+        updated["migration_state"] = target_state
+        updated["setup_complete"] = setup_complete
+        self._write_marker(updated)
+        verified = self._load_current_marker()
+        if verified is None:
+            raise MigrationError("migration state marker disappeared after write")
+        self._validate_marker_ownership(verified)
+        if (
+            verified.get("migration_state") != target_state
+            or verified.get("setup_complete") is not setup_complete
+        ):
+            raise MigrationError("migration state marker was not persisted")
+        return verified
+
     def _validate_metadata_layout(self, collection: str) -> None:
         layout = self._layout(
             self._collection_info(collection),
@@ -1536,12 +1866,21 @@ class QdrantMigration:
         required_fields = {
             "_openviking_meta_version",
             "collection_name",
+            "metadata_collection_name",
+            "logical_collection",
+            "migration_id",
+            "migrator_version",
+            "migration_state",
             "source_collection",
             "source_metadata_collection",
             "source_fingerprint",
             "metadata_fingerprint",
             "sparse_map_fingerprint",
             "setup_complete",
+            "last_source_cursor",
+            "backfill_complete",
+            "source_count",
+            "target_count",
             "acl_incomplete_count",
             "schema",
             "dense_vector_name",
@@ -1567,14 +1906,62 @@ class QdrantMigration:
             )
         for field_name, expected in (
             ("collection_name", self.target_collection),
+            ("metadata_collection_name", self.target_metadata_collection),
+            ("logical_collection", self.logical_collection),
+            ("migration_id", self.migration_id),
+            ("migrator_version", self.migrator_version),
             ("source_collection", self.source_collection),
             ("source_metadata_collection", self.source_metadata_collection),
         ):
             if marker.get(field_name) != expected:
+                if field_name == "migration_id":
+                    raise MigrationError(
+                        "target current marker migration ID differs: "
+                        f"expected={expected!r} target={marker.get(field_name)!r}"
+                    )
                 raise MigrationError(
                     f"target current marker {field_name} differs: "
                     f"expected={expected!r} target={marker.get(field_name)!r}"
                 )
+        for field_name, expected in (
+            ("target_collection", self.target_collection),
+            ("target_metadata_collection", self.target_metadata_collection),
+        ):
+            if field_name in marker and marker[field_name] != expected:
+                raise MigrationError(
+                    f"target current marker {field_name} differs: "
+                    f"expected={expected!r} target={marker.get(field_name)!r}"
+                )
+        migration_state = marker.get("migration_state")
+        if not isinstance(migration_state, str) or migration_state not in MIGRATION_STATES:
+            raise MigrationError(
+                f"target current marker has an invalid migration state: {migration_state!r}"
+            )
+        expected_setup = _MIGRATION_STATE_SETUP[migration_state]
+        if marker.get("setup_complete") is not expected_setup:
+            raise MigrationError(
+                "target current marker migration_state and setup_complete disagree"
+            )
+        for field_name in ("source_count", "target_count"):
+            value = marker.get(field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise MigrationError(
+                    f"target current marker has an invalid {field_name}"
+                )
+        if not isinstance(marker.get("backfill_complete"), bool):
+            raise MigrationError(
+                "target current marker has an invalid backfill_complete flag"
+            )
+        cursor = marker.get("last_source_cursor")
+        if cursor is not None and (
+            isinstance(cursor, bool)
+            or not isinstance(cursor, (int, str))
+            or (isinstance(cursor, int) and cursor < 0)
+            or (isinstance(cursor, str) and not cursor)
+        ):
+            raise MigrationError(
+                "target current marker has an invalid last_source_cursor"
+            )
         if not isinstance(marker.get("source_fingerprint"), str) or not marker["source_fingerprint"]:
             raise MigrationError(
                 "target current marker has no valid source fingerprint"
@@ -1606,6 +1993,7 @@ class QdrantMigration:
         dense_datatype = marker.get("dense_datatype")
         sparse_enabled = marker.get("sparse_enabled")
         sparse_modifier = marker.get("sparse_modifier")
+        vector_dimension = marker.get("vector_dimension")
         if (
             not isinstance(dense_vector_name, str)
             or not dense_vector_name
@@ -1617,8 +2005,15 @@ class QdrantMigration:
             or (dense_datatype is not None and not isinstance(dense_datatype, str))
             or not isinstance(sparse_enabled, bool)
             or (sparse_modifier is not None and not isinstance(sparse_modifier, str))
+            or isinstance(vector_dimension, bool)
+            or not isinstance(vector_dimension, int)
+            or vector_dimension <= 0
         ):
             raise MigrationError("target current marker has an invalid vector layout")
+        if vector_dimension != vector_dim:
+            raise MigrationError(
+                "target current marker has inconsistent vector dimensions"
+            )
         try:
             marker_distance = _canonical_distance(marker["distance"])
             marker_sparse_weight = float(marker["sparse_weight"])
@@ -1634,6 +2029,7 @@ class QdrantMigration:
             "dense_vector_name": dense_vector_name,
             "sparse_vector_name": sparse_vector_name,
             "vector_dim": vector_dim,
+            "vector_dimension": vector_dimension,
             "distance": marker_distance,
             "dense_datatype": dense_datatype,
             "sparse_enabled": sparse_enabled,
@@ -1719,23 +2115,21 @@ class QdrantMigration:
                 "rerun preflight with source writes frozen"
             )
 
-    def _existing_target_points(
-        self,
-        *,
-        with_vectors: bool = False,
-    ) -> tuple[dict[str, dict[str, Any]], int]:
-        points: dict[str, dict[str, Any]] = {}
+    def _scan_target_ids(self, manifest: _ScanManifest) -> int:
         scanned = 0
-        for point in self._scroll(self.target_collection, with_vectors=with_vectors):
+        for point in self._scroll(self.target_collection, with_vectors=False):
             scanned += 1
             point_id = point.get("id")
             if point_id is None:
                 raise MigrationError("target collection contains a point without an id")
-            key = str(point_id)
-            if key in points:
-                raise MigrationError(f"target pagination returned duplicate point id {key!r}")
-            points[key] = point
-        return points, scanned
+            payload = point.get("payload")
+            original_id = (
+                payload.get(_ORIGINAL_ID_FIELD)
+                if isinstance(payload, Mapping)
+                else None
+            )
+            manifest.add_target(point_id, original_id)
+        return scanned
 
     @staticmethod
     def _expected_payload_indexes(
@@ -1861,11 +2255,12 @@ class QdrantMigration:
             by_index[index] = term
         return by_term, by_index
 
-    def _assert_sparse_dictionary_complete(self, terms: set[str]) -> None:
-        if not terms:
+    def _assert_sparse_dictionary_complete(self, terms: Iterable[str]) -> None:
+        term_set = set(terms)
+        if not term_set:
             return
         by_term, _ = self._existing_sparse_dictionary()
-        missing = sorted(terms - set(by_term))
+        missing = sorted(term_set - set(by_term))
         if missing:
             raise SparseMigrationError(
                 "target sparse dictionary is missing terms after write: "
@@ -1879,58 +2274,66 @@ class QdrantMigration:
                     f"{term!r}: expected={expected_index} found={by_term[term]}"
                 )
 
-    def _validate_sparse_terms(self, terms: set[str]) -> None:
+    def _validate_sparse_terms(self, terms: Iterable[str]) -> None:
         by_term, by_index = self._existing_sparse_dictionary()
-        planned: dict[int, str] = {}
-        for term in sorted(terms):
-            index = stable_sparse_index(term)
-            previous_term = planned.get(index)
-            if previous_term is not None and previous_term != term:
-                raise SparseMigrationError(
-                    "sparse term collision after migration: "
-                    f"index={index} terms={previous_term!r},{term!r}"
-                )
-            existing_term = by_index.get(index)
-            if existing_term is not None and existing_term != term:
-                raise SparseMigrationError(
-                    "target sparse dictionary collision: "
-                    f"index={index} existing_term={existing_term!r} source_term={term!r}"
-                )
-            existing_index = by_term.get(term)
-            if existing_index is not None and existing_index != index:
-                raise SparseMigrationError(
-                    "target sparse dictionary maps source term to a different index: "
-                    f"term={term!r} existing={existing_index} expected={index}"
-                )
-            planned[index] = term
-        if terms and self._exists(self.target_metadata_collection):
-            expected_ids = {
-                term: to_qdrant_point_id(f"openviking:sparse:{term}") for term in terms
-            }
-            existing_points = self._retrieve(
-                self.target_metadata_collection,
-                list(expected_ids.values()),
-                with_vectors=False,
+        with _ScanManifest() as planned_manifest:
+            planned = planned_manifest.connection
+            planned.execute(
+                "CREATE TABLE planned_sparse_terms (term TEXT PRIMARY KEY, sparse_index INTEGER UNIQUE)"
             )
-            points_by_id = {
-                str(point.get("id")): point
-                for point in existing_points
-                if point.get("id") is not None
-            }
-            for term, point_id in expected_ids.items():
-                point = points_by_id.get(point_id)
-                if point is None:
+            for term in terms:
+                if not isinstance(term, str) or not term.strip():
+                    raise SparseMigrationError("source sparse dictionary has an invalid term")
+                index = stable_sparse_index(term)
+                try:
+                    planned.execute(
+                        "INSERT INTO planned_sparse_terms(term, sparse_index) VALUES (?, ?)",
+                        (term, index),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    existing = planned.execute(
+                        "SELECT term FROM planned_sparse_terms WHERE sparse_index = ?",
+                        (index,),
+                    ).fetchone()
+                    existing_term = existing[0] if existing else "<unknown>"
+                    if existing_term != term:
+                        raise SparseMigrationError(
+                            "sparse term collision after migration: "
+                            f"index={index} terms={existing_term!r},{term!r}"
+                        ) from exc
                     continue
-                payload = point.get("payload")
+                existing_term = by_index.get(index)
+                if existing_term is not None and existing_term != term:
+                    raise SparseMigrationError(
+                        "target sparse dictionary collision: "
+                        f"index={index} existing_term={existing_term!r} source_term={term!r}"
+                    )
+                existing_index = by_term.get(term)
+                if existing_index is not None and existing_index != index:
+                    raise SparseMigrationError(
+                        "target sparse dictionary maps source term to a different index: "
+                        f"term={term!r} existing={existing_index} expected={index}"
+                    )
+                if not self._exists(self.target_metadata_collection):
+                    continue
+                expected_id = to_qdrant_point_id(f"openviking:sparse:{term}")
+                points = self._retrieve(
+                    self.target_metadata_collection,
+                    [expected_id],
+                    with_vectors=False,
+                )
+                if not points:
+                    continue
+                payload = points[0].get("payload")
                 if (
                     not isinstance(payload, Mapping)
-                    or not payload.get(_SPARSE_TERM_MARKER)
+                    or payload.get(_SPARSE_TERM_MARKER) is not True
                     or payload.get("term") != term
-                    or payload.get("index") != stable_sparse_index(term)
+                    or payload.get("index") != index
                 ):
                     raise SparseMigrationError(
                         "target sparse dictionary point-id collision for term "
-                        f"{term!r}: point={point_id!r}"
+                        f"{term!r}: point={expected_id!r}"
                     )
 
     def _validate_source_metadata_layout(
@@ -2018,86 +2421,72 @@ class QdrantMigration:
         metadata_fingerprint = _metadata_fingerprint(metadata)
         sparse_weight = self._sparse_weight(metadata, sparse_enabled=layout.sparse_enabled)
         sparse_map_fingerprint = _sparse_map_fingerprint(self._sparse_map)
-        source = self._scan_source(layout=layout, schema=metadata.schema)
 
         target_exists = self._exists(self.target_collection)
         target_count = 0
-        target_points: dict[str, dict[str, Any]] = {}
         marker: dict[str, Any] | None = None
         target_metadata_exists = self._exists(self.target_metadata_collection)
-        if target_exists:
+        if target_exists or target_metadata_exists:
             marker = self._load_current_marker()
             if marker is None:
-                raise MigrationError(
-                    "target collection exists but has no valid current marker; "
-                    "refusing to adopt or overwrite it"
+                subject = (
+                    "target metadata collection"
+                    if target_metadata_exists and not target_exists
+                    else "target current marker"
                 )
-            self._validate_metadata_layout(self.target_metadata_collection)
-            target_info = self._collection_info(self.target_collection)
-            self._validate_existing_target(
-                target_info=target_info,
-                marker=marker,
-                layout=layout,
-                metadata=metadata,
-            )
-            target_count = self._count(self.target_collection)
-            target_points, target_scanned = self._existing_target_points()
-            if target_scanned != target_count:
                 raise MigrationError(
-                    "target count mismatch: "
-                    f"exact count={target_count} paginated count={target_scanned}"
-                )
-        elif target_metadata_exists:
-            marker = self._load_current_marker()
-            if marker is None:
-                raise MigrationError(
-                    "target metadata collection exists without a valid migration marker; "
+                    f"{subject} is missing; "
                     "refusing to adopt or overwrite it"
                 )
             self._validate_metadata_layout(self.target_metadata_collection)
             self._validate_existing_target(
-                target_info=None,
+                target_info=(
+                    self._collection_info(self.target_collection)
+                    if target_exists
+                    else None
+                ),
                 marker=marker,
                 layout=layout,
                 metadata=metadata,
             )
-            if marker.get("setup_complete") is not False:
-                raise MigrationError(
-                    "target metadata marker is complete but the target collection is missing"
-                )
+            if target_exists:
+                target_count = self._count(self.target_collection)
+                if marker.get("setup_complete") is False and target_count:
+                    # The incomplete marker still owns the target, but the
+                    # count remains a mutable observation for resume.
+                    target_count = self._count(self.target_collection)
 
-        for logical_id, target_id in source.id_map.items():
-            existing = target_points.get(target_id)
-            if existing is None:
-                continue
-            existing_payload = existing.get("payload")
-            existing_original = (
-                existing_payload.get(_ORIGINAL_ID_FIELD)
-                if isinstance(existing_payload, Mapping)
-                else None
+        with _ScanManifest() as scan:
+            source = self._scan_source(
+                layout=layout,
+                schema=metadata.schema,
+                manifest=scan,
             )
-            if existing_original is None:
-                raise MigrationError(
-                    f"target point {target_id} is missing {_ORIGINAL_ID_FIELD}; "
-                    "refusing to overwrite it"
-                )
-            if str(existing_original) != logical_id:
-                raise MigrationError(
-                    f"target point-id collision for {target_id}: "
-                    f"existing={existing_original!r} source={logical_id!r}"
-                )
-        extra_target_ids = set(target_points) - set(source.id_map.values())
-        if extra_target_ids:
-            raise MigrationError(
-                "target collection contains records absent from the source snapshot: "
-                f"{sorted(extra_target_ids)!r}"
-            )
+            if target_exists:
+                target_scanned = self._scan_target_ids(scan)
+                if target_scanned != target_count:
+                    raise MigrationError(
+                        "target count mismatch: "
+                        f"exact count={target_count} paginated count={target_scanned}"
+                    )
+                for target_id, logical_id in scan.connection.execute(
+                    "SELECT target_id, logical_id FROM source_targets"
+                ):
+                    if not scan.has_target(str(target_id)):
+                        continue
+                    existing_original = scan.target_original(str(target_id))
+                    if existing_original is None:
+                        raise MigrationError(
+                            f"target point {target_id} is missing {_ORIGINAL_ID_FIELD}; "
+                            "refusing to overwrite it"
+                        )
+                    if str(existing_original) != str(logical_id):
+                        raise MigrationError(
+                            f"target point-id collision for {target_id}: "
+                            f"existing={existing_original!r} source={logical_id!r}"
+                        )
 
         if marker is not None:
-            if marker.get("source_fingerprint") != source.fingerprint:
-                raise MigrationError(
-                    "target current marker source fingerprint differs from the source snapshot"
-                )
             if marker.get("metadata_fingerprint") != metadata_fingerprint:
                 raise MigrationError(
                     "target current marker metadata fingerprint differs from the source metadata"
@@ -2106,16 +2495,19 @@ class QdrantMigration:
                 raise MigrationError(
                     "target current marker sparse-map fingerprint differs from the sparse map"
                 )
-        self._validate_sparse_terms(source.sparse_terms)
 
         return MigrationPlan(
             source_collection=self.source_collection,
             target_collection=self.target_collection,
             source_metadata_collection=self.source_metadata_collection,
             target_metadata_collection=self.target_metadata_collection,
+            logical_collection=self.logical_collection,
+            migration_id=self.migration_id,
+            migrator_version=self.migrator_version,
             source_count=source.source_count,
             target_count=target_count,
-            target_exists=target_exists,
+            target_absent=not target_exists and not target_metadata_exists,
+            target_state=marker.get("migration_state") if marker else None,
             dense_vector_name=layout.dense_vector_name,
             sparse_vector_name=layout.sparse_vector_name,
             vector_dimension=layout.vector_dimension,
@@ -2124,14 +2516,14 @@ class QdrantMigration:
             sparse_enabled=layout.sparse_enabled,
             sparse_modifier=layout.sparse_modifier,
             sparse_weight=sparse_weight,
-            sparse_terms=source.sparse_terms,
-            id_map=source.id_map,
-            existing_target_ids=set(target_points),
             source_fingerprint=source.fingerprint,
             metadata_fingerprint=metadata_fingerprint,
             sparse_map_fingerprint=sparse_map_fingerprint,
             acl_incomplete_count=source.acl_incomplete_count,
-            target_metadata_exists=target_metadata_exists,
+            sparse_term_count=source.sparse_term_count,
+            sparse_term_fingerprint=source.sparse_term_fingerprint,
+            batch_size=self.batch_size,
+            timeout_seconds=self.timeout_seconds,
         )
 
     def _create_collection(self, name: str, body: dict[str, Any]) -> None:
@@ -2203,12 +2595,13 @@ class QdrantMigration:
         )
         self._validate_payload_indexes(schema, indexes)
 
-    def _write_sparse_dictionary(self, terms: set[str]) -> None:
-        if not terms:
+    def _write_sparse_dictionary(self, terms: Iterable[str]) -> None:
+        term_set = set(terms)
+        if not term_set:
             return
-        self._validate_sparse_terms(terms)
+        self._validate_sparse_terms(term_set)
         existing, _ = self._existing_sparse_dictionary()
-        missing = terms - set(existing)
+        missing = term_set - set(existing)
         points = []
         for term in sorted(missing):
             points.append(
@@ -2234,10 +2627,10 @@ class QdrantMigration:
     ) -> None:
         if (
             actual.source_count != expected.source_count
-            or actual.id_map != expected.id_map
-            or actual.sparse_terms != expected.sparse_terms
             or actual.fingerprint != expected.source_fingerprint
             or actual.acl_incomplete_count != expected.acl_incomplete_count
+            or actual.sparse_term_count != expected.sparse_term_count
+            or actual.sparse_term_fingerprint != expected.sparse_term_fingerprint
         ):
             raise MigrationError(
                 f"source changed {phase}; rerun preflight with source writes frozen"
@@ -2248,9 +2641,8 @@ class QdrantMigration:
         fields = plan.to_dict()
         for name in (
             "target_count",
-            "target_exists",
-            "existing_target_ids",
-            "target_metadata_exists",
+            "target_absent",
+            "target_state",
         ):
             fields.pop(name, None)
         return fields
@@ -2371,66 +2763,97 @@ class QdrantMigration:
         self,
         *,
         source: SourceSnapshot,
+        layout: CollectionLayout,
         schema: Mapping[str, Any],
-        copied_target_ids: set[str],
         allow_acl_fail_open: bool,
     ) -> int:
         target_count = self._count(self.target_collection)
-        target_points, target_scanned = self._existing_target_points(with_vectors=True)
-        if target_scanned != target_count:
-            raise MigrationError(
-                "target count mismatch after copy: "
-                f"exact count={target_count} paginated count={target_scanned}"
-            )
-        expected_ids = set(source.id_map.values())
-        actual_ids = set(target_points)
-        if actual_ids != expected_ids:
-            missing = sorted(expected_ids - actual_ids)
-            extras = sorted(actual_ids - expected_ids)
-            raise MigrationError(
-                "target records differ after copy: "
-                f"missing={missing!r} extras={extras!r}"
-            )
-        expected_points = {
-            str(point["id"]): point
-            for point in source.points
-        }
-        if set(expected_points) != expected_ids:
-            raise MigrationError("source snapshot has an inconsistent target id map")
         _, sparse_by_index = self._existing_sparse_dictionary()
-        for target_id, expected in expected_points.items():
-            actual = target_points[target_id]
-            payload = actual.get("payload")
-            expected_payload = expected.get("payload")
-            if not isinstance(payload, Mapping) or not isinstance(expected_payload, Mapping):
+        with _ScanManifest() as manifest:
+            target_scanned = self._scan_target_ids(manifest)
+            if target_scanned != target_count:
                 raise MigrationError(
-                    f"target point {target_id!r} has an invalid payload"
+                    "target count mismatch after copy: "
+                    f"exact count={target_count} paginated count={target_scanned}"
                 )
-            if str(payload.get(_ORIGINAL_ID_FIELD)) != str(
-                expected_payload.get(_ORIGINAL_ID_FIELD)
-            ):
-                raise MigrationError(
-                    f"target point {target_id!r} has the wrong original id"
-                )
-            self._validate_target_payload(
-                payload,
-                expected_payload,
+            pending: list[dict[str, Any]] = []
+
+            def validate_batch(points: list[dict[str, Any]]) -> None:
+                actual_points = {
+                    str(point.get("id")): point
+                    for point in self._retrieve(
+                        self.target_collection,
+                        [str(point["id"]) for point in points],
+                        with_vectors=True,
+                    )
+                    if point.get("id") is not None
+                }
+                for expected in points:
+                    target_id = str(expected["id"])
+                    actual = actual_points.get(target_id)
+                    if actual is None:
+                        raise MigrationError(
+                            f"target records differ after copy: missing={target_id!r}"
+                        )
+                    payload = actual.get("payload")
+                    expected_payload = expected.get("payload")
+                    if not isinstance(payload, Mapping) or not isinstance(
+                        expected_payload, Mapping
+                    ):
+                        raise MigrationError(
+                            f"target point {target_id!r} has an invalid payload"
+                        )
+                    if str(payload.get(_ORIGINAL_ID_FIELD)) != str(
+                        expected_payload.get(_ORIGINAL_ID_FIELD)
+                    ):
+                        raise MigrationError(
+                            f"target point {target_id!r} has the wrong original id"
+                        )
+                    self._validate_target_payload(
+                        payload,
+                        expected_payload,
+                        schema=schema,
+                        allow_acl_fail_open=allow_acl_fail_open,
+                        point_id=target_id,
+                    )
+                    if payload != expected_payload:
+                        raise MigrationError(
+                            f"target point {target_id!r} payload differs from copied source"
+                        )
+                    self._assert_target_vectors(
+                        actual,
+                        expected,
+                        exact=True,
+                        sparse_dictionary=sparse_by_index,
+                    )
+                    manifest.delete_target(target_id)
+
+            def validate_point(expected: dict[str, Any]) -> None:
+                pending.append(expected)
+                if len(pending) >= self.batch_size:
+                    validate_batch(pending)
+                    pending.clear()
+
+            actual_source = self._scan_source(
+                layout=layout,
                 schema=schema,
-                allow_acl_fail_open=allow_acl_fail_open,
-                point_id=target_id,
+                point_callback=validate_point,
             )
-            copied = target_id in copied_target_ids
-            if copied and payload != expected_payload:
+            # The caller already validated the physical layout; this summary
+            # is only used to guard the stream against source drift.
+            if (
+                actual_source.source_count != source.source_count
+                or actual_source.fingerprint != source.fingerprint
+            ):
+                raise MigrationError("source changed final verification")
+            if pending:
+                validate_batch(pending)
+            extra = manifest.first_extra_target()
+            if extra is not None:
                 raise MigrationError(
-                    f"target point {target_id!r} payload differs from copied source"
+                    f"target records differ after copy: extras={extra!r}"
                 )
-            self._assert_target_vectors(
-                actual,
-                expected,
-                exact=copied,
-                sparse_dictionary=sparse_by_index,
-            )
-        self._assert_sparse_dictionary_complete(source.sparse_terms)
+        self._assert_sparse_dictionary_complete(self._sparse_map.values())
         return target_count
 
     @staticmethod
@@ -2542,7 +2965,6 @@ class QdrantMigration:
         source = self._scan_source(
             layout=layout,
             schema=metadata.schema,
-            capture_points=True,
         )
         self._assert_source_snapshot(plan, source, phase="preflight")
         if plan.acl_incomplete_count and not allow_acl_fail_open:
@@ -2553,19 +2975,24 @@ class QdrantMigration:
 
         target_exists = self._exists(self.target_collection)
         target_metadata_exists = self._exists(self.target_metadata_collection)
-        if (
-            target_exists != plan.target_exists
-            or (
-                target_metadata_exists != plan.target_metadata_exists
-                and not (
-                    not plan.target_metadata_exists
-                    and target_metadata_exists
-                    and not target_exists
-                )
-            )
-        ):
+        if target_exists and not target_metadata_exists:
             raise MigrationError(
                 "target state changed after preflight; rerun preflight before apply"
+            )
+        if plan.target_absent and (target_exists or target_metadata_exists):
+            if not (
+                target_metadata_exists
+                and not target_exists
+                and (
+                    self._load_current_marker() or {}
+                ).get("setup_complete") is False
+            ):
+                raise MigrationError(
+                    "target state changed after preflight; rerun preflight before apply"
+                )
+        if plan.target_state in {"active", "retained", "rolled_back"}:
+            raise MigrationError(
+                f"cannot apply against target in migration state {plan.target_state!r}"
             )
 
         existing_marker: dict[str, Any] | None = None
@@ -2585,11 +3012,7 @@ class QdrantMigration:
                 metadata=metadata,
             )
             self._assert_marker_fingerprints(existing_marker, plan)
-            if (
-                not plan.target_metadata_exists
-                and target_metadata_exists
-                and existing_marker.get("setup_complete") is not False
-            ):
+            if plan.target_absent and existing_marker.get("setup_complete") is not False:
                 raise MigrationError(
                     "target metadata appeared after preflight without an incomplete "
                     "migration marker"
@@ -2617,15 +3040,24 @@ class QdrantMigration:
                 sparse_map_fingerprint=plan.sparse_map_fingerprint,
                 setup_complete=False,
                 acl_incomplete_count=plan.acl_incomplete_count,
+                source_count=plan.source_count,
+                target_count=plan.target_count,
             )
         else:
             # Preserve target-side schema/policy extensions accepted during
             # preflight while toggling only the migration gate.
             marker_incomplete = dict(existing_marker)
             marker_incomplete["setup_complete"] = False
+            marker_incomplete["migration_state"] = "building"
             marker_incomplete["acl_incomplete_count"] = plan.acl_incomplete_count
+            marker_incomplete["source_count"] = plan.source_count
+            marker_incomplete["target_count"] = plan.target_count
+            marker_incomplete["last_source_cursor"] = None
+            marker_incomplete["backfill_complete"] = False
         marker_complete = dict(marker_incomplete)
         marker_complete["setup_complete"] = True
+        marker_complete["migration_state"] = "ready"
+        marker_complete["target_count"] = plan.source_count
 
         target_created = False
         metadata_created = False
@@ -2650,7 +3082,7 @@ class QdrantMigration:
                 self._write_marker(marker_incomplete)
                 marker_written = True
                 self._write_indexes(index_schema, index_metadata)
-                self._write_sparse_dictionary(source.sparse_terms)
+                self._write_sparse_dictionary(self._sparse_map.values())
             else:
                 # Claim the data collection before writing its marker.  This
                 # prevents a concurrent collection creator from inheriting a
@@ -2692,29 +3124,35 @@ class QdrantMigration:
                     self._write_marker(marker_incomplete)
                     marker_written = True
                 self._write_indexes(index_schema, index_metadata)
-                self._write_sparse_dictionary(source.sparse_terms)
+                self._write_sparse_dictionary(self._sparse_map.values())
 
             self._wait_collection_ready(self.target_collection)
             self._wait_collection_ready(self.target_metadata_collection)
 
             migrated = 0
             skipped = 0
-            copied_target_ids: set[str] = set()
             pending: list[dict[str, Any]] = []
-            for transformed in source.points:
+
+            def copy_point(transformed: dict[str, Any]) -> None:
+                nonlocal migrated, skipped, pending
                 pending.append(transformed)
                 if len(pending) < self.batch_size:
-                    continue
-                migrated_batch, skipped_batch, copied_batch = self._apply_batch(pending)
+                    return
+                migrated_batch, skipped_batch = self._apply_batch(pending)
                 migrated += migrated_batch
                 skipped += skipped_batch
-                copied_target_ids.update(copied_batch)
                 pending = []
+
+            written_source = self._scan_source(
+                layout=layout,
+                schema=metadata.schema,
+                point_callback=copy_point,
+            )
             if pending:
-                migrated_batch, skipped_batch, copied_batch = self._apply_batch(pending)
+                migrated_batch, skipped_batch = self._apply_batch(pending)
                 migrated += migrated_batch
                 skipped += skipped_batch
-                copied_target_ids.update(copied_batch)
+            self._assert_source_snapshot(plan, written_source, phase="backfill")
 
             self._assert_source_layout(layout, phase="final verification")
             final_source = self._scan_source(layout=layout, schema=metadata.schema)
@@ -2727,8 +3165,8 @@ class QdrantMigration:
             self._wait_collection_ready(self.target_collection)
             target_count = self._validate_final_target(
                 source=source,
+                layout=layout,
                 schema=metadata.schema,
-                copied_target_ids=copied_target_ids,
                 allow_acl_fail_open=allow_acl_fail_open,
             )
             self._validate_existing_target(
@@ -2768,13 +3206,13 @@ class QdrantMigration:
             target_collection=self.target_collection,
         )
 
-    def _apply_batch(self, points: list[dict[str, Any]]) -> tuple[int, int, set[str]]:
+    def _apply_batch(self, points: list[dict[str, Any]]) -> tuple[int, int]:
         existing = {
             str(point.get("id")): point
             for point in self._retrieve(
                 self.target_collection,
                 [str(point["id"]) for point in points],
-                with_vectors=False,
+                with_vectors=True,
             )
             if point.get("id") is not None
         }
@@ -2795,24 +3233,20 @@ class QdrantMigration:
                     f"existing={current_id!r} source={source_id!r}"
                 )
             expected_payload = point["payload"]
+            vectors_match = False
             if payload == expected_payload:
+                try:
+                    self._assert_target_vectors(current, point, exact=True)
+                except MigrationError:
+                    pass
+                else:
+                    vectors_match = True
+            if vectors_match:
                 skipped += 1
-                continue
-            if (
-                isinstance(payload, Mapping)
-                and isinstance(expected_payload, Mapping)
-                and payload.get("owner_user_id") is None
-            ):
-                current_without_owner = dict(payload)
-                expected_without_owner = dict(expected_payload)
-                current_without_owner.pop("owner_user_id", None)
-                expected_without_owner.pop("owner_user_id", None)
-                if current_without_owner == expected_without_owner:
-                    write.append(point)
-                    continue
-            skipped += 1
+            else:
+                write.append(point)
         self._write_points(self.target_collection, write)
-        return len(write), skipped, {str(point["id"]) for point in write}
+        return len(write), skipped
 
 
 def _load_sparse_map(path: str | None) -> dict[str, Any] | None:
@@ -2841,9 +3275,13 @@ def _load_plan(path: str | None) -> MigrationPlan | None:
         "target_collection",
         "source_metadata_collection",
         "target_metadata_collection",
+        "logical_collection",
+        "migration_id",
+        "migrator_version",
         "source_count",
         "target_count",
-        "target_exists",
+        "target_absent",
+        "target_state",
         "dense_vector_name",
         "sparse_vector_name",
         "vector_dimension",
@@ -2852,14 +3290,14 @@ def _load_plan(path: str | None) -> MigrationPlan | None:
         "sparse_enabled",
         "sparse_modifier",
         "sparse_weight",
-        "sparse_terms",
-        "id_map",
-        "existing_target_ids",
         "source_fingerprint",
         "metadata_fingerprint",
         "sparse_map_fingerprint",
         "acl_incomplete_count",
-        "target_metadata_exists",
+        "sparse_term_count",
+        "sparse_term_fingerprint",
+        "batch_size",
+        "timeout_seconds",
     }
     missing = sorted(expected_fields - set(value))
     extra = sorted(set(value) - expected_fields)
@@ -2882,31 +3320,6 @@ def _load_plan(path: str | None) -> MigrationPlan | None:
             raise MigrationError(f"migration plan field {name!r} must be non-negative")
         return item
 
-    sparse_terms = value["sparse_terms"]
-    if (
-        not isinstance(sparse_terms, list)
-        or any(not isinstance(term, str) for term in sparse_terms)
-        or len(set(sparse_terms)) != len(sparse_terms)
-    ):
-        raise MigrationError("migration plan sparse_terms must be a list of unique strings")
-    existing_target_ids = value["existing_target_ids"]
-    if (
-        not isinstance(existing_target_ids, list)
-        or any(not isinstance(point_id, str) for point_id in existing_target_ids)
-        or len(set(existing_target_ids)) != len(existing_target_ids)
-    ):
-        raise MigrationError(
-            "migration plan existing_target_ids must be a list of unique strings"
-        )
-    id_map = value["id_map"]
-    if (
-        not isinstance(id_map, dict)
-        or any(
-            not isinstance(key, str) or not isinstance(point_id, str)
-            for key, point_id in id_map.items()
-        )
-    ):
-        raise MigrationError("migration plan id_map must map strings to strings")
     sparse_weight = value["sparse_weight"]
     if (
         isinstance(sparse_weight, bool)
@@ -2914,39 +3327,76 @@ def _load_plan(path: str | None) -> MigrationPlan | None:
         or not math.isfinite(float(sparse_weight))
     ):
         raise MigrationError("migration plan sparse_weight must be finite")
-    for name in ("target_exists", "sparse_enabled", "target_metadata_exists"):
+    for name in ("target_absent", "sparse_enabled"):
         if not isinstance(value[name], bool):
             raise MigrationError(f"migration plan field {name!r} must be a boolean")
+    target_state = value["target_state"]
+    if (
+        target_state is not None
+        and (
+            not isinstance(target_state, str)
+            or target_state not in MIGRATION_STATES
+        )
+    ):
+        raise MigrationError("migration plan target_state is invalid")
+    if value["target_absent"] and target_state is not None:
+        raise MigrationError(
+            "migration plan target_state must be null when target_absent is true"
+        )
+    if value["migrator_version"] != MIGRATOR_VERSION:
+        raise MigrationError(
+            "migration plan migrator_version does not match the running controller"
+        )
     for name in ("dense_datatype", "sparse_modifier"):
         if value[name] is not None and (
             not isinstance(value[name], str) or not value[name]
         ):
             raise MigrationError(f"migration plan field {name!r} must be a string or null")
+    sparse_term_count = integer("sparse_term_count", non_negative=True)
+    sparse_term_fingerprint = text("sparse_term_fingerprint")
+    batch_size = integer("batch_size")
+    if batch_size <= 0:
+        raise MigrationError("migration plan batch_size must be positive")
+    vector_dimension = integer("vector_dimension")
+    if vector_dimension <= 0:
+        raise MigrationError("migration plan vector_dimension must be positive")
+    timeout_seconds = value["timeout_seconds"]
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or float(timeout_seconds) <= 0
+    ):
+        raise MigrationError("migration plan timeout_seconds must be positive and finite")
 
     return MigrationPlan(
         source_collection=text("source_collection"),
         target_collection=text("target_collection"),
         source_metadata_collection=text("source_metadata_collection"),
         target_metadata_collection=text("target_metadata_collection"),
+        logical_collection=text("logical_collection"),
+        migration_id=text("migration_id"),
+        migrator_version=text("migrator_version"),
         source_count=integer("source_count", non_negative=True),
         target_count=integer("target_count", non_negative=True),
-        target_exists=value["target_exists"],
+        target_absent=value["target_absent"],
+        target_state=target_state,
         dense_vector_name=text("dense_vector_name"),
         sparse_vector_name=text("sparse_vector_name"),
-        vector_dimension=integer("vector_dimension"),
+        vector_dimension=vector_dimension,
         distance=text("distance"),
         dense_datatype=value["dense_datatype"],
         sparse_enabled=value["sparse_enabled"],
         sparse_modifier=value["sparse_modifier"],
         sparse_weight=float(sparse_weight),
-        sparse_terms=set(sparse_terms),
-        id_map=dict(id_map),
-        existing_target_ids=set(existing_target_ids),
         source_fingerprint=text("source_fingerprint"),
         metadata_fingerprint=text("metadata_fingerprint"),
         sparse_map_fingerprint=text("sparse_map_fingerprint"),
         acl_incomplete_count=integer("acl_incomplete_count", non_negative=True),
-        target_metadata_exists=value["target_metadata_exists"],
+        sparse_term_count=sparse_term_count,
+        sparse_term_fingerprint=sparse_term_fingerprint,
+        batch_size=batch_size,
+        timeout_seconds=float(timeout_seconds),
     )
 
 
@@ -2958,8 +3408,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-collection", required=True)
     parser.add_argument("--source-metadata-collection")
     parser.add_argument("--target-metadata-collection")
+    parser.add_argument("--logical-collection", required=True)
+    parser.add_argument("--migration-id", required=True)
     parser.add_argument("--batch-size", type=int, default=100)
-    parser.add_argument("--timeout-seconds", type=float, default=10.0)
+    parser.add_argument("--timeout-seconds", type=float, required=True)
     parser.add_argument("--dense-vector-name")
     parser.add_argument("--sparse-vector-name")
     parser.add_argument(
@@ -3009,6 +3461,8 @@ def main(argv: list[str] | None = None) -> int:
             dense_vector_name=args.dense_vector_name,
             sparse_vector_name=args.sparse_vector_name,
             sparse_map=sparse_map,
+            logical_collection=args.logical_collection,
+            migration_id=args.migration_id,
             timeout_seconds=args.timeout_seconds,
         )
         if args.command == "preflight":

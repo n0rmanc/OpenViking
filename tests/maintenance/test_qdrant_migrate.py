@@ -6,6 +6,7 @@ from urllib.parse import unquote, urlsplit
 
 import pytest
 
+from openviking.storage.vectordb.qdrant_sparse import stable_sparse_index
 from openviking.storage.vectordb.qdrant_utils import to_qdrant_point_id
 from scripts.maintenance.qdrant_migrate import (
     MigrationError,
@@ -14,6 +15,7 @@ from scripts.maintenance.qdrant_migrate import (
     _legacy_collection_metadata_id,
     _legacy_index_metadata_id,
     _load_plan,
+    _parser,
     main,
 )
 
@@ -215,6 +217,8 @@ def test_migration_target_mutations_use_strong_ordering_and_timeout() -> None:
         target_collection="index-data",
         source_metadata_collection="legacy__meta",
         target_metadata_collection="index-data__meta",
+        logical_collection="legacy/context",
+        migration_id="mig-1",
         timeout_seconds=37,
     )
 
@@ -268,6 +272,8 @@ def test_migration_collection_named_points_keeps_collection_contract() -> None:
         target_collection="points",
         source_metadata_collection="legacy__meta",
         target_metadata_collection="points__meta",
+        logical_collection="legacy/context",
+        migration_id="mig-1",
         timeout_seconds=37,
     )
 
@@ -297,6 +303,8 @@ def test_migration_point_mutation_rejects_acknowledged_result() -> None:
         target_collection="current",
         source_metadata_collection="legacy__meta",
         target_metadata_collection="current__meta",
+        logical_collection="legacy/context",
+        migration_id="mig-1",
         timeout_seconds=37,
     )
 
@@ -317,6 +325,8 @@ def test_migration_rejects_qdrant_versions_below_strong_ordering_floor() -> None
         target_collection="current",
         source_metadata_collection="legacy__meta",
         target_metadata_collection="current__meta",
+        logical_collection="legacy/context",
+        migration_id="mig-1",
         timeout_seconds=1.0,
     )
 
@@ -333,6 +343,8 @@ def test_migration_rejects_qdrant_prerelease_versions(version: str) -> None:
         target_collection="current",
         source_metadata_collection="legacy__meta",
         target_metadata_collection="current__meta",
+        logical_collection="legacy/context",
+        migration_id="mig-1",
         timeout_seconds=1.0,
     )
 
@@ -348,6 +360,8 @@ def test_migration_accepts_qdrant_build_metadata_on_stable_version() -> None:
         target_collection="current",
         source_metadata_collection="legacy__meta",
         target_metadata_collection="current__meta",
+        logical_collection="legacy/context",
+        migration_id="mig-1",
         timeout_seconds=1.0,
     )
 
@@ -381,6 +395,8 @@ def test_migration_readiness_polls_until_green_and_indexes_visible() -> None:
         target_collection="current",
         source_metadata_collection="legacy__meta",
         target_metadata_collection="current__meta",
+        logical_collection="legacy/context",
+        migration_id="mig-1",
         timeout_seconds=0.2,
     )
 
@@ -399,6 +415,8 @@ def test_migration_readiness_rejects_red_collection() -> None:
         target_collection="current",
         source_metadata_collection="legacy__meta",
         target_metadata_collection="current__meta",
+        logical_collection="legacy/context",
+        migration_id="mig-1",
         timeout_seconds=1.0,
     )
 
@@ -417,6 +435,8 @@ def test_migration_readiness_times_out_while_collection_is_yellow() -> None:
         target_collection="current",
         source_metadata_collection="legacy__meta",
         target_metadata_collection="current__meta",
+        logical_collection="legacy/context",
+        migration_id="mig-1",
         timeout_seconds=0.01,
     )
 
@@ -541,6 +561,8 @@ def _legacy_fixture(*, sparse: bool = True) -> FakeQdrant:
 
 
 def _migration(qdrant: FakeQdrant, **kwargs: object) -> QdrantMigration:
+    kwargs.setdefault("logical_collection", "legacy/context")
+    kwargs.setdefault("migration_id", "mig-1")
     return QdrantMigration(
         client=qdrant,
         source_collection="legacy__context",
@@ -549,6 +571,142 @@ def _migration(qdrant: FakeQdrant, **kwargs: object) -> QdrantMigration:
         target_metadata_collection="current__context__openviking_meta",
         **kwargs,
     )
+
+
+def _add_current_marker(
+    qdrant: FakeQdrant,
+    *,
+    migration_id: str = "mig-1",
+    migration_state: str = "building",
+) -> None:
+    migration = _migration(qdrant, migration_id=migration_id)
+    plan = migration.preflight()
+    metadata = migration._legacy_metadata()
+    layout = migration._layout(
+        migration._collection_info(migration.source_collection),
+    )
+    marker = migration._marker_payload(
+        layout=layout,
+        metadata=metadata,
+        sparse_weight=plan.sparse_weight,
+        source_fingerprint=plan.source_fingerprint,
+        metadata_fingerprint=plan.metadata_fingerprint,
+        sparse_map_fingerprint=plan.sparse_map_fingerprint,
+        setup_complete=migration_state in {"ready", "cutting_over", "active", "retained"},
+        acl_incomplete_count=plan.acl_incomplete_count,
+        migration_state=migration_state,
+        source_count=plan.source_count,
+        target_count=0,
+    )
+    marker["migration_id"] = migration_id
+    qdrant.add_collection(
+        migration.target_metadata_collection,
+        vectors={"meta": {"size": 1, "distance": "Dot"}},
+        points=[
+            {
+                "id": to_qdrant_point_id("openviking:metadata"),
+                "vector": {"meta": [0.0]},
+                "payload": marker,
+            }
+        ],
+    )
+
+
+def test_preflight_plan_is_compact_and_binds_identity() -> None:
+    plan = _migration(
+        _legacy_fixture(sparse=False),
+        logical_collection="legacy/context",
+        migration_id="mig-1",
+        timeout_seconds=23,
+    ).preflight()
+
+    value = plan.to_dict()
+
+    assert value["logical_collection"] == "legacy/context"
+    assert value["migration_id"] == "mig-1"
+    assert value["timeout_seconds"] == 23.0
+    assert value["target_absent"] is True
+    assert value["target_state"] is None
+    assert "id_map" not in value
+    assert "existing_target_ids" not in value
+    assert "sparse_terms" not in value
+    assert "url" not in value
+    assert "api_key" not in value
+
+
+def test_foreign_target_marker_is_rejected() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    _add_current_marker(qdrant, migration_id="other")
+
+    with pytest.raises(MigrationError, match="migration ID"):
+        _migration(qdrant, migration_id="mig-1").preflight()
+
+
+def test_state_transition_preserves_setup_gate() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _add_current_marker(qdrant)
+
+    assert migration._transition("building")["setup_complete"] is False
+    assert migration._transition("ready")["setup_complete"] is True
+
+
+def test_cli_phase_arguments_require_identity_and_timeout() -> None:
+    with pytest.raises(SystemExit):
+        _parser().parse_args(
+            [
+                "--url",
+                "http://qdrant.invalid",
+                "--source-collection",
+                "legacy__context",
+                "--target-collection",
+                "current__context",
+                "preflight",
+            ]
+        )
+
+    args = _parser().parse_args(
+        [
+            "--url",
+            "http://qdrant.invalid",
+            "--source-collection",
+            "legacy__context",
+            "--target-collection",
+            "current__context",
+            "--logical-collection",
+            "legacy/context",
+            "--migration-id",
+            "mig-1",
+            "--timeout-seconds",
+            "23",
+            "preflight",
+        ]
+    )
+    assert args.logical_collection == "legacy/context"
+    assert args.migration_id == "mig-1"
+    assert args.timeout_seconds == 23.0
+
+
+def test_cli_apply_requires_a_reviewed_plan() -> None:
+    with pytest.raises(SystemExit):
+        _parser().parse_args(
+            [
+                "--url",
+                "http://qdrant.invalid",
+                "--source-collection",
+                "legacy__context",
+                "--target-collection",
+                "current__context",
+                "--logical-collection",
+                "legacy/context",
+                "--migration-id",
+                "mig-1",
+                "--timeout-seconds",
+                "23",
+                "apply",
+                "--confirm",
+            ]
+        )
 
 
 def _apply(migration: QdrantMigration, **kwargs: object):
@@ -565,14 +723,8 @@ def test_preflight_aggregates_metadata_and_remaps_ids_without_writes() -> None:
     assert plan.source_count == 2
     assert plan.dense_vector_name == "vector"
     assert plan.vector_dimension == 2
-    assert plan.sparse_terms == {"hello", "world"}
-    assert plan.target_exists is False
-    assert plan.id_map == {
-        "1": to_qdrant_point_id("1"),
-        "550e8400-e29b-41d4-a716-446655440000": to_qdrant_point_id(
-            "550e8400-e29b-41d4-a716-446655440000"
-        ),
-    }
+    assert plan.sparse_term_count == 2
+    assert plan.target_absent is True
     assert all(method in {"GET", "POST"} for method, _, _ in qdrant.requests)
 
 
@@ -633,7 +785,7 @@ def test_apply_creates_current_marker_indexes_and_data_but_never_changes_source(
     assert result.target_count == 2
 
 
-def test_apply_is_idempotent_and_preserves_existing_target_records() -> None:
+def test_apply_reconciles_existing_target_records_from_source() -> None:
     qdrant = _legacy_fixture()
     migration = _migration(qdrant, sparse_map={111: "hello", 222: "world"})
     _apply(migration, confirm=True, allow_acl_fail_open=True)
@@ -650,9 +802,9 @@ def test_apply_is_idempotent_and_preserves_existing_target_records() -> None:
 
     result = _apply(migration, confirm=True, allow_acl_fail_open=True)
 
-    assert result.migrated_count == 0
-    assert result.skipped_count == 2
-    assert target[existing_id]["payload"]["name"] == "newer-target-value"
+    assert result.migrated_count == 1
+    assert result.skipped_count == 1
+    assert target[existing_id]["payload"]["name"] == "doc"
     assert (
         len(
             [
@@ -661,7 +813,7 @@ def test_apply_is_idempotent_and_preserves_existing_target_records() -> None:
                 if request[0] == "PUT" and request[1].endswith("/current__context/points")
             ]
         )
-        == data_writes_before
+        == data_writes_before + 1
     )
 
 
@@ -714,7 +866,7 @@ def test_incomplete_marker_resumes_after_data_setup_crash(monkeypatch) -> None:
     assert result.target_count == 2
 
 
-def test_resume_preserves_newer_target_vectors() -> None:
+def test_resume_reconciles_newer_target_vectors() -> None:
     qdrant = _legacy_fixture(sparse=False)
     migration = _migration(qdrant)
     _apply(migration, confirm=True, allow_acl_fail_open=True)
@@ -726,31 +878,31 @@ def test_resume_preserves_newer_target_vectors() -> None:
 
     result = _apply(_migration(qdrant), confirm=True, allow_acl_fail_open=True)
 
-    assert result.migrated_count == 0
-    assert result.skipped_count == 2
+    assert result.migrated_count == 1
+    assert result.skipped_count == 1
     assert qdrant.collections["current__context"]["points"][existing_id]["vector"]["vector"] == [
-        9.0,
-        9.0,
+        1.0,
+        0.0,
     ]
 
 
-def test_resume_rejects_malformed_existing_target_vectors() -> None:
+def test_resume_repairs_malformed_existing_target_vectors() -> None:
     qdrant = _legacy_fixture(sparse=False)
     migration = _migration(qdrant)
     _apply(migration, confirm=True, allow_acl_fail_open=True)
     existing_id = to_qdrant_point_id("1")
     qdrant.collections["current__context"]["points"][existing_id]["vector"].pop("vector")
 
-    with pytest.raises(MigrationError, match="vector"):
-        _apply(_migration(qdrant), confirm=True, allow_acl_fail_open=True)
+    result = _apply(_migration(qdrant), confirm=True, allow_acl_fail_open=True)
 
-    marker = qdrant.collections["current__context__openviking_meta"]["points"][
-        to_qdrant_point_id("openviking:metadata")
-    ]["payload"]
-    assert marker["setup_complete"] is False
+    assert result.migrated_count == 1
+    assert (
+        qdrant.collections["current__context"]["points"][existing_id]["vector"]["vector"]
+        == [1.0, 0.0]
+    )
 
 
-def test_resume_rejects_sparse_indexes_missing_from_dictionary() -> None:
+def test_resume_repairs_sparse_indexes_missing_from_dictionary() -> None:
     qdrant = _legacy_fixture(sparse=True)
     migration = _migration(qdrant, sparse_map={111: "hello", 222: "world"})
     _apply(migration, confirm=True, allow_acl_fail_open=True)
@@ -759,15 +911,22 @@ def test_resume_rejects_sparse_indexes_missing_from_dictionary() -> None:
         "sparse_vector"
     ]["indices"] = [7]
 
-    with pytest.raises(MigrationError, match="sparse dictionary"):
-        _apply(
-            _migration(qdrant, sparse_map={111: "hello", 222: "world"}),
-            confirm=True,
-            allow_acl_fail_open=True,
-        )
+    result = _apply(
+        _migration(qdrant, sparse_map={111: "hello", 222: "world"}),
+        confirm=True,
+        allow_acl_fail_open=True,
+    )
+
+    assert result.migrated_count == 1
+    assert (
+        qdrant.collections["current__context"]["points"][existing_id]["vector"][
+            "sparse_vector"
+        ]["indices"]
+        == [stable_sparse_index("hello")]
+    )
 
 
-def test_resume_rejects_missing_acl_on_existing_complete_target() -> None:
+def test_resume_repairs_missing_acl_on_existing_complete_target() -> None:
     qdrant = _legacy_fixture(sparse=False)
     for point in qdrant.collections["legacy__context"]["points"].values():
         point["payload"].update(
@@ -784,13 +943,12 @@ def test_resume_rejects_missing_acl_on_existing_complete_target() -> None:
         "acl_enabled"
     )
 
-    with pytest.raises(MigrationError, match="ACL"):
-        _apply(_migration(qdrant), confirm=True)
+    result = _apply(_migration(qdrant), confirm=True)
 
-    marker = qdrant.collections["current__context__openviking_meta"]["points"][
-        to_qdrant_point_id("openviking:metadata")
+    assert result.migrated_count == 1
+    assert "acl_enabled" in qdrant.collections["current__context"]["points"][
+        existing_id
     ]["payload"]
-    assert marker["setup_complete"] is False
 
 
 def test_missing_original_id_fails_before_target_creation() -> None:
@@ -922,7 +1080,7 @@ def test_existing_target_allows_newer_schema_fields_and_sparse_policy() -> None:
 
     plan = _migration(qdrant).preflight()
 
-    assert plan.target_exists is True
+    assert plan.target_absent is False
 
 
 def test_complete_marker_indexes_must_exist_physically() -> None:
@@ -1245,6 +1403,8 @@ def test_default_legacy_metadata_collection_is_global() -> None:
         client=qdrant,
         source_collection="legacy__context",
         target_collection="current__context",
+        logical_collection="legacy/context",
+        migration_id="mig-1",
     )
 
     assert migration.source_metadata_collection == "__openviking_meta"
@@ -1263,6 +1423,12 @@ def test_cli_reports_invalid_sparse_map_without_traceback(tmp_path, capsys) -> N
             "legacy__context",
             "--target-collection",
             "current__context",
+            "--logical-collection",
+            "legacy/context",
+            "--migration-id",
+            "mig-1",
+            "--timeout-seconds",
+            "10",
             "--sparse-map",
             str(sparse_map),
             "preflight",
@@ -1289,12 +1455,13 @@ def test_source_mutation_between_preflight_and_apply_is_rejected(monkeypatch) ->
     original_scan = migration._scan_source
     calls = 0
 
-    def scan_source(*, layout, schema, capture_points=False):
+    def scan_source(*, layout, schema, manifest=None, point_callback=None):
         nonlocal calls
         snapshot = original_scan(
             layout=layout,
             schema=schema,
-            capture_points=capture_points,
+            manifest=manifest,
+            point_callback=point_callback,
         )
         calls += 1
         if calls == 1:
@@ -1412,7 +1579,7 @@ def test_partial_index_setup_is_repaired_on_resume(monkeypatch) -> None:
     assert resumed_marker["setup_complete"] is True
 
 
-def test_existing_target_records_absent_from_source_are_rejected() -> None:
+def test_existing_target_records_absent_from_source_remain_for_reconcile() -> None:
     qdrant = _legacy_fixture(sparse=False)
     migration = _migration(qdrant)
     _apply(migration, confirm=True, allow_acl_fail_open=True)
@@ -1422,8 +1589,15 @@ def test_existing_target_records_absent_from_source_are_rejected() -> None:
         uri="/resources/extra.md",
     )
 
-    with pytest.raises(MigrationError, match="absent from the source"):
-        _migration(qdrant).preflight()
+    plan = _migration(qdrant).preflight()
+
+    assert plan.target_absent is False
+    with pytest.raises(MigrationError, match="extras"):
+        _migration(qdrant).apply(
+            confirm=True,
+            plan=plan,
+            allow_acl_fail_open=True,
+        )
 
 
 def test_sparse_only_source_record_is_preserved() -> None:
@@ -1759,7 +1933,7 @@ def test_sparse_map_accepts_numeric_looking_reverse_terms() -> None:
 
     plan = _migration(qdrant, sparse_map={"111": 111, "world": 222}).preflight()
 
-    assert plan.sparse_terms == {"111", "world"}
+    assert plan.sparse_term_count == 2
 
 
 def test_fractional_level_fails_closed() -> None:
@@ -1840,4 +2014,6 @@ def test_all_migration_collection_names_must_be_distinct() -> None:
             target_collection="current__context",
             source_metadata_collection="legacy__context__openviking_meta",
             target_metadata_collection="current__context",
+            logical_collection="legacy/context",
+            migration_id="mig-1",
         )

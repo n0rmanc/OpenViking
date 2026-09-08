@@ -94,6 +94,8 @@ def test_pre3872_migration_round_trips_through_current_adapter() -> None:
         target_metadata_collection=target_metadata,
         batch_size=1,
         sparse_map={111: "hello", 222: "world"},
+        logical_collection="legacy/context",
+        migration_id=suffix,
     )
     fields = [
         {"FieldName": "id", "FieldType": "string", "IsPrimaryKey": True},
@@ -239,7 +241,7 @@ def test_pre3872_migration_round_trips_through_current_adapter() -> None:
         assert plan.vector_dimension == 2
         assert plan.dense_datatype == "float32"
         assert plan.sparse_modifier == "idf"
-        assert plan.sparse_terms == {"hello", "world"}
+        assert plan.sparse_term_count == 2
 
         result = migration.apply(confirm=True, plan=plan)
         assert result.source_count == 3
