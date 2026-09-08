@@ -296,8 +296,9 @@ collection，不新增 `qdrant-client` 依赖：
 - 迁移流程为
   `preflight -> prepare -> backfill -> reconcile -> verify`。online copy 不冻结
   整个长窗口，只在 cutover 前由 operator 获取 barrier、drain in-flight writes，
-  再以 `cutover --barrier-held --deployment-hooks` 完成 rollout/readiness/read-only
-  smoke。operator 也负责明确 release barrier。
+  再以 `cutover --confirm --lock-held --barrier-held --plan /path/to/plan.json --deployment-hooks /path/to/hooks.json`
+  完成 rollout/readiness/read-only smoke。
+  operator 也负责明确 release barrier。
 - `--allow-acl-fail-open` 只记录并警告 incomplete ACL，绝不伪造保护；barrier
   release 后若 target 已接受 current-format writes，rollback 必须另做 reverse
   migration。`retire --confirm` 仅在 retention window 后、target 未被 serving 时

@@ -33,6 +33,19 @@ REQUIRED_QDRANT_TESTS = (
     "tests/storage/test_qdrant_integration.py",
     "tests/storage/test_collection_schemas.py",
 )
+REQUIRED_QDRANT_SHARED_DEPENDENCIES = (
+    "openviking/storage/collection_schemas.py",
+    "openviking/storage/viking_vector_index_backend.py",
+    "openviking/storage/vectordb_adapters/base.py",
+    "openviking/storage/vectordb_adapters/factory.py",
+    "openviking/storage/expr.py",
+)
+DEFAULT_CUVS_TESTS = (
+    "tests/vectordb/test_cuvs_config.py",
+    "tests/vectordb/test_cuvs_index.py",
+    "tests/vectordb/test_cuvs_collection.py",
+    "tests/vectordb/test_str_to_uint64.py",
+)
 
 
 class FakeQdrant:
@@ -4940,7 +4953,7 @@ def test_cli_rejects_invalid_hook_arrays_before_controller_dispatch(
     assert not _CliMigration.instances[-1].calls
 
 
-def test_qdrant_ci_workflow_lists_required_suites() -> None:
+def test_qdrant_ci_workflow_lists_required_suites(monkeypatch) -> None:
     root = Path(__file__).resolve().parents[2]
     workflow = yaml.safe_load((root / ".github/workflows/pr.yml").read_text())
     lite_workflow = yaml.safe_load(
@@ -4962,6 +4975,7 @@ def test_qdrant_ci_workflow_lists_required_suites() -> None:
     qdrant_pattern = qdrant_pattern_line.split("=", 1)[1].strip().strip('"')
     for path in (
         *REQUIRED_QDRANT_TESTS,
+        *REQUIRED_QDRANT_SHARED_DEPENDENCIES,
         "openviking/storage/vectordb/collection/qdrant_rest.py",
         "openviking/storage/vectordb/collection/qdrant_collection.py",
         "openviking/storage/vectordb/qdrant_sparse.py",
@@ -4996,7 +5010,60 @@ def test_qdrant_ci_workflow_lists_required_suites() -> None:
     lite_on = lite_workflow.get("on", lite_workflow.get(True))
     lite_inputs = lite_on["workflow_call"]["inputs"]
     assert "test_paths_json" in lite_inputs
+    for trigger_name in ("workflow_call", "workflow_dispatch"):
+        assert json.loads(
+            lite_on[trigger_name]["inputs"]["test_paths_json"]["default"]
+        ) == list(DEFAULT_CUVS_TESTS)
     lite_steps = lite_workflow["jobs"]["test-lite"]["steps"]
     test_step = next(step for step in lite_steps if "pytest" in step.get("run", ""))
-    assert test_step["env"] == {"QDRANT_URL": "", "QDRANT_API_KEY": ""}
-    assert "${{ join(fromJson(inputs.test_paths_json), ' ') }}" in test_step["run"]
+    assert test_step["env"] == {
+        "QDRANT_URL": "",
+        "QDRANT_API_KEY": "",
+        "TEST_PATHS_JSON": "${{ inputs.test_paths_json }}",
+    }
+    assert test_step["shell"] == "bash"
+
+    runner = test_step["run"].rstrip("\n")
+    prefix = "uv run python - <<'PY'\n"
+    suffix = "\nPY"
+    assert runner.startswith(prefix)
+    assert runner.endswith(suffix)
+    runner_source = runner[len(prefix) : -len(suffix)]
+    assert "${{ join(fromJson(inputs.test_paths_json), ' ') }}" not in runner
+
+    captured: list[tuple[list[str], dict[str, object]]] = []
+
+    def capture(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        captured.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(subprocess, "run", capture)
+    def run_runner(paths: list[str]) -> tuple[list[str], dict[str, object]]:
+        captured.clear()
+        monkeypatch.setenv("TEST_PATHS_JSON", json.dumps(paths))
+        exec(compile(runner_source, "<_test_lite.yml>", "exec"), {})
+        assert len(captured) == 1
+        return captured[0]
+
+    command_kwargs = {"check": True, "shell": False}
+    command_prefix = ["uv", "run", "pytest", "-q", "-o", "addopts=", "--"]
+    assert run_runner(list(DEFAULT_CUVS_TESTS)) == (
+        [*command_prefix, *DEFAULT_CUVS_TESTS],
+        command_kwargs,
+    )
+    assert run_runner(list(REQUIRED_QDRANT_TESTS)) == (
+        [*command_prefix, *REQUIRED_QDRANT_TESTS],
+        command_kwargs,
+    )
+
+    malicious_paths = ["tests/fixture; printf SHOULD_NOT_RUN", "--literal-option"]
+    assert run_runner(malicious_paths) == (
+        [*command_prefix, *malicious_paths],
+        command_kwargs,
+    )
+
+    captured.clear()
+    monkeypatch.setenv("TEST_PATHS_JSON", json.dumps(["tests/valid", 1]))
+    with pytest.raises(SystemExit, match="non-empty JSON array of non-empty strings"):
+        exec(compile(runner_source, "<_test_lite.yml>", "exec"), {})
+    assert captured == []

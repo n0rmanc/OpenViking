@@ -903,7 +903,7 @@ Document:
 ```text
 preflight -> prepare -> backfill -> reconcile -> verify
 barrier acquisition and in-flight write drain
-cutover --barrier-held --deployment-hooks
+cutover --confirm --lock-held --barrier-held --plan PATH --deployment-hooks PATH
 rollback only before accepted target writes and while the barrier is held
 retire --confirm after the retention window
 ```
