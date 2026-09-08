@@ -97,7 +97,12 @@ def _index_request(requests):
     return request
 
 
-def _qdrant_adapter_for_collection(collection: QdrantCollection) -> QdrantCollectionAdapter:
+def _qdrant_adapter_for_collection(
+    collection: QdrantCollection,
+    *,
+    distance_metric: str = "cosine",
+    sparse_weight: float = 0.0,
+) -> QdrantCollectionAdapter:
     adapter = QdrantCollectionAdapter(
         url="http://qdrant.local",
         api_key=None,
@@ -105,9 +110,9 @@ def _qdrant_adapter_for_collection(collection: QdrantCollection) -> QdrantCollec
         project_name="project",
         collection_name="docs",
         index_name="default",
-        distance_metric="cosine",
+        distance_metric=distance_metric,
         dimension=2,
-        sparse_weight=0.0,
+        sparse_weight=sparse_weight,
         dense_vector_name="dense",
         sparse_vector_name="sparse",
     )
@@ -546,7 +551,10 @@ async def test_update_collection_schema_creates_missing_qdrant_index() -> None:
     requests: list[tuple[str, str, dict[str, object], dict[str, object]]] = []
 
     collection._client.request = _index_request(requests)  # type: ignore[method-assign]
-    await _AsyncVectorAdapter(_qdrant_adapter_for_collection(collection)).update_collection_schema(
+    adapter = _qdrant_adapter_for_collection(
+        collection, distance_metric="dot", sparse_weight=0.35
+    )
+    await _AsyncVectorAdapter(adapter).update_collection_schema(
         [
             {"FieldName": "account_id", "FieldType": "string"},
             {"FieldName": "acl_enabled", "FieldType": "bool"},
@@ -557,9 +565,9 @@ async def test_update_collection_schema_creates_missing_qdrant_index() -> None:
 
     assert collection.get_index_meta_data("default") == {
         "IndexName": "default",
-        "VectorIndex": {"IndexType": "hnsw", "Distance": "cosine"},
+        "VectorIndex": {"IndexType": "hnsw_hybrid", "Distance": "dot"},
         "ScalarIndex": ["account_id", "tenant_custom", "acl_enabled"],
-        "SparseWeight": 0.0,
+        "SparseWeight": 0.35,
     }
     assert (
         "PUT",
@@ -573,6 +581,94 @@ async def test_update_collection_schema_creates_missing_qdrant_index() -> None:
         {"field_name": "acl_enabled", "field_schema": "bool"},
         {"wait": "true"},
     ) in requests
+
+
+@pytest.mark.asyncio
+async def test_non_qdrant_schema_update_keeps_local_branch_operations() -> None:
+    calls = []
+
+    class LocalCollection:
+        def get_meta_data(self):
+            return {"Fields": [{"FieldName": "existing", "FieldType": "string"}]}
+
+        def update(self, *, fields):
+            calls.append(("fields", fields))
+
+        def get_index_meta_data(self, index_name):
+            assert index_name == "default"
+            return {"ScalarIndex": ["existing_index"]}
+
+        def update_index(self, index_name, *, scalar_index):
+            calls.append(("index", index_name, scalar_index))
+
+    class LocalAdapter:
+        mode = "local"
+
+        def get_collection(self):
+            return LocalCollection()
+
+    await _AsyncVectorAdapter(LocalAdapter()).update_collection_schema(
+        [
+            {"FieldName": "existing", "FieldType": "string"},
+            {"FieldName": "added", "FieldType": "bool"},
+        ],
+        ["existing_index", "added_index"],
+        "default",
+    )
+
+    assert calls == [
+        ("fields", [{"FieldName": "added", "FieldType": "bool"}]),
+        ("index", "default", ["existing_index", "added_index"]),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_qdrant_schema_update_retries_after_index_failure() -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="docs",
+        metadata_collection_name="docs__meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+    )
+    collection._schema = {
+        "CollectionName": "docs",
+        "Fields": [{"FieldName": "account_id", "FieldType": "string"}],
+    }
+    collection._write_metadata_marker = lambda: None  # type: ignore[method-assign]
+    requests: list[tuple[str, str, dict[str, object], dict[str, object]]] = []
+    successful_request = _index_request(requests)
+    failed = False
+
+    def request(method, path, body=None, *, params=None):
+        nonlocal failed
+        if method == "PUT" and path.endswith("/index") and not failed:
+            failed = True
+            raise QdrantError("index failed", status=503)
+        return successful_request(method, path, body, params=params)
+
+    collection._client.request = request  # type: ignore[method-assign]
+    adapter = _qdrant_adapter_for_collection(collection)
+
+    with pytest.raises(QdrantError, match="index failed"):
+        await _AsyncVectorAdapter(adapter).update_collection_schema(
+            [{"FieldName": "account_id", "FieldType": "string"}],
+            ["account_id"],
+            "default",
+        )
+    assert not collection.has_index("default")
+
+    await _AsyncVectorAdapter(adapter).update_collection_schema(
+        [{"FieldName": "account_id", "FieldType": "string"}],
+        ["account_id"],
+        "default",
+    )
+
+    assert collection.get_index_meta_data("default")["ScalarIndex"] == ["account_id"]
 
 
 @pytest.mark.asyncio
