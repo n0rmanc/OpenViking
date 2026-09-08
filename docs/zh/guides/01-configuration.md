@@ -1409,7 +1409,7 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 | `sparse_weight` | float | 混合向量搜索的稀疏权重，仅在使用混合索引时生效 | 0.0 |
 | `volcengine` | object | 'volcengine' 类型的 VikingDB 配置 | - |
 | `vikingdb` | object | 'vikingdb' 类型的私有部署配置 | - |
-| `qdrant` | object | Qdrant REST 地址、API key、超时、named vector 名称和可选 metadata collection 名称 | - |
+| `qdrant` | object | Qdrant REST 地址、API key、超时、named vector 名称以及可选的 physical data/metadata collection 名称 | - |
 | `cuvs` | object | NVIDIA cuVS 配置，也用于在 'local' 下显式开启显存感知自动模式，参见 [cuVS 使用指南](./16-cuvs.md) | - |
 
 默认使用本地模式
@@ -1480,7 +1480,9 @@ named sparse vector 和客户端 weighted RRF hybrid search：
         "api_key": "optional-key",
         "timeout_seconds": 10,
         "dense_vector_name": "vector",
-        "sparse_vector_name": "sparse_vector"
+        "sparse_vector_name": "sparse_vector",
+        "data_collection_name": "default__context__generation",
+        "metadata_collection_name": "default__context__generation__openviking_meta"
       }
     }
   }
@@ -1497,6 +1499,30 @@ PR `#3872` 之前建立的 collection 不能由当前 adapter 直接接管。切
 当前 target collection 前，请先执行
 [pre-`#3872` migration runbook](../../../scripts/maintenance/README.md)，或
 重新导入数据。请在回滚窗口内保留 source collection 和旧 metadata sidecar。
+
+在线迁移时，`data_collection_name` 和 `metadata_collection_name` 是不可变的
+physical target 名称，不是 alias。controller 与 rollout 必须使用相同的
+`logical_collection`、`migration_id`、target pair 和 `timeout_seconds`，这些
+值会记录在 target marker 中。操作阶段为：
+
+```text
+preflight -> prepare -> backfill -> reconcile -> verify
+```
+
+online copy 不会冻结整个长 copy 窗口。请先取得 external per-source lock，让
+legacy 持续服务 source；只有 final reconcile/cutover 前才取得 write barrier，
+并先 drain in-flight writes。只有在 operator 持有 barrier 时才运行
+`cutover --confirm --lock-held --barrier-held --deployment-hooks`；current
+readiness 和 read-only smoke 通过后，仍由 operator 明确 release barrier。
+兼容性的 `apply` offline 路径仍保留全窗口 freeze 语义。
+
+临时 SQLite reconciliation manifest 只保存 target IDs 和 fingerprints，需要
+约一份 source scan 的磁盘空间，并不代表 online page reads 形成单一 snapshot。
+只有审阅 incomplete record 数量后才可传入 `--allow-acl-fail-open`；该选项只
+记录并警告风险，绝不会伪造 ACL protection。rollback 只允许在 barrier 仍持有且
+target 尚未接受 current-format write 时自动执行；release barrier 后必须另行设计
+reverse migration。`retire --confirm` 只能在 retention window 结束且确认 target
+未被 serving 后执行。
 
 Hybrid search 会分别向 Qdrant 发出 dense 和 sparse 请求，再由客户端以
 weighted reciprocal-rank score 合并结果。这不是 Qdrant 的 server-side RRF：

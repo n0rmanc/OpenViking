@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 from typing import Any, Dict, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from openviking_cli.utils.logger import get_logger
 
@@ -58,12 +58,25 @@ class QdrantConfig(BaseModel):
     timeout_seconds: float = Field(default=10.0, gt=0)
     dense_vector_name: str = Field(default="vector", min_length=1)
     sparse_vector_name: str = Field(default="sparse_vector", min_length=1)
+    data_collection_name: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description="Optional explicit Qdrant data collection name",
+    )
     metadata_collection_name: Optional[str] = Field(
         default=None,
+        min_length=1,
         description="Optional explicit OpenViking metadata collection name",
     )
 
     model_config = {"extra": "forbid"}
+
+    @field_validator("data_collection_name", "metadata_collection_name")
+    @classmethod
+    def validate_collection_name(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not value.strip():
+            raise ValueError("Qdrant collection names must not be blank")
+        return value
 
 
 class CuVSConfig(BaseModel):
@@ -231,8 +244,7 @@ class VectorDBBackendConfig(BaseModel):
     url: Optional[str] = Field(
         default=None,
         description=(
-            "Remote service URL for 'http' or 'qdrant' backends "
-            "(e.g., 'http://localhost:5000')"
+            "Remote service URL for 'http' or 'qdrant' backends (e.g., 'http://localhost:5000')"
         ),
     )
 

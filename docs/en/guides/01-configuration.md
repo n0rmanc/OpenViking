@@ -1434,7 +1434,7 @@ Vector database storage configuration
 | `sparse_weight` | float | Sparse weight for hybrid vector search, only effective when using hybrid index | 0.0 |
 | `volcengine` | object | 'volcengine' type VikingDB configuration | - |
 | `vikingdb` | object | 'vikingdb' type private deployment configuration | - |
-| `qdrant` | object | Qdrant REST URL, API key, timeout, named vector names, and optional metadata collection name | - |
+| `qdrant` | object | Qdrant REST URL, API key, timeout, named vector names, and optional physical data/metadata collection names | - |
 | `cuvs` | object | NVIDIA cuVS configuration for the 'cuvs' backend and the opt-in memory-aware auto mode on 'local'; see the [cuVS guide](./16-cuvs.md) | - |
 
 Default local mode
@@ -1506,7 +1506,9 @@ search:
         "api_key": "optional-key",
         "timeout_seconds": 10,
         "dense_vector_name": "vector",
-        "sparse_vector_name": "sparse_vector"
+        "sparse_vector_name": "sparse_vector",
+        "data_collection_name": "default__context__generation",
+        "metadata_collection_name": "default__context__generation__openviking_meta"
       }
     }
   }
@@ -1524,6 +1526,35 @@ Run the [pre-`#3872` migration runbook](../../../scripts/maintenance/README.md)
 or re-ingest the data before cutting configuration over to the current target
 collection. Keep the source collection and legacy metadata sidecar for the
 rollback window.
+
+For an online migration, `data_collection_name` and
+`metadata_collection_name` are immutable physical target names, not aliases.
+The controller and rollout must use the same `logical_collection`,
+`migration_id`, target pair, and `timeout_seconds`; these values are recorded
+in the target marker. The operational phases are:
+
+```text
+preflight -> prepare -> backfill -> reconcile -> verify
+```
+
+The online copy does not freeze the entire long copy. Acquire the external
+per-source lock, keep legacy serving the source, and acquire the write barrier
+only for final reconciliation and cutover. Drain in-flight writes before the
+final source snapshot. Run
+`cutover --confirm --lock-held --barrier-held --deployment-hooks` only with
+the operator-held barrier; the operator explicitly releases it after current
+readiness and read-only smoke pass. The compatibility `apply` command retains
+the full-window freeze semantics for its offline path.
+
+The temporary SQLite reconciliation manifest stores only target IDs and
+fingerprints and requires disk space for approximately one source scan. It is
+not a source snapshot across online page reads. Use
+`--allow-acl-fail-open` only after reviewing the incomplete-record count:
+the flag warns and records the risk, but never fakes ACL protection. Rollback
+is automatic only while the barrier is held and before any accepted
+current-format target write; after barrier release use a separate reverse
+migration. Run `retire --confirm` only after the retention window and after
+reviewing that the target is not served.
 
 Hybrid search sends separate dense and sparse requests to Qdrant and combines
 the results in the client with a weighted reciprocal-rank score. This is not
