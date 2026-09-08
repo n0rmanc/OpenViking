@@ -5078,7 +5078,7 @@ class QdrantMigration:
             self._validate_marker_ownership(marker)
             state = "retained"
 
-        if self._exists(self.target_collection):
+        if target_exists:
             self._validate_retire_pair(
                 plan=plan,
                 expected_state="retained",
@@ -5091,18 +5091,30 @@ class QdrantMigration:
                     "target data collection remains after a successful delete receipt"
                 )
         else:
+            if self._exists(self.target_collection):
+                raise MigrationError(
+                    "target data collection reappeared during retained retry"
+                )
             self._validate_retire_pair(
                 plan=plan,
                 expected_state="retained",
                 target_exists=False,
             )
 
+        if self._exists(self.target_collection):
+            raise MigrationError(
+                "target data collection reappeared before metadata deletion"
+            )
         self._validate_retire_pair(
             plan=plan,
             expected_state="retained",
             target_exists=False,
         )
         hooks.assert_target_not_served(self)
+        if self._exists(self.target_collection):
+            raise MigrationError(
+                "target data collection reappeared before metadata deletion"
+            )
         self._delete_collection(self.target_metadata_collection)
         if self._exists(self.target_metadata_collection):
             raise MigrationError(

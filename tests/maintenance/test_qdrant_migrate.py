@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import unquote, urlsplit
 
 import pytest
@@ -3962,11 +3964,14 @@ class _LifecycleHooks:
         accepted_writes: bool = False,
         fail: str | None = None,
         on_drain=None,
+        on_assert_target_not_served=None,
     ) -> None:
         self.events: list[str] = []
         self.accepted_writes = accepted_writes
         self.fail = fail
         self.on_drain = on_drain
+        self.on_assert_target_not_served = on_assert_target_not_served
+        self.assert_target_not_served_calls = 0
 
     def _call(self, name: str) -> None:
         self.events.append(name)
@@ -4005,6 +4010,9 @@ class _LifecycleHooks:
 
     def assert_target_not_served(self, migration) -> None:
         self._call("assert_target_not_served")
+        self.assert_target_not_served_calls += 1
+        if self.on_assert_target_not_served is not None:
+            self.on_assert_target_not_served()
 
 
 def _ready_migration(qdrant: FakeQdrant) -> tuple[QdrantMigration, object]:
@@ -4296,6 +4304,414 @@ def test_retire_orphan_cleanup_requires_absent_plan_exact_names_and_confirm() ->
     )
     assert result["migration_state"] == "orphan_cleaned"
     assert migration.target_collection not in qdrant.collections
+    assert migration.target_metadata_collection not in qdrant.collections
+
+
+_HOOK_NAMES = (
+    "drain_legacy_writes",
+    "remove_legacy_from_serving_path",
+    "rollout_current",
+    "wait_current_ready",
+    "smoke_current_read_only",
+    "remove_current_from_serving_path",
+    "restore_legacy",
+    "verify_legacy_read_path",
+    "current_target_has_accepted_writes",
+    "assert_target_not_served",
+)
+
+
+def _hook_document() -> dict[str, list[str]]:
+    return {name: ["fake-hook", name] for name in _HOOK_NAMES}
+
+
+def _hook_migration() -> SimpleNamespace:
+    return SimpleNamespace(
+        logical_collection="legacy/context",
+        migration_id="mig-1",
+        source_collection="legacy__context",
+        source_metadata_collection="legacy__context__openviking_meta",
+        target_collection="current__context",
+        target_metadata_collection="current__context__openviking_meta",
+        timeout_seconds=7.25,
+        migrator_version="qdrant-blue-green-v1",
+    )
+
+
+def test_deployment_hooks_runner_uses_safe_argv_and_bindings(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    path = tmp_path / "hooks.json"
+    path.write_text(json.dumps(_hook_document()), encoding="utf-8")
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        stdout = "false\n" if argv[1] == "current_target_has_accepted_writes" else "hook output"
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=stdout,
+            stderr="secret hook stderr",
+        )
+
+    monkeypatch.setenv("QDRANT_API_KEY", "secret-api-key")
+    monkeypatch.setattr(
+        "scripts.maintenance.qdrant_migrate.subprocess.run",
+        fake_run,
+    )
+    hooks = DeploymentHooks.from_path(str(path))
+    migration = _hook_migration()
+
+    for name in _HOOK_NAMES:
+        result = getattr(hooks, name)(migration)
+        if name == "current_target_has_accepted_writes":
+            assert result is False
+
+    assert len(calls) == len(_HOOK_NAMES)
+    for argv, kwargs in calls:
+        assert argv == _hook_document()[argv[1]]
+        assert kwargs["check"] is True
+        assert kwargs["shell"] is False
+        assert kwargs["capture_output"] is True
+        assert kwargs["text"] is True
+        assert kwargs["timeout"] == 7.25
+        env = kwargs["env"]
+        assert env["OV_LOGICAL_COLLECTION"] == "legacy/context"
+        assert env["OV_MIGRATION_ID"] == "mig-1"
+        assert env["OV_SOURCE_COLLECTION"] == "legacy__context"
+        assert env["OV_SOURCE_METADATA_COLLECTION"] == "legacy__context__openviking_meta"
+        assert env["OV_TARGET_COLLECTION"] == "current__context"
+        assert env["OV_TARGET_METADATA_COLLECTION"] == "current__context__openviking_meta"
+        assert env["OV_TIMEOUT_SECONDS"] == "7.25"
+        assert env["OV_MIGRATOR_VERSION"] == "qdrant-blue-green-v1"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("drain_legacy_writes", []),
+        ("rollout_current", [""]),
+        ("smoke_current_read_only", [1]),
+        ("assert_target_not_served", ["bad\x00argv"]),
+    ],
+)
+def test_deployment_hooks_reject_complete_key_invalid_argv_documents(
+    tmp_path,
+    name: str,
+    value: object,
+) -> None:
+    document = _hook_document()
+    document[name] = value  # type: ignore[assignment]
+    path = tmp_path / "hooks.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(MigrationError, match="non-empty argv list"):
+        DeploymentHooks.from_path(str(path))
+
+
+@pytest.mark.parametrize("stdout", ["", "TRUE", "true\nfalse", '{"value": false}'])
+def test_deployment_hooks_reject_malformed_boolean_output(
+    monkeypatch,
+    stdout: str,
+) -> None:
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="secret")
+
+    monkeypatch.setattr(
+        "scripts.maintenance.qdrant_migrate.subprocess.run",
+        fake_run,
+    )
+    hooks = DeploymentHooks(_hook_document())
+
+    with pytest.raises(MigrationError, match="only true or false"):
+        hooks.current_target_has_accepted_writes(_hook_migration())
+
+
+@pytest.mark.parametrize("failure", ["timeout", "nonzero"])
+def test_deployment_hooks_wrap_timeout_and_nonzero_without_leaking_output(
+    monkeypatch,
+    capsys,
+    failure: str,
+) -> None:
+    def fake_run(argv, **kwargs):
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(
+                argv,
+                kwargs["timeout"],
+                output="secret timeout output",
+                stderr="secret timeout stderr",
+            )
+        raise subprocess.CalledProcessError(
+            17,
+            argv,
+            output="secret failure output",
+            stderr="secret failure stderr",
+        )
+
+    monkeypatch.setattr(
+        "scripts.maintenance.qdrant_migrate.subprocess.run",
+        fake_run,
+    )
+    hooks = DeploymentHooks(_hook_document())
+
+    with pytest.raises(MigrationError, match="timed out|failed"):
+        hooks.drain_legacy_writes(_hook_migration())
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+    assert "secret" not in str(captured)
+
+
+def test_cutover_requires_resume_for_interrupted_cutting_over() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    _set_marker_state(qdrant, migration, "cutting_over")
+    plan = migration.preflight()
+    hooks = _LifecycleHooks()
+
+    with pytest.raises(MigrationError, match="--resume"):
+        migration.cutover(
+            confirm=True,
+            plan=plan,
+            barrier_held=True,
+            lock_held=True,
+            hooks=hooks,
+        )
+
+    assert hooks.events == []
+    assert qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]["migration_state"] == "cutting_over"
+
+
+def test_resumed_cutover_rejects_accepted_writes_before_reconcile_or_target_writes(
+    monkeypatch,
+) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    _set_marker_state(qdrant, migration, "cutting_over")
+    plan = migration.preflight()
+    hooks = _LifecycleHooks(accepted_writes=True)
+    writes_before = len(
+        [request for request in qdrant.requests if request[0] in {"PUT", "DELETE"}]
+    )
+
+    def unexpected_reconcile(**kwargs):
+        raise AssertionError("reconcile must not run after accepted writes")
+
+    monkeypatch.setattr(migration, "reconcile", unexpected_reconcile)
+    with pytest.raises(MigrationError, match="accepted current-format writes"):
+        migration.cutover(
+            confirm=True,
+            plan=plan,
+            barrier_held=True,
+            lock_held=True,
+            resume=True,
+            hooks=hooks,
+        )
+
+    assert hooks.events == ["current_target_has_accepted_writes"]
+    assert len(
+        [request for request in qdrant.requests if request[0] in {"PUT", "DELETE"}]
+    ) == writes_before
+
+
+def test_resumed_cutover_false_check_runs_before_idempotent_sequence() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    _set_marker_state(qdrant, migration, "cutting_over")
+    plan = migration.preflight()
+    hooks = _LifecycleHooks()
+
+    result = migration.cutover(
+        confirm=True,
+        plan=plan,
+        barrier_held=True,
+        lock_held=True,
+        resume=True,
+        hooks=hooks,
+        allow_acl_fail_open=True,
+    )
+
+    assert result["migration_state"] == "active"
+    assert hooks.events[0] == "current_target_has_accepted_writes"
+    assert hooks.events[-1] == "current_target_has_accepted_writes"
+    assert hooks.events.index("drain_legacy_writes") > 0
+
+
+def _add_empty_target_collection(qdrant: FakeQdrant, migration: QdrantMigration) -> None:
+    qdrant.add_collection(
+        migration.target_collection,
+        vectors={"vector": {"size": 2, "distance": "Cosine"}},
+    )
+
+
+def test_retire_rejects_target_data_reappearing_on_metadata_only_retry() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    _set_marker_state(qdrant, migration, "retained")
+    plan = migration.preflight()
+    qdrant.collections.pop(migration.target_collection)
+
+    hooks: _LifecycleHooks
+
+    def reappear() -> None:
+        if hooks.assert_target_not_served_calls == 1:
+            _add_empty_target_collection(qdrant, migration)
+
+    hooks = _LifecycleHooks(on_assert_target_not_served=reappear)
+    with pytest.raises(MigrationError, match="reappeared"):
+        migration.retire(
+            confirm=True,
+            plan=plan,
+            lock_held=True,
+            hooks=hooks,
+        )
+
+    assert migration.target_collection in qdrant.collections
+    assert migration.target_metadata_collection in qdrant.collections
+
+
+def test_retire_rejects_target_data_reappearing_before_metadata_delete() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    _set_marker_state(qdrant, migration, "active")
+    plan = migration.preflight()
+
+    hooks: _LifecycleHooks
+
+    def reappear() -> None:
+        if hooks.assert_target_not_served_calls == 3:
+            _add_empty_target_collection(qdrant, migration)
+
+    hooks = _LifecycleHooks(on_assert_target_not_served=reappear)
+    with pytest.raises(MigrationError, match="reappeared"):
+        migration.retire(
+            confirm=True,
+            plan=plan,
+            lock_held=True,
+            hooks=hooks,
+        )
+
+    assert migration.target_collection in qdrant.collections
+    assert migration.target_metadata_collection in qdrant.collections
+
+
+@pytest.mark.parametrize(
+    "delete_response",
+    [{"result": False}, {}, {"result": "true"}],
+)
+def test_retire_rejects_false_missing_or_malformed_data_delete_receipts(
+    monkeypatch,
+    delete_response: dict[str, object],
+) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    _set_marker_state(qdrant, migration, "active")
+    plan = migration.preflight()
+    original_request = qdrant.request
+
+    def fake_request(method, path, body=None, *, params=None):
+        if method == "DELETE" and path == migration._path(migration.target_collection):
+            return delete_response
+        return original_request(method, path, body, params=params)
+
+    monkeypatch.setattr(qdrant, "request", fake_request)
+    with pytest.raises(MigrationError, match="did not complete"):
+        migration.retire(
+            confirm=True,
+            plan=plan,
+            lock_held=True,
+            hooks=_LifecycleHooks(),
+        )
+
+    assert migration.target_collection in qdrant.collections
+    assert migration.target_metadata_collection in qdrant.collections
+
+
+def test_retire_rejects_claimed_data_delete_when_collection_remains(
+    monkeypatch,
+) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    _set_marker_state(qdrant, migration, "active")
+    plan = migration.preflight()
+    original_request = qdrant.request
+
+    def fake_request(method, path, body=None, *, params=None):
+        if method == "DELETE" and path == migration._path(migration.target_collection):
+            return {"result": True}
+        return original_request(method, path, body, params=params)
+
+    monkeypatch.setattr(qdrant, "request", fake_request)
+    with pytest.raises(MigrationError, match="remains"):
+        migration.retire(
+            confirm=True,
+            plan=plan,
+            lock_held=True,
+            hooks=_LifecycleHooks(),
+        )
+
+    assert migration.target_collection in qdrant.collections
+    assert migration.target_metadata_collection in qdrant.collections
+
+
+def test_retire_metadata_delete_failure_leaves_owned_retry_receipt() -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration = _migration(qdrant)
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    _set_marker_state(qdrant, migration, "active")
+    plan = migration.preflight()
+    original_request = qdrant.request
+    failed = False
+
+    def fail_metadata_once(method, path, body=None, *, params=None):
+        nonlocal failed
+        if method == "DELETE" and path == migration._path(
+            migration.target_metadata_collection
+        ) and not failed:
+            failed = True
+            raise _FakeHttpError(500)
+        return original_request(method, path, body, params=params)
+
+    qdrant.request = fail_metadata_once
+    with pytest.raises(_FakeHttpError):
+        migration.retire(
+            confirm=True,
+            plan=plan,
+            lock_held=True,
+            hooks=_LifecycleHooks(),
+        )
+
+    assert migration.target_collection not in qdrant.collections
+    assert migration.target_metadata_collection in qdrant.collections
+    marker = qdrant.collections[migration.target_metadata_collection]["points"][
+        to_qdrant_point_id("openviking:metadata")
+    ]["payload"]
+    assert marker["migration_state"] == "retained"
+
+    qdrant.request = original_request
+    result = migration.retire(
+        confirm=True,
+        plan=plan,
+        lock_held=True,
+        hooks=_LifecycleHooks(),
+    )
+    assert result["migration_state"] == "retained"
     assert migration.target_metadata_collection not in qdrant.collections
 
 
