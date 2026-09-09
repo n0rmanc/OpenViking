@@ -6,6 +6,8 @@ from __future__ import annotations
 import io
 import json
 import math
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
@@ -15,7 +17,11 @@ import pytest
 from openviking.storage.expr import And, Contains, Eq, In, Or, PathScope, RawDSL
 from openviking.storage.vectordb.collection.qdrant_collection import QdrantCollection
 from openviking.storage.vectordb.collection.qdrant_rest import QdrantError, QdrantRestClient
-from openviking.storage.vectordb.qdrant_sparse import SparseTermDictionary, stable_sparse_index
+from openviking.storage.vectordb.qdrant_sparse import (
+    SparseTermDictionary,
+    sparse_owner_point_id,
+    stable_sparse_index,
+)
 from openviking.storage.vectordb.qdrant_utils import (
     build_qdrant_payload,
     compile_qdrant_filter,
@@ -92,6 +98,8 @@ def _index_request(requests):
                     }
                 }
             }
+        if method == "POST" and path.endswith("/points"):
+            return {"result": []}
         return {}
 
     return request
@@ -156,6 +164,24 @@ def _target_marker(**updates):
         "indexes": {},
     }
     marker = dict(marker)
+    marker.update(updates)
+    return marker
+
+
+def _legacy_current_marker(**updates):
+    marker = {
+        "_openviking_meta_version": 1,
+        "collection_name": "docs",
+        "metadata_collection_name": "docs__meta",
+        "schema": {"CollectionName": "docs", "Fields": []},
+        "dense_vector_name": "dense",
+        "sparse_vector_name": "sparse",
+        "vector_dim": 2,
+        "distance": "Cosine",
+        "sparse_enabled": False,
+        "sparse_weight": 0.0,
+        "indexes": {},
+    }
     marker.update(updates)
     return marker
 
@@ -1250,6 +1276,75 @@ def test_payload_index_readiness_times_out_with_pending_work() -> None:
         collection._wait_payload_index("account_id", present=True)
 
 
+@pytest.mark.parametrize("status", ["yellow", "grey"])
+def test_payload_index_readiness_accepts_available_states_when_index_visible(
+    status: str,
+) -> None:
+    collection = _readiness_collection(
+        _ScriptedTransport(),
+        timeout_seconds=0.01,
+    )
+    collection._client.request = lambda *_args, **_kwargs: {  # type: ignore[method-assign]
+        "result": {
+            "status": status,
+            "optimizer_status": "ok",
+            "update_queue": 0,
+            "payload_schema": {"account_id": {}},
+        }
+    }
+
+    collection._wait_payload_index("account_id", present=True)
+
+
+def test_collection_readiness_still_requires_green_without_payload_index() -> None:
+    collection = _readiness_collection(
+        _ScriptedTransport(),
+        timeout_seconds=0.01,
+    )
+    collection._client.request = lambda *_args, **_kwargs: {  # type: ignore[method-assign]
+        "result": {
+            "status": "yellow",
+            "optimizer_status": "ok",
+            "update_queue": 0,
+        }
+    }
+
+    with pytest.raises(QdrantError, match="did not become ready"):
+        collection._wait_collection_ready("docs")
+
+
+@pytest.mark.parametrize("status", ["green", "yellow", "grey"])
+def test_payload_index_readiness_rejects_missing_index(status: str) -> None:
+    collection = _readiness_collection(
+        _ScriptedTransport(),
+        timeout_seconds=0.01,
+    )
+    collection._client.request = lambda *_args, **_kwargs: {  # type: ignore[method-assign]
+        "result": {
+            "status": status,
+            "optimizer_status": "ok",
+            "update_queue": 0,
+            "payload_schema": {},
+        }
+    }
+
+    with pytest.raises(QdrantError, match="did not become visible"):
+        collection._wait_payload_index("account_id", present=True)
+
+
+def test_payload_index_readiness_rejects_malformed_response() -> None:
+    collection = _readiness_collection(
+        _ScriptedTransport(),
+        timeout_seconds=0.01,
+    )
+    collection._client.request = lambda *_args, **_kwargs: {  # type: ignore[method-assign]
+        "result": {"status": "green"}
+    }
+
+    with pytest.raises(QdrantError, match="malformed"):
+        collection._wait_payload_index("account_id", present=True)
+
+
 def test_collection_lifecycle_writes_marker_and_payload_indexes() -> None:
     transport = _ScriptedTransport(
         (404, {}),
@@ -1709,6 +1804,229 @@ def test_target_marker_round_trips_logical_and_physical_identity() -> None:
     assert marker["collection_name"] == "generation-data"
     assert marker["metadata_collection_name"] == "generation-meta"
     assert marker["logical_collection"] == "project/docs"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("migration_id", None),
+        ("migration_id", ""),
+        ("migration_id", "   "),
+        ("migration_state", None),
+        ("migration_state", ""),
+        ("migration_state", "   "),
+    ],
+)
+def test_migration_marker_requires_nonempty_identity_fields(
+    field: str,
+    value: object,
+) -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="generation-data",
+        metadata_collection_name="generation-meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=True,
+        sparse_weight=0.5,
+        logical_collection="project/docs",
+    )
+    marker = _target_marker(**{field: value})
+    collection._load_metadata_marker = lambda: marker  # type: ignore[method-assign]
+
+    assert collection.has_openviking_metadata() is False
+    with pytest.raises(RuntimeError, match="migration"):
+        collection.get_meta_data()
+
+
+@pytest.mark.parametrize("field", ["migration_id", "migration_state"])
+def test_migration_marker_requires_identity_fields_to_be_present(field: str) -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="generation-data",
+        metadata_collection_name="generation-meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=True,
+        sparse_weight=0.5,
+        logical_collection="project/docs",
+    )
+    marker = _target_marker()
+    marker.pop(field)
+    collection._load_metadata_marker = lambda: marker  # type: ignore[method-assign]
+
+    assert collection.has_openviking_metadata() is False
+    with pytest.raises(RuntimeError, match="migration"):
+        collection.get_meta_data()
+
+
+@pytest.mark.parametrize("version", [True, 1.0, "1"])
+def test_metadata_marker_version_requires_a_strict_integer(version: object) -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="docs",
+        metadata_collection_name="docs__meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+    )
+    marker = _legacy_current_marker(_openviking_meta_version=version)
+    collection._load_metadata_marker = lambda: marker  # type: ignore[method-assign]
+
+    assert collection.has_openviking_metadata() is False
+    with pytest.raises(RuntimeError, match="valid current marker"):
+        collection.get_meta_data()
+
+
+def test_default_derived_collection_keeps_loading_ordinary_legacy_marker() -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="docs",
+        metadata_collection_name="docs__meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+        logical_collection="project/docs",
+    )
+    marker = _legacy_current_marker()
+    collection._load_metadata_marker = lambda: marker  # type: ignore[method-assign]
+
+    assert collection.has_openviking_metadata()
+    assert collection.get_meta_data() == {"CollectionName": "docs", "Fields": []}
+
+
+@pytest.mark.parametrize("logical_collection", [None, "project/other"])
+def test_explicit_physical_collection_requires_matching_logical_marker(
+    logical_collection: str | None,
+) -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="docs",
+        metadata_collection_name="docs__meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+        logical_collection="project/docs",
+        require_logical_collection=True,
+    )
+    marker = _legacy_current_marker()
+    if logical_collection is None:
+        marker.pop("logical_collection", None)
+    else:
+        marker["logical_collection"] = logical_collection
+    collection._load_metadata_marker = lambda: marker  # type: ignore[method-assign]
+
+    assert collection.has_openviking_metadata() is False
+    with pytest.raises(RuntimeError, match="logical collection"):
+        collection.get_meta_data()
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"target_collection": "generation-data"},
+        {"target_metadata_collection": "generation-meta"},
+        {"target_collection": "other-data", "target_metadata_collection": "generation-meta"},
+        {"target_collection": "generation-data", "target_metadata_collection": "other-meta"},
+    ],
+)
+def test_optional_target_provenance_is_complete_and_canonical(
+    updates: dict[str, str],
+) -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
+        collection_name="generation-data",
+        metadata_collection_name="generation-meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=True,
+        sparse_weight=0.5,
+        logical_collection="project/docs",
+    )
+    marker = _target_marker()
+    marker.pop("target_collection", None)
+    marker.pop("target_metadata_collection", None)
+    marker.update(updates)
+    collection._load_metadata_marker = lambda: marker  # type: ignore[method-assign]
+
+    assert collection.has_openviking_metadata() is False
+    with pytest.raises(RuntimeError, match="target"):
+        collection.get_meta_data()
+
+
+def test_metadata_marker_lookup_rejects_wrong_point_id() -> None:
+    collection = QdrantCollection(
+        client=QdrantRestClient(
+            "http://qdrant.local",
+            opener=_ScriptedTransport(
+                (200, {"result": {"status": "green"}}),
+                (
+                    200,
+                    {
+                        "result": [
+                            {
+                                "id": "wrong-marker-id",
+                                "payload": _legacy_current_marker(),
+                            }
+                        ]
+                    },
+                ),
+            ),
+        ),
+        collection_name="docs",
+        metadata_collection_name="docs__meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+    )
+
+    with pytest.raises(RuntimeError, match="marker"):
+        collection._load_metadata_marker()
+
+
+def test_metadata_marker_lookup_rejects_duplicate_points() -> None:
+    marker_point = {
+        "id": to_qdrant_point_id("openviking:metadata"),
+        "payload": _legacy_current_marker(),
+    }
+    collection = QdrantCollection(
+        client=QdrantRestClient(
+            "http://qdrant.local",
+            opener=_ScriptedTransport(
+                (200, {"result": {"status": "green"}}),
+                (200, {"result": [marker_point, dict(marker_point)]}),
+            ),
+        ),
+        collection_name="docs",
+        metadata_collection_name="docs__meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+    )
+
+    with pytest.raises(RuntimeError, match="marker"):
+        collection._load_metadata_marker()
 
 
 @pytest.mark.parametrize(
@@ -2300,6 +2618,94 @@ def test_collection_crud_search_count_and_scalar_scroll_use_qdrant_shapes() -> N
     }
 
 
+def test_grouped_or_conditional_aggregation_is_rejected_before_http() -> None:
+    transport = _ScriptedTransport((200, {"result": {"count": 1}}))
+    collection = _readiness_collection(transport)
+
+    with pytest.raises(NotImplementedError, match="grouped or conditional"):
+        collection.aggregate_data("default", field="account_id")
+    with pytest.raises(NotImplementedError, match="grouped or conditional"):
+        collection.aggregate_data("default", cond={"gt": 1})
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize(
+    ("output_fields", "expected_fields"),
+    [
+        (None, {"id": "doc-1"}),
+        ([], {"id": "doc-1"}),
+        (["name"], {"id": "doc-1", "name": "doc.md"}),
+        (["name", "level"], {"id": "doc-1", "name": "doc.md", "level": 2}),
+    ],
+)
+def test_scalar_search_projects_sort_value_for_score_but_not_output(
+    output_fields: list[str] | None,
+    expected_fields: dict[str, object],
+) -> None:
+    collection = _readiness_collection(_ScriptedTransport())
+    requested_fields = None if output_fields is None else list(output_fields)
+    original_fields = None if requested_fields is None else list(requested_fields)
+    seen_include: set[str] = set()
+
+    def request(_method: str, _path: str, body=None, *, params=None):
+        del params
+        include = set(body["with_payload"]["include"])
+        seen_include.update(include)
+        payload = {
+            "_openviking_original_id": "doc-1",
+        }
+        if "name" in include:
+            payload["name"] = "doc.md"
+        if "level" in include:
+            payload["level"] = 2
+        return {
+            "result": {
+                "points": [
+                    {
+                        "id": to_qdrant_point_id("doc-1"),
+                        "payload": payload,
+                    }
+                ]
+            }
+        }
+
+    collection._client.request = request  # type: ignore[method-assign]
+
+    result = collection.search_by_scalar(
+        "default",
+        "level",
+        output_fields=requested_fields,
+    )
+
+    assert seen_include == {"_openviking_original_id", "level", *set(output_fields or [])}
+    assert result.data[0].score == 2.0
+    assert result.data[0].fields == expected_fields
+    assert requested_fields == original_fields
+
+
+def test_fetch_data_converts_each_payload_once() -> None:
+    collection = _readiness_collection(_ScriptedTransport())
+    point = {
+        "id": to_qdrant_point_id("doc-1"),
+        "payload": {"_openviking_original_id": "doc-1", "name": "doc.md"},
+    }
+    conversions = 0
+
+    collection._retrieve_points = lambda *_args, **_kwargs: [point]  # type: ignore[method-assign]
+
+    def payload_to_record(_point):
+        nonlocal conversions
+        conversions += 1
+        return {"id": "doc-1", "name": "doc.md"}
+
+    collection._payload_to_record = payload_to_record  # type: ignore[method-assign]
+
+    result = collection.fetch_data(["doc-1"])
+
+    assert conversions == 1
+    assert result.items[0].fields == {"id": "doc-1", "name": "doc.md"}
+
+
 def test_sparse_query_uses_named_qdrant_sparse_vector_shape() -> None:
     transport = _ScriptedTransport(
         (
@@ -2463,6 +2869,34 @@ def test_scroll_follows_qdrant_next_page_offset() -> None:
     assert transport.requests[1]["body"]["offset"] == "cursor-2"
 
 
+def test_scroll_rejects_empty_page_with_next_page_offset() -> None:
+    transport = _ScriptedTransport(
+        (
+            200,
+            {
+                "result": {
+                    "points": [],
+                    "next_page_offset": "cursor-2",
+                }
+            },
+        ),
+    )
+    collection = QdrantCollection(
+        client=QdrantRestClient("http://qdrant.local", opener=transport),
+        collection_name="docs",
+        metadata_collection_name="docs__meta",
+        dense_vector_name="dense",
+        sparse_vector_name="sparse",
+        vector_dim=2,
+        distance="cosine",
+        sparse_enabled=False,
+        sparse_weight=0.0,
+    )
+
+    with pytest.raises(QdrantError, match="scroll response is malformed"):
+        collection._scroll("docs", filter=None, limit=1)
+
+
 def test_dense_query_rejects_wrong_dimension() -> None:
     collection = QdrantCollection(
         client=QdrantRestClient("http://qdrant.local", opener=_ScriptedTransport()),
@@ -2542,14 +2976,105 @@ def test_qdrant_rejects_sparse_weight_outside_rrf_range() -> None:
         QdrantCollectionAdapter.from_config(config)
 
 
-def test_sparse_encoding_persists_terms_in_metadata_sidecar() -> None:
-    transport = _ScriptedTransport(
-        (200, {"result": {"points": []}}),
-        (200, {"result": {"points": []}}),
-        (200, {"result": {"status": "completed"}}),
-        (200, {"result": {"points": []}}),
-    )
-    collection = QdrantCollection(
+def _sparse_binding(
+    term: str,
+    index: int,
+    *,
+    owner: bool,
+    payload_updates: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "_openviking_sparse_term": True,
+        "term": term,
+        "index": index,
+    }
+    if payload_updates:
+        payload.update(payload_updates)
+    return {
+        "id": (
+            sparse_owner_point_id(index)
+            if owner
+            else to_qdrant_point_id(f"openviking:sparse:{term}")
+        ),
+        "payload": payload,
+    }
+
+
+class _SparseTransport:
+    def __init__(
+        self,
+        *,
+        version: str = "1.16.0",
+        points: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.version = version
+        self.requests: list[dict[str, Any]] = []
+        self._points = {str(point["id"]): point for point in points or []}
+        self._lock = Lock()
+        self.lost_write = False
+
+    def __call__(self, request, timeout):
+        body = json.loads(request.data.decode("utf-8")) if request.data else None
+        path = urlsplit(request.full_url).path
+        with self._lock:
+            self.requests.append(
+                {
+                    "method": request.method,
+                    "url": request.full_url,
+                    "body": body,
+                    "params": dict(parse_qs(urlsplit(request.full_url).query)),
+                    "timeout": timeout,
+                }
+            )
+
+        if request.method == "GET" and path == "/":
+            return _Response({"result": {"version": self.version}})
+
+        if request.method == "POST" and path.endswith("/points/scroll"):
+            clause = body["filter"]["must"][0]
+            key = clause["key"]
+            value = clause["match"]["value"]
+            with self._lock:
+                points = [
+                    point
+                    for point in self._points.values()
+                    if point["payload"].get(key) == value
+                ]
+            return _Response({"result": {"points": points[: body["limit"]]}})
+
+        if request.method == "PUT" and path.endswith("/points"):
+            point = body["points"][0]
+            point_id = str(point["id"])
+            update_filter = body.get("update_filter")
+            with self._lock:
+                if update_filter is None:
+                    self._points[point_id] = point
+                else:
+                    assert update_filter == {
+                        "must_not": [{"has_id": [point_id]}]
+                    }
+                    if point_id not in self._points:
+                        self._points[point_id] = point
+                lost_write = self.lost_write
+                self.lost_write = False
+            if lost_write:
+                raise QdrantError("simulated lost write response")
+            return _Response({"result": {"status": "completed"}})
+
+        if request.method == "POST" and path.endswith("/points"):
+            with self._lock:
+                points = [
+                    self._points[point_id]
+                    for point_id in body["ids"]
+                    if point_id in self._points
+                ]
+            return _Response({"result": points})
+
+        raise AssertionError(f"unexpected request: {request.method} {request.full_url}")
+
+
+def _sparse_collection(transport: _SparseTransport) -> QdrantCollection:
+    return QdrantCollection(
         client=QdrantRestClient("http://qdrant.local", opener=transport),
         collection_name="docs",
         metadata_collection_name="docs__meta",
@@ -2561,17 +3086,352 @@ def test_sparse_encoding_persists_terms_in_metadata_sidecar() -> None:
         sparse_weight=0.5,
     )
 
+
+def test_sparse_encoding_persists_terms_in_metadata_sidecar() -> None:
+    transport = _SparseTransport()
+    collection = _sparse_collection(transport)
+
     encoded = collection.encode_sparse_vector({"token": 1.5})
 
     assert encoded["indices"] and encoded["values"] == [1.5]
     assert transport.requests[0]["body"]["filter"]["must"][0]["key"] == "term"
     assert transport.requests[1]["body"]["filter"]["must"][0]["key"] == "index"
-    persisted = transport.requests[2]["body"]["points"][0]
+    assert all(
+        request["params"] == {"consistency": ["all"]}
+        for request in transport.requests
+        if request["method"] == "POST"
+        and urlsplit(request["url"]).path.endswith(("/points", "/points/scroll"))
+    )
+    version_request = next(
+        request
+        for request in transport.requests
+        if request["method"] == "GET" and urlsplit(request["url"]).path == "/"
+    )
+    assert urlsplit(version_request["url"]).path == "/"
+    persisted_request = next(
+        request
+        for request in transport.requests
+        if request["method"] == "PUT"
+        and urlsplit(request["url"]).path.endswith("/points")
+    )
+    persisted = persisted_request["body"]["points"][0]
+    index = encoded["indices"][0]
+    assert persisted["id"] == sparse_owner_point_id(index)
     assert persisted["payload"] == {
         "_openviking_sparse_term": True,
         "term": "token",
-        "index": encoded["indices"][0],
+        "index": index,
     }
+    assert persisted_request["body"]["update_filter"] == {
+        "must_not": [{"has_id": [sparse_owner_point_id(index)]}]
+    }
+    assert persisted_request["params"] == {"wait": ["true"], "ordering": ["strong"]}
+    readback_request = next(
+        request
+        for request in transport.requests
+        if request["method"] == "POST"
+        and urlsplit(request["url"]).path.endswith("/points")
+    )
+    assert readback_request["body"]["ids"] == [sparse_owner_point_id(index)]
+
+
+def test_sparse_owner_keeps_migration_provenance_as_an_all_or_none_pair() -> None:
+    transport = _SparseTransport()
+    collection = _sparse_collection(transport)
+    collection._logical_collection = "project/docs"
+    collection._migration_marker_fields = {"migration_id": "migration-1"}
+
+    collection.encode_sparse_vector({"token": 1.5})
+
+    write = next(
+        request
+        for request in transport.requests
+        if request["method"] == "PUT"
+        and urlsplit(request["url"]).path.endswith("/points")
+    )
+    assert write["body"]["points"][0]["payload"]["logical_collection"] == "project/docs"
+    assert write["body"]["points"][0]["payload"]["migration_id"] == "migration-1"
+
+
+def test_sparse_provenance_is_lazily_loaded_once_when_owner_is_registered() -> None:
+    transport = _SparseTransport()
+    collection = _sparse_collection(transport)
+    collection._logical_collection = "project/docs"
+    collection._migration_marker_fields = None
+    loads = 0
+
+    def load_marker() -> dict[str, Any]:
+        nonlocal loads
+        loads += 1
+        collection._migration_marker_fields = {"migration_id": "migration-1"}
+        return {}
+
+    collection._load_metadata_marker = load_marker  # type: ignore[method-assign]
+
+    collection.encode_sparse_vector({"token": 1.5})
+
+    assert loads == 1
+    write = next(
+        request
+        for request in transport.requests
+        if request["method"] == "PUT"
+        and urlsplit(request["url"]).path.endswith("/points")
+    )
+    assert write["body"]["points"][0]["payload"]["logical_collection"] == "project/docs"
+    assert write["body"]["points"][0]["payload"]["migration_id"] == "migration-1"
+
+
+_INVALID_SPARSE_PROVENANCE = (
+    {"logical_collection": "project/docs"},
+    {"migration_id": "migration-1"},
+    {"logical_collection": "", "migration_id": "migration-1"},
+    {"logical_collection": "project/docs", "migration_id": ""},
+    {"logical_collection": None, "migration_id": "migration-1"},
+    {"logical_collection": "project/docs", "migration_id": None},
+    {"logical_collection": None, "migration_id": None},
+    {"logical_collection": "", "migration_id": ""},
+    {"logical_collection": "foreign/docs", "migration_id": "migration-1"},
+    {"logical_collection": "project/docs", "migration_id": "foreign-migration"},
+)
+
+
+@pytest.mark.parametrize("lookup", ["term", "index"])
+@pytest.mark.parametrize("payload_updates", _INVALID_SPARSE_PROVENANCE)
+def test_sparse_lookup_rejects_invalid_migration_provenance(
+    lookup: str,
+    payload_updates: dict[str, Any],
+) -> None:
+    index = stable_sparse_index("token")
+    transport = _SparseTransport(
+        points=[
+            _sparse_binding(
+                "token",
+                index,
+                owner=False,
+                payload_updates=payload_updates,
+            )
+        ]
+    )
+    collection = _sparse_collection(transport)
+    collection._logical_collection = "project/docs"
+    collection._migration_marker_fields = {"migration_id": "migration-1"}
+
+    with pytest.raises(ValueError, match="provenance"):
+        if lookup == "term":
+            collection._resolve_sparse_term("token")
+        else:
+            collection._resolve_sparse_index(index)
+
+
+@pytest.mark.parametrize(
+    "payload_updates",
+    [None, {"logical_collection": "project/docs", "migration_id": "migration-1"}],
+    ids=["absent", "matching"],
+)
+def test_sparse_lookup_accepts_absent_or_matching_migration_provenance(
+    payload_updates: dict[str, Any] | None,
+) -> None:
+    index = stable_sparse_index("token")
+    transport = _SparseTransport(
+        points=[
+            _sparse_binding(
+                "token",
+                index,
+                owner=False,
+                payload_updates=payload_updates,
+            )
+        ]
+    )
+    collection = _sparse_collection(transport)
+    collection._logical_collection = "project/docs"
+    collection._migration_marker_fields = {"migration_id": "migration-1"}
+
+    assert collection._resolve_sparse_term("token") == index
+    assert collection._resolve_sparse_index(index) == "token"
+
+
+def test_sparse_lookup_accepts_absent_provenance_with_logical_only_marker() -> None:
+    index = stable_sparse_index("token")
+    transport = _SparseTransport(points=[_sparse_binding("token", index, owner=False)])
+    collection = _sparse_collection(transport)
+    collection._logical_collection = "project/docs"
+    collection._migration_marker_fields = {}
+
+    assert collection._resolve_sparse_term("token") == index
+    assert collection._resolve_sparse_index(index) == "token"
+
+
+@pytest.mark.parametrize("payload_updates", _INVALID_SPARSE_PROVENANCE)
+def test_sparse_owner_readback_rejects_invalid_migration_provenance(
+    payload_updates: dict[str, Any],
+) -> None:
+    transport = _SparseTransport()
+    collection = _sparse_collection(transport)
+    collection._logical_collection = "project/docs"
+    collection._migration_marker_fields = {"migration_id": "migration-1"}
+    retrieve_points = collection._retrieve_points
+
+    def invalid_readback(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        points = retrieve_points(*args, **kwargs)
+        assert len(points) == 1
+        points[0]["payload"].pop("logical_collection", None)
+        points[0]["payload"].pop("migration_id", None)
+        points[0]["payload"].update(payload_updates)
+        return points
+
+    collection._retrieve_points = invalid_readback  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="provenance"):
+        collection.encode_sparse_vector({"token": 1.5})
+
+
+def test_sparse_owner_readback_accepts_absent_migration_provenance() -> None:
+    transport = _SparseTransport()
+    collection = _sparse_collection(transport)
+    collection._logical_collection = "project/docs"
+    collection._migration_marker_fields = {"migration_id": "migration-1"}
+    retrieve_points = collection._retrieve_points
+
+    def legacy_readback(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        points = retrieve_points(*args, **kwargs)
+        assert len(points) == 1
+        points[0]["payload"].pop("logical_collection", None)
+        points[0]["payload"].pop("migration_id", None)
+        return points
+
+    collection._retrieve_points = legacy_readback  # type: ignore[method-assign]
+
+    assert collection.encode_sparse_vector({"token": 1.5})["values"] == [1.5]
+
+
+@pytest.mark.parametrize("owner", [False, True])
+def test_colliding_sparse_term_cannot_alias_poison_existing_binding(owner: bool) -> None:
+    existing_index = stable_sparse_index("69235")
+    transport = _SparseTransport(
+        points=[_sparse_binding("69235", existing_index, owner=owner)]
+    )
+    collection = _sparse_collection(transport)
+
+    with pytest.raises(ValueError, match="collision"):
+        collection.encode_sparse_vector({"95303": 1.0})
+
+    assert not any(
+        request["method"] == "PUT"
+        and urlsplit(request["url"]).path.endswith("/points")
+        for request in transport.requests
+    )
+    assert collection._resolve_sparse_index(existing_index) == "69235"
+
+
+def test_legacy_sparse_binding_resolves_without_registering_owner() -> None:
+    index = stable_sparse_index("token")
+    transport = _SparseTransport(points=[_sparse_binding("token", index, owner=False)])
+    collection = _sparse_collection(transport)
+
+    assert collection.encode_sparse_vector({"token": 1.5}) == {
+        "indices": [index],
+        "values": [1.5],
+    }
+    assert not any(
+        request["method"] in {"GET", "PUT"}
+        and (
+            urlsplit(request["url"]).path == "/"
+            or urlsplit(request["url"]).path.endswith("/points")
+        )
+        for request in transport.requests
+    )
+
+
+def test_legacy_sparse_binding_fails_closed_when_owner_is_missing() -> None:
+    index = stable_sparse_index("token")
+    transport = _SparseTransport(points=[_sparse_binding("token", index, owner=False)])
+    collection = _sparse_collection(transport)
+    collection._resolve_sparse_index = lambda _index: None  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="existing_term=None"):
+        collection.encode_sparse_vector({"token": 1.5})
+
+    assert not any(
+        request["method"] == "PUT"
+        and urlsplit(request["url"]).path.endswith("/points")
+        for request in transport.requests
+    )
+
+
+def test_same_sparse_term_registration_is_idempotent_under_concurrency() -> None:
+    transport = _SparseTransport()
+    collection = _sparse_collection(transport)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda _unused: collection.encode_sparse_vector({"token": 1.5}),
+                range(2),
+            )
+        )
+
+    index = stable_sparse_index("token")
+    assert results == [{"indices": [index], "values": [1.5]}] * 2
+    writes = [
+        request
+        for request in transport.requests
+        if request["method"] == "PUT"
+        and urlsplit(request["url"]).path.endswith("/points")
+    ]
+    assert writes
+    assert all(
+        write["body"]["points"][0]["id"] == sparse_owner_point_id(index) for write in writes
+    )
+
+
+def test_lost_sparse_write_response_retries_via_owner_readback() -> None:
+    transport = _SparseTransport()
+    transport.lost_write = True
+    collection = _sparse_collection(transport)
+
+    with pytest.raises(QdrantError, match="lost write"):
+        collection.encode_sparse_vector({"token": 1.5})
+
+    index = stable_sparse_index("token")
+    assert collection.encode_sparse_vector({"token": 1.5}) == {
+        "indices": [index],
+        "values": [1.5],
+    }
+    assert any(
+        request["method"] == "POST"
+        and urlsplit(request["url"]).path.endswith("/points/scroll")
+        and request["body"]["filter"]["must"][0]["key"] == "term"
+        for request in transport.requests
+    )
+
+
+def test_unsupported_qdrant_version_prevents_sparse_owner_write() -> None:
+    transport = _SparseTransport(version="1.15.9")
+    collection = _sparse_collection(transport)
+
+    with pytest.raises(QdrantError, match="1.16.0"):
+        collection.encode_sparse_vector({"token": 1.5})
+
+    assert not any(
+        request["method"] == "PUT"
+        and urlsplit(request["url"]).path.endswith("/points")
+        for request in transport.requests
+    )
+
+
+def test_malformed_sparse_lookup_fails_closed_before_owner_write() -> None:
+    collection = _sparse_collection(_SparseTransport())
+
+    def malformed_request(method: str, path: str, body=None, *, params=None):
+        del params
+        if method == "POST" and path.endswith("/points/scroll"):
+            return {"result": {"points": "not-a-list"}}
+        raise AssertionError(f"unexpected request: {method} {path} {body}")
+
+    collection._client.request = malformed_request  # type: ignore[method-assign]
+
+    with pytest.raises(QdrantError, match="scroll response is malformed"):
+        collection.encode_sparse_vector({"token": 1.5})
 
 
 def test_adapter_recomputes_physical_collection_name_when_logical_name_changes() -> None:
@@ -2609,6 +3469,7 @@ def test_explicit_qdrant_physical_names_override_custom_params() -> None:
     collection = adapter._new_collection()
     assert collection._collection_name == "generation-data"
     assert collection._metadata_collection_name == "generation-meta"
+    assert collection._require_logical_collection is True
 
 
 def test_data_name_only_derives_metadata_sidecar() -> None:
@@ -2635,7 +3496,9 @@ def test_omitted_physical_names_keep_project_name_derivation() -> None:
         dimension=2,
     )
     adapter = QdrantCollectionAdapter.from_config(config)
-    assert adapter._new_collection()._collection_name == "project__docs"
+    collection = adapter._new_collection()
+    assert collection._collection_name == "project__docs"
+    assert collection._require_logical_collection is False
 
 
 def test_qdrant_config_accepts_nested_url_and_keeps_content_disabled() -> None:

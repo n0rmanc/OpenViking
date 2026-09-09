@@ -1489,8 +1489,12 @@ For other existing remote collections, including Volcengine VikingDB, provision 
 <details>
 <summary><b>Qdrant REST</b></summary>
 
-Qdrant uses the standard-library REST transport; no `qdrant-client` dependency is
-required. Set `sparse_weight` to `0` for dense-only mode, or to a value in
+The supported server range is Qdrant >=1.16 on every node. The runtime checks the
+endpoint version before claiming a new sparse owner; maintenance tools check
+before preflight. Dense-only and existing-term reads do not perform a version
+check and are not evidence that an older server is supported.
+OpenViking uses the standard-library REST transport; no `qdrant-client` dependency
+is required. Set `sparse_weight` to `0` for dense-only mode, or to a value in
 `(0, 1]` to enable named sparse vectors and client-side weighted RRF hybrid
 search:
 
@@ -1523,6 +1527,18 @@ instead of being adopted. URI scope metadata and account/tag filters are retaine
 `Contains` and server-side content grep are unsupported, so grep uses the
 filesystem fallback (`USE_CONTENT_FIELD=False`).
 
+Explicit physical collection names require a matching `logical_collection` in
+the marker. Older ordinary current-format markers without that field remain
+compatible when using default-derived physical names.
+
+New sparse terms reserve a deterministic per-index owner using a native
+`update_filter` with insert-only semantics and verify ownership before writing
+vectors. Existing term-keyed dictionary rows remain readable and are never
+overwritten. Stop all old application writers when
+upgrading; mixed old/new writers are unsupported. Optional, non-destructive
+[dictionary owner seeding](../../../scripts/maintenance/README.md#upgrade-an-existing-current-format-sparse-dictionary)
+retains legacy rows and does not re-embed data.
+
 Collections created before PR `#3872` cannot be adopted by the current adapter.
 Run the [pre-`#3872` migration runbook](../../../scripts/maintenance/README.md)
 or re-ingest the data before cutting configuration over to the current target
@@ -1531,9 +1547,11 @@ rollback window.
 
 For an online migration, `data_collection_name` and
 `metadata_collection_name` are immutable physical target names, not aliases.
-The controller and rollout must use the same `logical_collection`,
-`migration_id`, target pair, and `timeout_seconds`; these values are recorded
-in the target marker. The operational phases are:
+Runtime rollout must match the marker's logical collection, target pair, and
+vector/sparse policy. The controller separately validates `migration_id` and
+its code-owned `migrator_version`; neither is a runtime configuration option.
+`timeout_seconds` is pinned in the controller plan, not stored in the marker.
+The operational phases are:
 
 ```text
 preflight -> prepare -> backfill -> reconcile -> verify

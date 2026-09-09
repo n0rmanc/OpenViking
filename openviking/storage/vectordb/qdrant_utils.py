@@ -25,6 +25,31 @@ _OPENVIKING_QDRANT_ID_NAMESPACE = uuid.UUID("4b6bb5a8-7f1f-5b1a-9d4c-b93f29b1d67
 _URI_FIELDS = {"uri", "parent_uri"}
 
 
+def pending_work(value: Any) -> bool:
+    """Interpret Qdrant queue/deferred readiness fields conservatively."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value > 0
+    if isinstance(value, Mapping):
+        return any(pending_work(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() not in {
+            "",
+            "0",
+            "false",
+            "none",
+            "ok",
+            "complete",
+            "completed",
+        }
+    return True
+
+
 def qdrant_payload_field_schema(
     field_name: str,
     fields: Iterable[Mapping[str, Any]],
