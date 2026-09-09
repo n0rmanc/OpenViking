@@ -164,6 +164,7 @@ class QdrantCollectionAdapter(CollectionAdapter):
             logical_collection=(
                 self._logical_collection if self._explicit_physical_names else logical_collection
             ),
+            require_logical_collection=self._explicit_physical_names,
         )
 
     def _load_existing_collection_if_needed(self) -> None:

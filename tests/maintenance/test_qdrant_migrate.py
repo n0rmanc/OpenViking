@@ -12,7 +12,10 @@ from urllib.parse import unquote, urlsplit
 import pytest
 import yaml
 
-from openviking.storage.vectordb.qdrant_sparse import stable_sparse_index
+from openviking.storage.vectordb.qdrant_sparse import (
+    sparse_owner_point_id,
+    stable_sparse_index,
+)
 from openviking.storage.vectordb.qdrant_utils import to_qdrant_point_id
 from scripts.maintenance.qdrant_migrate import (
     DeploymentHooks,
@@ -25,12 +28,15 @@ from scripts.maintenance.qdrant_migrate import (
     _load_plan,
     _parser,
     _ScanManifest,
+    _SparseDictionaryManifest,
     main,
 )
 
 REQUIRED_QDRANT_TESTS = (
     "tests/maintenance/test_qdrant_migrate.py",
     "tests/storage/test_qdrant_adapter.py",
+    "tests/storage/test_qdrant_sparse.py",
+    "tests/maintenance/test_qdrant_sparse_upgrade.py",
     "tests/storage/test_qdrant_migration_integration.py",
     "tests/storage/test_qdrant_integration.py",
     "tests/storage/test_collection_schemas.py",
@@ -150,7 +156,30 @@ class FakeQdrant:
             return {"result": True}
 
         if suffix == ["points"] and method == "PUT":
-            for point in (body or {}).get("points", []):
+            request = body or {}
+            update_filter = request.get("update_filter")
+            excluded_ids: set[str] = set()
+            if update_filter is not None:
+                assert update_filter == {
+                    "must_not": [
+                        {
+                            "has_id": [
+                                str(point["id"])
+                                for point in request.get("points", [])
+                            ]
+                        }
+                    ]
+                }
+                excluded_ids = {
+                    str(point_id)
+                    for point_id in update_filter["must_not"][0]["has_id"]
+                }
+            for point in request.get("points", []):
+                # Qdrant's update_filter is evaluated for each point in a
+                # batch. An existing owner is therefore skipped, while a
+                # concurrently absent owner is inserted.
+                if str(point["id"]) in excluded_ids and str(point["id"]) in points:
+                    continue
                 points[str(point["id"])] = copy.deepcopy(point)
             return {"result": {"status": "completed"}}
 
@@ -340,6 +369,24 @@ def test_migration_collection_named_points_keeps_collection_contract() -> None:
     assert client.requests[1][3] == {"wait": "true", "ordering": "strong"}
 
 
+def test_migration_point_lookup_rejects_malformed_points() -> None:
+    client = _RecordingClient()
+    client.request = lambda *args, **kwargs: {"result": ["not-a-point"]}  # type: ignore[method-assign]
+    migration = QdrantMigration(
+        client=client,
+        source_collection="legacy",
+        target_collection="current",
+        source_metadata_collection="legacy__meta",
+        target_metadata_collection="current__meta",
+        logical_collection="legacy/context",
+        migration_id="mig-1",
+        timeout_seconds=37,
+    )
+
+    with pytest.raises(MigrationError, match="invalid Qdrant point lookup point"):
+        migration._retrieve("legacy", ["id"], with_vectors=False)
+
+
 def test_migration_point_mutation_rejects_acknowledged_result() -> None:
     client = _RecordingClient()
     client.request = lambda *args, **kwargs: {"result": {"status": "acknowledged"}}  # type: ignore[method-assign]
@@ -392,8 +439,8 @@ def test_collection_mutations_require_literal_true_receipts(
         )
 
 
-def test_migration_rejects_qdrant_versions_below_strong_ordering_floor() -> None:
-    client = _ReadinessClient([{"title": "qdrant", "version": "1.9.5"}])
+def test_migration_rejects_qdrant_versions_below_sparse_owner_floor() -> None:
+    client = _ReadinessClient([{"title": "qdrant", "version": "1.15.9"}])
     migration = QdrantMigration(
         client=client,
         source_collection="legacy",
@@ -405,11 +452,11 @@ def test_migration_rejects_qdrant_versions_below_strong_ordering_floor() -> None
         timeout_seconds=1.0,
     )
 
-    with pytest.raises(MigrationError, match="minimum 1.10.0"):
+    with pytest.raises(MigrationError, match="minimum 1.16.0"):
         migration._assert_strong_ordering_support()
 
 
-@pytest.mark.parametrize("version", ["1.10.0-rc1", "1.10.0-rc1+build.1"])
+@pytest.mark.parametrize("version", ["1.16.0-rc1", "1.16.0-rc1+build.1"])
 def test_migration_rejects_qdrant_prerelease_versions(version: str) -> None:
     client = _ReadinessClient([{"title": "qdrant", "version": version}])
     migration = QdrantMigration(
@@ -428,7 +475,7 @@ def test_migration_rejects_qdrant_prerelease_versions(version: str) -> None:
 
 
 def test_migration_accepts_qdrant_build_metadata_on_stable_version() -> None:
-    client = _ReadinessClient([{"title": "qdrant", "version": "1.10.0+build.1"}])
+    client = _ReadinessClient([{"title": "qdrant", "version": "1.16.0+build.1"}])
     migration = QdrantMigration(
         client=client,
         source_collection="legacy",
@@ -1201,6 +1248,44 @@ def test_sparse_dictionary_write_is_chunked_and_verified() -> None:
         )
     ]
     assert [len(points) for points in dictionary_writes] == [1, 1]
+    assert all(
+        point["id"] == sparse_owner_point_id(point["payload"]["index"])
+        for points in dictionary_writes
+        for point in points
+    )
+    dictionary_requests = [
+        (body, params)
+        for (method, path, body), params in zip(
+            qdrant.requests,
+            qdrant.request_params,
+            strict=True,
+        )
+        if method == "PUT"
+        and path == migration._path(migration.target_metadata_collection, "/points")
+        and body
+        and any(
+            point.get("payload", {}).get("_openviking_sparse_term") is True
+            for point in body["points"]
+        )
+    ]
+    assert all(
+        params == {"wait": "true", "ordering": "strong"}
+        for _body, params in dictionary_requests
+    )
+    assert all(
+        body["update_filter"]
+        == {
+            "must_not": [
+                {
+                    "has_id": [
+                        str(point["id"])
+                        for point in body["points"]
+                    ]
+                }
+            ]
+        }
+        for body, _params in dictionary_requests
+    )
     assert len(
         [
             point
@@ -1248,8 +1333,8 @@ def test_backfill_validates_sparse_dictionary_once_per_invocation() -> None:
     # regardless of the two source pages copied by this invocation.
     assert len(dictionary_scans) == 3
     term_ids = {
-        to_qdrant_point_id("openviking:sparse:hello"),
-        to_qdrant_point_id("openviking:sparse:world"),
+        sparse_owner_point_id(stable_sparse_index("hello")),
+        sparse_owner_point_id(stable_sparse_index("world")),
     }
     per_term_lookups = [
         request
@@ -1277,12 +1362,12 @@ def test_backfill_rejects_missing_sparse_dictionary_before_writes_and_revalidate
         lock_held=True,
     )
     sparse_points = qdrant.collections[migration.target_metadata_collection]["points"]
-    missing_id = to_qdrant_point_id("openviking:sparse:hello")
+    missing_id = sparse_owner_point_id(stable_sparse_index("hello"))
     missing_point = sparse_points.pop(missing_id)
     qdrant.requests.clear()
     qdrant.request_params.clear()
 
-    with pytest.raises(SparseMigrationError, match="missing terms"):
+    with pytest.raises(SparseMigrationError, match="incomplete"):
         migration.backfill(
             confirm=True,
             plan=plan,
@@ -2787,15 +2872,90 @@ def test_sparse_hash_collisions_fail_closed(monkeypatch) -> None:
         _migration(qdrant, sparse_map={111: "hello", 222: "world"}).preflight()
 
 
+def test_sparse_manifest_accepts_legacy_alias_and_owner_for_same_binding() -> None:
+    term = "hello"
+    index = stable_sparse_index(term)
+    with _SparseDictionaryManifest() as manifest:
+        manifest.add(
+            term,
+            index,
+            point_id=to_qdrant_point_id(f"openviking:sparse:{term}"),
+        )
+        manifest.add(term, index, point_id=sparse_owner_point_id(index))
+
+        assert manifest.index_for_term(term) == index
+        assert manifest.term_for_index(index) == term
+        assert manifest.has_owner(index)
+
+
+def test_existing_sparse_dictionary_accepts_retained_alias_without_provenance() -> None:
+    qdrant = _legacy_fixture(sparse=True)
+    migration = _migration(qdrant, sparse_map={111: "hello", 222: "world"})
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    alias_id = to_qdrant_point_id("openviking:sparse:hello")
+    qdrant.collections[migration.target_metadata_collection]["points"][alias_id] = {
+        "id": alias_id,
+        "vector": {"meta": [0.0]},
+        "payload": {
+            "_openviking_sparse_term": True,
+            "term": "hello",
+            "index": stable_sparse_index("hello"),
+        },
+    }
+
+    migration.preflight()
+
+
+def test_existing_sparse_dictionary_rejects_partial_provenance() -> None:
+    qdrant = _legacy_fixture(sparse=True)
+    migration = _migration(qdrant, sparse_map={111: "hello", 222: "world"})
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    alias_id = to_qdrant_point_id("openviking:sparse:hello")
+    qdrant.collections[migration.target_metadata_collection]["points"][alias_id] = {
+        "id": alias_id,
+        "vector": {"meta": [0.0]},
+        "payload": {
+            "_openviking_sparse_term": True,
+            "term": "hello",
+            "index": stable_sparse_index("hello"),
+            "logical_collection": migration.logical_collection,
+        },
+    }
+
+    with pytest.raises(SparseMigrationError, match="incomplete migration provenance"):
+        migration.preflight()
+
+
+def test_existing_sparse_dictionary_rejects_foreign_provenance() -> None:
+    qdrant = _legacy_fixture(sparse=True)
+    migration = _migration(qdrant, sparse_map={111: "hello", 222: "world"})
+    _apply(migration, confirm=True, allow_acl_fail_open=True)
+    alias_id = to_qdrant_point_id("openviking:sparse:hello")
+    qdrant.collections[migration.target_metadata_collection]["points"][alias_id] = {
+        "id": alias_id,
+        "vector": {"meta": [0.0]},
+        "payload": {
+            "_openviking_sparse_term": True,
+            "term": "hello",
+            "index": stable_sparse_index("hello"),
+            "logical_collection": "other/context",
+            "migration_id": "other-migration",
+        },
+    }
+
+    with pytest.raises(SparseMigrationError, match="another migration"):
+        migration.preflight()
+
+
 def test_existing_sparse_dictionary_collisions_fail_closed() -> None:
     qdrant = _legacy_fixture(sparse=True)
     migration = _migration(qdrant, sparse_map={111: "hello", 222: "world"})
     _apply(migration, confirm=True, allow_acl_fail_open=True)
     metadata_points = qdrant.collections["current__context__openviking_meta"]["points"]
-    hello_id = to_qdrant_point_id("openviking:sparse:hello")
+    hello_id = sparse_owner_point_id(stable_sparse_index("hello"))
     metadata_points[hello_id]["payload"]["term"] = "different"
 
-    with pytest.raises(SparseMigrationError, match="collision"):
+    with pytest.raises(SparseMigrationError, match="invalid sparse point"):
         _migration(qdrant, sparse_map={111: "hello", 222: "world"}).preflight()
 
 
@@ -2804,12 +2964,12 @@ def test_existing_sparse_dictionary_point_id_collision_fails_closed() -> None:
     migration = _migration(qdrant, sparse_map={111: "hello", 222: "world"})
     _apply(migration, confirm=True, allow_acl_fail_open=True)
     metadata_points = qdrant.collections["current__context__openviking_meta"]["points"]
-    hello_id = to_qdrant_point_id("openviking:sparse:hello")
+    hello_id = sparse_owner_point_id(stable_sparse_index("hello"))
     metadata_points[hello_id]["payload"].update(
         {"term": "different", "index": 999}
     )
 
-    with pytest.raises(SparseMigrationError, match="point-id"):
+    with pytest.raises(SparseMigrationError, match="invalid sparse point"):
         _migration(qdrant, sparse_map={111: "hello", 222: "world"}).preflight()
 
 
@@ -2828,7 +2988,7 @@ def test_sparse_dictionary_write_is_verified_before_completion(monkeypatch) -> N
 
     monkeypatch.setattr(migration, "_write_points", drop_dictionary_write)
 
-    with pytest.raises(SparseMigrationError, match="missing terms after write"):
+    with pytest.raises(SparseMigrationError, match="incomplete"):
         _apply(migration, confirm=True, allow_acl_fail_open=True)
 
     marker = qdrant.collections[migration.target_metadata_collection]["points"][
@@ -3896,7 +4056,7 @@ def test_target_metadata_rejects_foreign_points() -> None:
         "payload": {"term": "foreign", "index": 7},
     }
 
-    with pytest.raises(SparseMigrationError, match="unexpected point"):
+    with pytest.raises(SparseMigrationError, match="invalid sparse point"):
         _migration(qdrant, sparse_map={111: "hello", 222: "world"}).preflight()
 
 
@@ -3917,7 +4077,7 @@ def test_target_sparse_dictionary_requires_stable_index_for_all_terms() -> None:
         },
     }
 
-    with pytest.raises(SparseMigrationError, match="stable term mapping"):
+    with pytest.raises(SparseMigrationError, match="invalid sparse point"):
         _migration(qdrant, sparse_map={111: "hello", 222: "world"}).preflight()
 
 
@@ -4740,6 +4900,35 @@ class _LifecycleHooks:
             self.on_assert_target_not_served()
 
 
+class _PartialRolloutHooks(_LifecycleHooks):
+    def __init__(self, *, remove_serving: bool) -> None:
+        super().__init__()
+        self.serving = False
+        self.wait_calls = 0
+        self.remove_serving = remove_serving
+
+    def rollout_current(self, migration) -> None:
+        self._call("rollout_current")
+        self.serving = True
+
+    def wait_current_ready(self, migration) -> None:
+        self._call("wait_current_ready")
+        self.wait_calls += 1
+        if self.wait_calls == 1:
+            raise RuntimeError("wait_current_ready failed")
+
+    def remove_current_from_serving_path(self, migration) -> None:
+        self._call("remove_current_from_serving_path")
+        if self.remove_serving:
+            self.serving = False
+
+    def assert_target_not_served(self, migration) -> None:
+        self._call("assert_target_not_served")
+        self.assert_target_not_served_calls += 1
+        if self.serving:
+            raise RuntimeError("target still served")
+
+
 def _ready_migration(qdrant: FakeQdrant) -> tuple[QdrantMigration, object]:
     migration, plan = _prepare_reconcile(qdrant)
     migration.verify(
@@ -5272,6 +5461,96 @@ def test_resumed_cutover_false_check_runs_before_idempotent_sequence() -> None:
     assert hooks.events[0] == "current_target_has_accepted_writes"
     assert hooks.events[-1] == "current_target_has_accepted_writes"
     assert hooks.events.index("drain_legacy_writes") > 0
+
+
+def test_resumed_cutover_unserves_partial_rollout_before_reconcile(monkeypatch) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _ready_migration(qdrant)
+    hooks = _PartialRolloutHooks(remove_serving=True)
+
+    with pytest.raises(RuntimeError, match="wait_current_ready"):
+        migration.cutover(
+            confirm=True,
+            plan=plan,
+            barrier_held=True,
+            lock_held=True,
+            hooks=hooks,
+            allow_acl_fail_open=True,
+        )
+
+    assert hooks.serving is True
+    events_before_resume = len(hooks.events)
+    reconcile_started: list[bool] = []
+    original_reconcile = migration.reconcile
+
+    def observe_reconcile(**kwargs):
+        reconcile_started.append(True)
+        assert hooks.events[events_before_resume : events_before_resume + 3] == [
+            "current_target_has_accepted_writes",
+            "remove_current_from_serving_path",
+            "assert_target_not_served",
+        ]
+        return original_reconcile(**kwargs)
+
+    monkeypatch.setattr(migration, "reconcile", observe_reconcile)
+    result = migration.cutover(
+        confirm=True,
+        plan=plan,
+        barrier_held=True,
+        lock_held=True,
+        resume=True,
+        hooks=hooks,
+        allow_acl_fail_open=True,
+    )
+
+    assert result["migration_state"] == "active"
+    assert reconcile_started == [True]
+    assert hooks.assert_target_not_served_calls == 1
+
+
+def test_resumed_cutover_refuses_if_partial_rollout_remains_served(monkeypatch) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    migration, plan = _ready_migration(qdrant)
+    hooks = _PartialRolloutHooks(remove_serving=False)
+
+    with pytest.raises(RuntimeError, match="wait_current_ready"):
+        migration.cutover(
+            confirm=True,
+            plan=plan,
+            barrier_held=True,
+            lock_held=True,
+            hooks=hooks,
+            allow_acl_fail_open=True,
+        )
+
+    writes_before_resume = len(
+        [request for request in qdrant.requests if request[0] in {"PUT", "DELETE"}]
+    )
+    events_before_resume = len(hooks.events)
+
+    def unexpected_reconcile(**kwargs):
+        raise AssertionError("reconcile must not run while target is still served")
+
+    monkeypatch.setattr(migration, "reconcile", unexpected_reconcile)
+    with pytest.raises(RuntimeError, match="target still served"):
+        migration.cutover(
+            confirm=True,
+            plan=plan,
+            barrier_held=True,
+            lock_held=True,
+            resume=True,
+            hooks=hooks,
+            allow_acl_fail_open=True,
+        )
+
+    assert hooks.events[events_before_resume:] == [
+        "current_target_has_accepted_writes",
+        "remove_current_from_serving_path",
+        "assert_target_not_served",
+    ]
+    assert len(
+        [request for request in qdrant.requests if request[0] in {"PUT", "DELETE"}]
+    ) == writes_before_resume
 
 
 def _add_empty_target_collection(qdrant: FakeQdrant, migration: QdrantMigration) -> None:

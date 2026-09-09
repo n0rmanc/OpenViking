@@ -1464,7 +1464,10 @@ acl_inherited_grants
 <details>
 <summary><b>Qdrant REST</b></summary>
 
-Qdrant 使用 Python 标准库 REST transport，不需要新增 `qdrant-client`
+支持的版本范围是所有 Qdrant server 节点 >=1.16。Runtime 在取得新 sparse owner 前
+检查 endpoint 版本，maintenance tools 在 preflight 前检查。Dense-only 和既有
+term 的读取不会检查版本，读取成功不代表支持旧版本。
+OpenViking 使用 Python 标准库 REST transport，不需要新增 `qdrant-client`
 依赖。`sparse_weight=0` 表示 dense-only；设置为 `(0, 1]` 内的值会启用
 named sparse vector 和客户端 weighted RRF hybrid search：
 
@@ -1497,15 +1500,26 @@ term dictionary。没有 marker 的既有 Qdrant collection 会 fail closed，�
 及服务端 content grep 不支持，因此 grep 继续使用 filesystem fallback
 （`USE_CONTENT_FIELD=False`）。
 
+显式指定 physical collection names 时，marker 必须包含匹配的
+`logical_collection`。旧版普通 current-format marker 没有该字段时，
+仍可使用默认派生的 physical names 读取。
+
+新 sparse term 使用原生 `update_filter` 实现 insert-only，取得每个 index 唯一的 owner，并在写入
+vector 前读回验证。旧的 term-keyed dictionary 只读保留，不覆写。升级时必须
+停止所有旧版 application writers；不支持旧／新版混合写入。可选的
+[dictionary owner seeding](../../../scripts/maintenance/README.md#upgrade-an-existing-current-format-sparse-dictionary)
+会保留旧 rows，不删除或重新 embedding 数据。
+
 PR `#3872` 之前建立的 collection 不能由当前 adapter 直接接管。切换配置到
 当前 target collection 前，请先执行
 [pre-`#3872` migration runbook](../../../scripts/maintenance/README.md)，或
 重新导入数据。请在回滚窗口内保留 source collection 和旧 metadata sidecar。
 
 在线迁移时，`data_collection_name` 和 `metadata_collection_name` 是不可变的
-physical target 名称，不是 alias。controller 与 rollout 必须使用相同的
-`logical_collection`、`migration_id`、target pair 和 `timeout_seconds`，这些
-值会记录在 target marker 中。操作阶段为：
+physical target 名称，不是 alias。Runtime rollout 必须匹配 marker 的 logical
+collection、target pair 和 vector/sparse policy。Controller 单独验证
+`migration_id` 及代码定义的 `migrator_version`，两者都不是 runtime 配置项。
+`timeout_seconds` 固定在 controller plan 中，不存入 marker。操作阶段为：
 
 ```text
 preflight -> prepare -> backfill -> reconcile -> verify

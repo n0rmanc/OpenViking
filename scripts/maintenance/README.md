@@ -1,5 +1,8 @@
 # Qdrant maintenance
 
+All Qdrant server nodes must be >=1.16 before running these tools or enabling the
+new sparse writer. Version checks fail closed; there is no ordinary-upsert fallback.
+
 ## Migrate a pre-`#3872` collection
 
 `qdrant_migrate.py` copies a legacy Qdrant data collection and its legacy
@@ -54,11 +57,21 @@ qdrant:
 ```
 
 `data_collection_name` and `metadata_collection_name` are physical Qdrant
-names, not aliases. The target marker also binds `logical_collection` and
-`migration_id`; a marker owned by another migration or missing the current
-identity is never adopted. The migrator version is code-owned. Required new
-marker fields are validated fail-closed; this unpublished branch has no
-intermediate marker-schema upgrader.
+names, not aliases. A migration target marker also binds `logical_collection`
+and `migration_id`; the controller never adopts a migration marker owned by
+another migration or missing the current identity. The migrator version is
+code-owned. Required new marker fields are validated fail-closed; this
+unpublished branch has no intermediate marker-schema upgrader.
+
+Runtime attachment validates the physical/logical binding and vector policy.
+For migration markers it also requires a complete migration identity/state.
+The controller separately validates the migration ID and code-owned migrator
+version against the reviewed
+plan; these are not runtime configuration options. Successful attachment alone
+does not prove that migration verification or cutover completed. Explicit
+physical-name overrides require a logical identity in the marker; older ordinary
+current-format markers without it remain compatible through default-derived
+physical names.
 
 `--source-metadata-collection` defaults to the pre-`#3872` global
 `__openviking_meta`. The target sidecar defaults to
@@ -171,8 +184,10 @@ Qdrant collections that only contain the legacy boolean.
 If cutover fails, the marker remains `cutting_over` (or `failed`) and the
 operator keeps the barrier held. An interrupted cutover requires explicit
 `--resume`; the controller checks for accepted current-format writes before
-source-authoritative repair and again before publishing `active`. It never
-silently overwrites accepted target writes.
+source-authoritative repair and again before publishing `active`. Before repair,
+it removes any partially rolled-out current deployment from the serving path
+and requires `assert_target_not_served` to succeed. It never silently overwrites
+accepted target writes.
 
 Rollback is allowed only while the barrier is held, before any accepted
 current-format target write, with `--confirm --lock-held
@@ -227,3 +242,66 @@ After either path, configure the application with the target physical pair,
 perform the normal deployment rollout separately, and retain the legacy
 source/sidecar for the agreed audit window. This script never updates
 application configuration, restarts services, or deletes legacy data.
+
+## Upgrade an existing current-format sparse dictionary
+
+`qdrant_sparse_upgrade.py` is only for an existing current-format data/metadata
+pair. For a pre-`#3872` source, use `qdrant_migrate.py` above; its new targets
+already receive per-index owner points.
+
+The new sparse writer atomically claims one immutable owner point per stable
+numeric index using Qdrant's native conditional upsert (`update_filter`).
+Existing term-keyed rows remain readable and are never deleted or rewritten.
+The converter only seeds missing owner points; it does not rewrite data
+vectors, change the marker format, or repair conflicting dictionaries.
+
+1. Upgrade **every Qdrant server node to >=1.16** before enabling the new
+   writer. The CLI checks the contacted endpoint's version; that is not proof
+   that every replica has been upgraded.
+2. Confirm the exact physical data/metadata pair and take a recoverable
+   backup. Acquire the external collection maintenance lock and application
+   write barrier, stop **all old application writers**, and drain in-flight
+   requests. Mixed old/new writers are unsupported, even after conversion:
+   old writers do not honor index ownership. The CLI acknowledgement flags
+   cannot acquire or verify these external controls.
+3. Run read-only preflight and review its counts:
+
+   ```bash
+   ./.venv/bin/python scripts/maintenance/qdrant_sparse_upgrade.py \
+     --url https://qdrant.example \
+     --data-collection current__context \
+     --metadata-collection current__context__openviking_meta \
+     --timeout-seconds 30 \
+     preflight
+   ```
+
+4. With the same lock and barrier still held, convert:
+
+   ```bash
+   ./.venv/bin/python scripts/maintenance/qdrant_sparse_upgrade.py \
+     --url https://qdrant.example \
+     --data-collection current__context \
+     --metadata-collection current__context__openviking_meta \
+     --timeout-seconds 30 \
+     convert --confirm --lock-held --barrier-held --old-writers-stopped
+   ```
+
+   Set `QDRANT_API_KEY` in the environment when required. The converter uses
+   bounded batches and temporary SQLite manifests, requiring local disk space
+   proportional to the dictionary. It validates canonical IDs, stable hashes,
+   provenance, and the legacy/owner union before writing; every inserted owner
+   is read back with `consistency=all`. Final verification requires complete
+   owner coverage, unchanged original bindings, and an unchanged marker.
+   On any conflict or validation failure it stops without deleting partial
+   progress. Keep the barrier held, investigate, then rerun the same command;
+   a retry may only add still-missing matching owners.
+5. Re-run preflight and require `missing_owner_count: 0`. Deploy only the new
+   writer, check existing sparse reads, then release the barrier and perform
+   a normal read/write acceptance check. Retain the backup and legacy rows.
+   Starting old writers again is not a supported rollback.
+
+Conversion is optional for read compatibility: existing-term lookups remain
+read-only and accept both canonical row formats. A runtime-only marker need
+not have migration provenance. A dictionary row with migration provenance
+must carry both `logical_collection` and `migration_id` matching its marker;
+an incomplete or mismatched pair fails closed.

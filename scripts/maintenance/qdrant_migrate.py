@@ -56,11 +56,15 @@ from openviking.storage.vectordb.collection.qdrant_rest import (  # noqa: E402
     QdrantError,
     QdrantRestClient,
     _validate_timeout_seconds,
+    validate_qdrant_version,
 )
 from openviking.storage.vectordb.qdrant_sparse import (  # noqa: E402
+    parse_sparse_point,
+    sparse_owner_point_id,
     stable_sparse_index,
 )
 from openviking.storage.vectordb.qdrant_utils import (  # noqa: E402
+    pending_work,
     qdrant_payload_field_schema,
     to_qdrant_point_id,
 )
@@ -84,7 +88,6 @@ _LEGACY_UINT64_MAX = 2**64 - 1
 _QDRANT_SPARSE_INDEX_MAX = 0x7FFF_FFFF
 _QDRANT_ID_NAMESPACE = uuid.UUID("4b6bb5a8-7f1f-5b1a-9d4c-b93f29b1d67c")
 _INTEGER_RE = re.compile(r"^[+-]?[0-9]+$")
-_QDRANT_VERSION_FLOOR = (1, 10, 0)
 MIGRATOR_VERSION = "qdrant-blue-green-v1"
 MAX_RECONCILIATION_ROUNDS = 3
 _DEPLOYMENT_HOOK_NAMES = (
@@ -227,10 +230,7 @@ class _ScanManifest:
         try:
             self._connection.close()
         finally:
-            try:
-                os.unlink(self._path)
-            except FileNotFoundError:
-                pass
+            Path(self._path).unlink(missing_ok=True)
 
     def __enter__(self) -> "_ScanManifest":
         return self
@@ -465,10 +465,7 @@ class _SparseDictionaryManifest:
         try:
             self._connection.close()
         finally:
-            try:
-                os.unlink(self._path)
-            except FileNotFoundError:
-                pass
+            Path(self._path).unlink(missing_ok=True)
 
     def __enter__(self) -> "_SparseDictionaryManifest":
         return self
@@ -524,6 +521,14 @@ class _SparseDictionaryManifest:
     def has_index(self, index: int) -> bool:
         return self.term_for_index(index) is not None
 
+    def has_owner(self, index: int) -> bool:
+        owner_id = sparse_owner_point_id(index)
+        row = self._connection.execute(
+            "SELECT 1 FROM sparse_dictionary_points WHERE point_id = ?",
+            (owner_id,),
+        ).fetchone()
+        return row is not None
+
 
 class _ScrollOffsets:
     """Disk-backed cycle detection for one Qdrant scroll."""
@@ -544,10 +549,7 @@ class _ScrollOffsets:
         try:
             self._connection.close()
         finally:
-            try:
-                os.unlink(self._path)
-            except FileNotFoundError:
-                pass
+            Path(self._path).unlink(missing_ok=True)
 
     def add(self, value: Any) -> bool:
         try:
@@ -1393,46 +1395,10 @@ class QdrantMigration:
         response = self._request("GET", "/")
         value = _result(response)
         version = value.get("version") if isinstance(value, Mapping) else None
-        if not isinstance(version, str):
-            raise MigrationError("Qdrant version is missing from the root response")
-        match = re.fullmatch(
-            r"v?(\d+)\.(\d+)\.(\d+)"
-            r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
-            version.strip(),
-        )
-        if match is None:
-            raise MigrationError(f"Qdrant version is unparseable: {version!r}")
-        parsed = tuple(int(part) for part in match.groups())
-        if parsed < _QDRANT_VERSION_FLOOR:
-            floor = ".".join(map(str, _QDRANT_VERSION_FLOOR))
-            raise MigrationError(
-                f"Qdrant version {version!r} does not support the required "
-                f"strong ordering contract (minimum {floor})"
-            )
-
-    @staticmethod
-    def _pending_work(value: Any) -> bool:
-        if value is None:
-            return False
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return value > 0
-        if isinstance(value, Mapping):
-            return any(QdrantMigration._pending_work(item) for item in value.values())
-        if isinstance(value, (list, tuple, set)):
-            return bool(value)
-        if isinstance(value, str):
-            return value.strip().lower() not in {
-                "",
-                "0",
-                "false",
-                "none",
-                "ok",
-                "complete",
-                "completed",
-            }
-        return True
+        try:
+            validate_qdrant_version(version)
+        except QdrantError as exc:
+            raise MigrationError(str(exc)) from exc
 
     def _wait_collection_ready(
         self,
@@ -1460,7 +1426,7 @@ class QdrantMigration:
                     f"Qdrant collection {collection} optimizer is not ready: {optimizer_status}"
                 )
             pending = any(
-                self._pending_work(info[name])
+                pending_work(info[name])
                 for name in ("update_queue", "deferred")
                 if name in info
             )
@@ -1747,7 +1713,9 @@ class QdrantMigration:
         value = _result(response)
         if not isinstance(value, list):
             raise MigrationError(f"invalid Qdrant point lookup response for {collection}")
-        return [point for point in value if isinstance(point, dict)]
+        if any(not isinstance(point, dict) for point in value):
+            raise MigrationError(f"invalid Qdrant point lookup point for {collection}")
+        return value
 
     def _legacy_metadata(self) -> LegacyMetadata:
         if not self._exists(self.source_metadata_collection):
@@ -3105,40 +3073,27 @@ class QdrantMigration:
                 point_id = point.get("id")
                 if point_id is not None and str(point_id) == _META_MARKER_ID:
                     continue
-                payload = point.get("payload")
-                if not isinstance(payload, Mapping) or payload.get(_SPARSE_TERM_MARKER) is not True:
+                try:
+                    term, index = parse_sparse_point(point)
+                except (TypeError, ValueError) as exc:
                     raise SparseMigrationError(
-                        f"target metadata collection contains an unexpected point {point_id!r}"
+                        f"target metadata collection contains an invalid sparse point "
+                        f"{point_id!r}: {exc}"
+                    ) from exc
+                payload = point["payload"]
+                has_logical = "logical_collection" in payload
+                has_migration = "migration_id" in payload
+                if has_logical != has_migration:
+                    raise SparseMigrationError(
+                        "target sparse dictionary point has incomplete migration provenance"
                     )
-                if (
+                if has_logical and (
                     payload.get("logical_collection") != self.logical_collection
                     or payload.get("migration_id") != self.migration_id
                 ):
                     raise SparseMigrationError(
                         "target sparse dictionary point belongs to another migration; "
                         "stable term mapping cannot be trusted"
-                    )
-                term = payload.get("term")
-                raw_index = payload.get("index")
-                if not isinstance(term, str) or not term.strip():
-                    raise SparseMigrationError("target sparse dictionary has an invalid term")
-                expected_point_id = to_qdrant_point_id(f"openviking:sparse:{term}")
-                if point_id is None or str(point_id) != expected_point_id:
-                    raise SparseMigrationError(
-                        "target sparse dictionary point-id collision for term "
-                        f"{term!r}: expected={expected_point_id!r} found={point_id!r}"
-                    )
-                index = _sparse_index(
-                    raw_index,
-                    field_name=f"target sparse dictionary index for {term!r}",
-                    minimum=1,
-                )
-                expected_index = stable_sparse_index(term)
-                if index != expected_index:
-                    raise SparseMigrationError(
-                        "target sparse dictionary has an index that does not match "
-                        f"the stable term mapping for {term!r}: "
-                        f"expected={expected_index} found={index}"
                     )
                 dictionary.add(term, index, point_id=str(point_id))
         except Exception:
@@ -3151,10 +3106,18 @@ class QdrantMigration:
         if not term_set:
             return
         with self._existing_sparse_dictionary() as dictionary:
-            missing = sorted(term for term in term_set if not dictionary.has_term(term))
-            if missing:
+            missing_terms = sorted(term for term in term_set if not dictionary.has_term(term))
+            missing_owners = sorted(
+                term for term in term_set if not dictionary.has_owner(stable_sparse_index(term))
+            )
+            if missing_terms or missing_owners:
+                detail: list[str] = []
+                if missing_terms:
+                    detail.append(f"terms={missing_terms!r}")
+                if missing_owners:
+                    detail.append(f"owners={missing_owners!r}")
                 raise SparseMigrationError(
-                    f"target sparse dictionary is missing terms after write: {missing!r}"
+                    "target sparse dictionary is incomplete after write: " + ", ".join(detail)
                 )
             for term in term_set:
                 expected_index = stable_sparse_index(term)
@@ -3208,27 +3171,28 @@ class QdrantMigration:
                         )
                     if not target_metadata_exists:
                         continue
-                    expected_id = to_qdrant_point_id(f"openviking:sparse:{term}")
+                    expected_ids = (
+                        to_qdrant_point_id(f"openviking:sparse:{term}"),
+                        sparse_owner_point_id(index),
+                    )
                     points = self._retrieve(
                         self.target_metadata_collection,
-                        [expected_id],
+                        list(expected_ids),
                         with_vectors=False,
                     )
-                    if not points:
-                        continue
-                    payload = points[0].get("payload")
-                    if (
-                        not isinstance(payload, Mapping)
-                        or payload.get(_SPARSE_TERM_MARKER) is not True
-                        or payload.get("term") != term
-                        or payload.get("index") != index
-                        or payload.get("logical_collection") != self.logical_collection
-                        or payload.get("migration_id") != self.migration_id
-                    ):
-                        raise SparseMigrationError(
-                            "target sparse dictionary point-id collision for term "
-                            f"{term!r}: point={expected_id!r}"
-                        )
+                    for point in points:
+                        try:
+                            actual_term, actual_index = parse_sparse_point(point)
+                        except (TypeError, ValueError) as exc:
+                            raise SparseMigrationError(
+                                f"target sparse dictionary point-id collision for term "
+                                f"{term!r}: point={point.get('id')!r}: {exc}"
+                            ) from exc
+                        if actual_term != term or actual_index != index:
+                            raise SparseMigrationError(
+                                "target sparse dictionary point-id collision for term "
+                                f"{term!r}: point={point.get('id')!r}"
+                            )
 
     def _validate_source_metadata_layout(
         self,
@@ -3509,6 +3473,7 @@ class QdrantMigration:
         *,
         allow_unmarked: bool = False,
         expected_state: str | None = None,
+        insert_only: bool = False,
     ) -> None:
         if not points:
             return
@@ -3530,10 +3495,20 @@ class QdrantMigration:
             if expected_state is None:
                 raise MigrationError("owned point write requires an expected state")
             self._assert_owned_target_mutation(collection, expected_state=expected_state)
+        body: dict[str, Any] = {"points": points}
+        if insert_only:
+            owner_ids = [str(point["id"]) for point in points]
+            if len(owner_ids) != len(set(owner_ids)):
+                raise MigrationError("insert-only point batch contains duplicate point IDs")
+            # Qdrant >=1.16 enforces update_filter per point, preserving an
+            # existing owner even when writers race.
+            body["update_filter"] = {
+                "must_not": [{"has_id": owner_ids}],
+            }
         self._request(
             "PUT",
             self._path(collection, "/points"),
-            {"points": points},
+            body,
             mutation=True,
         )
 
@@ -3595,11 +3570,15 @@ class QdrantMigration:
             return
         self._validate_sparse_terms(term_list)
         with self._existing_sparse_dictionary() as existing:
-            missing = [term for term in term_list if not existing.has_term(term)]
+            missing = [
+                term
+                for term in term_list
+                if not existing.has_owner(stable_sparse_index(term))
+            ]
         for offset in range(0, len(missing), self.batch_size):
             points = [
                 {
-                    "id": to_qdrant_point_id(f"openviking:sparse:{term}"),
+                    "id": sparse_owner_point_id(stable_sparse_index(term)),
                     "vector": {_META_VECTOR_NAME: [0.0]},
                     "payload": {
                         _SPARSE_TERM_MARKER: True,
@@ -3615,6 +3594,7 @@ class QdrantMigration:
                 self.target_metadata_collection,
                 points,
                 expected_state=expected_state,
+                insert_only=True,
             )
         self._assert_sparse_dictionary_complete(term_list)
 
@@ -4836,6 +4816,8 @@ class QdrantMigration:
                 raise MigrationError(
                     "resumed cutover refuses to overwrite accepted current-format writes"
                 )
+            hooks.remove_current_from_serving_path(self)
+            hooks.assert_target_not_served(self)
 
         hooks.drain_legacy_writes(self)
         hooks.remove_legacy_from_serving_path(self)
@@ -5321,7 +5303,7 @@ class QdrantMigration:
                 "refusing cutover without --allow-acl-fail-open"
             )
         self._assert_source_layout(layout, phase="target setup")
-        marker_incomplete = self.prepare(
+        self.prepare(
             confirm=confirm,
             plan=plan,
             allow_acl_fail_open=allow_acl_fail_open,
@@ -5340,33 +5322,30 @@ class QdrantMigration:
         )
         self._assert_marker_fingerprints(marker_incomplete, plan)
 
-        try:
-            backfill_result = self.backfill(
-                confirm=confirm,
-                plan=plan,
-                allow_acl_fail_open=allow_acl_fail_open,
-                lock_held=lock_held,
-            )
-            migrated = int(backfill_result["migrated_count"])
-            skipped = int(backfill_result["skipped_count"])
+        backfill_result = self.backfill(
+            confirm=confirm,
+            plan=plan,
+            allow_acl_fail_open=allow_acl_fail_open,
+            lock_held=lock_held,
+        )
+        migrated = int(backfill_result["migrated_count"])
+        skipped = int(backfill_result["skipped_count"])
 
-            self._assert_source_layout(layout, phase="final verification")
-            final_source = self._scan_source(layout=layout, schema=metadata.schema)
-            self._assert_source_snapshot(plan, final_source, phase="apply")
-            final_metadata = self._legacy_metadata()
-            if _metadata_fingerprint(final_metadata) != plan.metadata_fingerprint:
-                raise MigrationError(
-                    "legacy metadata changed during apply; rerun preflight with writes frozen"
-                )
-            verification = self.verify(
-                plan=plan,
-                allow_acl_fail_open=allow_acl_fail_open,
-                confirm=confirm,
-                lock_held=lock_held,
+        self._assert_source_layout(layout, phase="final verification")
+        final_source = self._scan_source(layout=layout, schema=metadata.schema)
+        self._assert_source_snapshot(plan, final_source, phase="apply")
+        final_metadata = self._legacy_metadata()
+        if _metadata_fingerprint(final_metadata) != plan.metadata_fingerprint:
+            raise MigrationError(
+                "legacy metadata changed during apply; rerun preflight with writes frozen"
             )
-            target_count = int(verification["target_count"])
-        except Exception:
-            raise
+        verification = self.verify(
+            plan=plan,
+            allow_acl_fail_open=allow_acl_fail_open,
+            confirm=confirm,
+            lock_held=lock_held,
+        )
+        target_count = int(verification["target_count"])
 
         return MigrationResult(
             source_count=plan.source_count,
