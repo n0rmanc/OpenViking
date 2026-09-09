@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import yaml
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -38,6 +40,26 @@ def test_build_docker_workflow_uses_manual_input_version_for_dispatch_tags():
 
     assert "type=raw,value=${{ github.event.inputs.version }}" in workflow
     assert "type=ref,event=tag" in workflow
+
+
+def test_build_docker_workflow_tags_s3fs_branch_pushes():
+    branch = "fix/s3fs-pathlock-stale-stat-cache"
+    workflow = yaml.load(
+        _read_text(".github/workflows/build-docker-image.yml"), Loader=yaml.BaseLoader
+    )
+    assert workflow["on"]["push"]["branches"] == ["main", branch]
+    branch_rule = (
+        "type=ref,event=branch,enable=${{ github.event_name == 'push' && "
+        f"github.ref == 'refs/heads/{branch}'"
+        " }}"
+    )
+    for job_name in ("build-and-push-image", "create-manifest"):
+        metadata = next(
+            step
+            for step in workflow["jobs"][job_name]["steps"]
+            if step.get("id") == "meta"
+        )
+        assert branch_rule in metadata["with"]["tags"].splitlines()
 
 
 def test_build_docker_workflow_does_not_force_zero_version_on_main_builds():
