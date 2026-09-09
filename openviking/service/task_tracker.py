@@ -19,7 +19,7 @@ import re
 import threading
 import time
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -82,19 +82,26 @@ class TaskRecord:
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     auth: Dict[str, Any] = field(default_factory=dict, repr=False)
+    _extra_fields: Dict[str, Any] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize for JSON response."""
-        d = asdict(self)
-        d["status"] = self.status.value
-        d["created_at_iso"] = datetime.fromtimestamp(self.created_at, tz=timezone.utc).isoformat()
-        d["updated_at_iso"] = datetime.fromtimestamp(self.updated_at, tz=timezone.utc).isoformat()
-        d["result"] = _sanitize_task_result(d.get("result"))
-        d["meta"] = _sanitize_task_result(d.get("meta"))
-        d.pop("auth", None)
-        d.pop("account_id", None)
-        d.pop("user_id", None)
-        return d
+        return {
+            "task_id": self.task_id,
+            "task_type": self.task_type,
+            "status": self.status.value,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "resource_id": self.resource_id,
+            "meta": _sanitize_task_result(deepcopy(self.meta)),
+            "stage": self.stage,
+            "result": _sanitize_task_result(deepcopy(self.result)),
+            "error": self.error,
+            "created_at_iso": datetime.fromtimestamp(self.created_at, tz=timezone.utc).isoformat(),
+            "updated_at_iso": datetime.fromtimestamp(self.updated_at, tz=timezone.utc).isoformat(),
+        }
 
 
 # ── Singleton ──
@@ -135,7 +142,7 @@ _SENSITIVE_PATTERNS = re.compile(
 )
 
 _MAX_ERROR_LEN = 500
-_SENSITIVE_RESULT_KEYS = {"user_key"}
+SENSITIVE_TASK_KEYS = frozenset({"api_key", "user_key"})
 
 
 def _sanitize_error(error: str) -> str:
@@ -152,7 +159,7 @@ def _sanitize_task_result(result: Any) -> Any:
         return {
             key: _sanitize_task_result(value)
             for key, value in result.items()
-            if key not in _SENSITIVE_RESULT_KEYS
+            if key not in SENSITIVE_TASK_KEYS
         }
     if isinstance(result, list):
         return [_sanitize_task_result(item) for item in result]
@@ -207,10 +214,14 @@ class TaskTracker:
         self._dispatcher.bind_current_loop()
         self._install_work_index_callbacks()
 
-    async def restore_work_tasks(self, owners: Dict[str, tuple[str, str]]) -> None:
+    async def restore_work_tasks(self, owners: Dict[str, tuple[str, str]]) -> List[TaskRecord]:
         """Restore task records referenced by rebuilt QueueFS work."""
+        restored = []
         for task_id, (account_id, user_id) in owners.items():
-            await self.get(task_id, account_id=account_id, user_id=user_id)
+            task = await self.get(task_id, account_id=account_id, user_id=user_id)
+            if task is not None:
+                restored.append(task)
+        return restored
 
     async def _finalize_before_ack(self, metadata: QueueTaskMetadata) -> None:
         """Persist the terminal state before QueueFS removes the last recovery message."""
@@ -1083,9 +1094,15 @@ class TaskTracker:
 
     @staticmethod
     def _record_from_payload(payload: Dict[str, Any]) -> TaskRecord:
-        data = dict(payload)
+        known_fields = {item.name for item in fields(TaskRecord) if item.init}
+        data = {key: deepcopy(value) for key, value in payload.items() if key in known_fields}
         data["status"] = TaskStatus(data["status"])
-        return TaskRecord(**data)
+        record = TaskRecord(**data)
+        # Keep fields from other writers for the next persistence update.
+        record._extra_fields = {
+            key: deepcopy(value) for key, value in payload.items() if key not in known_fields
+        }
+        return record
 
     async def _load_from_store(
         self,
