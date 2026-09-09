@@ -3080,13 +3080,7 @@ class QdrantMigration:
                         f"target metadata collection contains an invalid sparse point "
                         f"{point_id!r}: {exc}"
                     ) from exc
-                payload = point.get("payload")
-                if not isinstance(payload, Mapping):
-                    # parse_sparse_point already rejects this, but keep the
-                    # narrow type for the provenance checks below.
-                    raise SparseMigrationError(
-                        f"target sparse dictionary point {point_id!r} has no payload"
-                    )
+                payload = point["payload"]
                 has_logical = "logical_collection" in payload
                 has_migration = "migration_id" in payload
                 if has_logical != has_migration:
@@ -3112,21 +3106,11 @@ class QdrantMigration:
         if not term_set:
             return
         with self._existing_sparse_dictionary() as dictionary:
-            missing = sorted(
-                term
-                for term in term_set
-                if not dictionary.has_term(term)
-                or not dictionary.has_owner(stable_sparse_index(term))
+            missing_terms = sorted(term for term in term_set if not dictionary.has_term(term))
+            missing_owners = sorted(
+                term for term in term_set if not dictionary.has_owner(stable_sparse_index(term))
             )
-            if missing:
-                missing_terms = sorted(
-                    term for term in missing if not dictionary.has_term(term)
-                )
-                missing_owners = sorted(
-                    term
-                    for term in missing
-                    if not dictionary.has_owner(stable_sparse_index(term))
-                )
+            if missing_terms or missing_owners:
                 detail: list[str] = []
                 if missing_terms:
                     detail.append(f"terms={missing_terms!r}")
@@ -3525,7 +3509,6 @@ class QdrantMigration:
             "PUT",
             self._path(collection, "/points"),
             body,
-            params=None,
             mutation=True,
         )
 

@@ -128,18 +128,20 @@ def test_qdrant_phase_1_and_phase_2_round_trip() -> None:
                 "Fields": [
                     {"FieldName": "account_id", "FieldType": "string"},
                     {"FieldName": "search_tags", "FieldType": "list<string>"},
+                    {"FieldName": "level", "FieldType": "int64"},
                 ],
             }
         )
         collection.create_index(
             "default",
-            {"ScalarIndex": ["account_id", "search_tags"]},
+            {"ScalarIndex": ["account_id", "search_tags", "level"]},
         )
         collection.upsert_data(
             [
                 {
                     "id": "doc-a",
                     "account_id": "acct-a",
+                    "level": 2,
                     "search_tags": ["team=search", "env=prod"],
                     "uri": "viking://resources/wiki/a.md",
                     "vector": [1.0, 0.0],
@@ -148,6 +150,7 @@ def test_qdrant_phase_1_and_phase_2_round_trip() -> None:
                 {
                     "id": "doc-b",
                     "account_id": "acct-b",
+                    "level": 1,
                     "search_tags": ["team=search"],
                     "uri": "viking://resources/wiki/b.md",
                     "vector": [0.0, 1.0],
@@ -176,6 +179,22 @@ def test_qdrant_phase_1_and_phase_2_round_trip() -> None:
             .id
             == "doc-a"
         )
+        scalar = collection.search_by_scalar(
+            "default", "level", filters=path_and_account
+        ).data[0]
+        assert scalar.score == 2.0
+        assert scalar.fields == {
+            "id": "doc-a",
+            "account_id": "acct-a",
+            "level": 2,
+            "search_tags": ["team=search", "env=prod"],
+            "uri": "/resources/wiki/a.md",
+        }
+        projected = collection.search_by_scalar(
+            "default", "level", filters=path_and_account, output_fields=["account_id"]
+        ).data[0]
+        assert projected.score == 2.0
+        assert projected.fields == {"id": "doc-a", "account_id": "acct-a"}
         assert (
             collection.search_by_vector(
                 "default",

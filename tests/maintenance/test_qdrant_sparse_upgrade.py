@@ -135,6 +135,8 @@ def _marker(
         "sparse_enabled": True,
     }
     if state is not None:
+        marker["logical_collection"] = "logical"
+        marker["migration_id"] = "migration"
         marker["migration_state"] = state
     if setup_complete is not None:
         marker["setup_complete"] = setup_complete
@@ -268,6 +270,41 @@ def test_preflight_rejects_malformed_marker_state(state) -> None:
     assert _writes(client) == []
 
 
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        pytest.param({"migration_state": "active"}, id="state-only"),
+        pytest.param(
+            {"target_collection": "data", "target_metadata_collection": "meta"},
+            id="target-pair-only",
+        ),
+        pytest.param({"vector_dimension": 1536}, id="vector-dimension-only"),
+        pytest.param({"migrator_version": "qdrant-blue-green-v1"}, id="migrator-version-only"),
+    ],
+)
+def test_preflight_and_convert_reject_incomplete_migration_marker(
+    fragment: dict[str, object],
+) -> None:
+    client = _FakeQdrant(
+        marker={**_marker(state=None), **fragment},
+        points=[_sparse_point("hello")],
+    )
+    converter = _upgrade(client)
+
+    with pytest.raises(upgrade.SparseUpgradeError, match="migration marker"):
+        converter.preflight()
+    assert _writes(client) == []
+
+    with pytest.raises(upgrade.SparseUpgradeError, match="migration marker"):
+        converter.convert(
+            confirm=True,
+            lock_held=True,
+            barrier_held=True,
+            old_writers_stopped=True,
+        )
+    assert _writes(client) == []
+
+
 def test_preflight_rejects_incomplete_marker_and_disabled_sparse() -> None:
     for marker in (
         _marker(setup_complete=False),
@@ -278,8 +315,13 @@ def test_preflight_rejects_incomplete_marker_and_disabled_sparse() -> None:
             _upgrade(_FakeQdrant(marker=marker)).preflight()
 
 
-def test_preflight_accepts_plain_current_marker_without_migration_provenance() -> None:
+@pytest.mark.parametrize("logical_collection", [None, "logical"])
+def test_preflight_accepts_plain_current_marker_without_migration_provenance(
+    logical_collection: str | None,
+) -> None:
     marker = _marker(state=None, setup_complete=None)
+    if logical_collection is not None:
+        marker["logical_collection"] = logical_collection
 
     plan = _upgrade(_FakeQdrant(marker=marker)).preflight()
 

@@ -28,6 +28,7 @@ from openviking.storage.vectordb.qdrant_sparse import (
 )
 from openviking.storage.vectordb.qdrant_utils import (
     build_qdrant_payload,
+    is_qdrant_migration_marker,
     pending_work,
     qdrant_payload_field_schema,
     to_qdrant_point_id,
@@ -53,20 +54,6 @@ _ADAPTER_MARKER_FIELDS = {
     "sparse_enabled",
     "sparse_weight",
     "indexes",
-}
-_MIGRATION_MARKER_FIELDS = {
-    "migration_id",
-    "migration_state",
-    "migrator_version",
-    "source_collection",
-    "source_metadata_collection",
-    "source_fingerprint",
-    "metadata_fingerprint",
-    "sparse_map_fingerprint",
-    "target_count",
-    "target_collection",
-    "target_metadata_collection",
-    "vector_dimension",
 }
 _MIGRATION_STATE_SETUP = {
     "building": False,
@@ -317,7 +304,7 @@ class QdrantCollection(ICollection):
         }
         if self._logical_collection is not None:
             payload["logical_collection"] = self._logical_collection
-        if self._is_migration_marker(payload):
+        if is_qdrant_migration_marker(payload):
             payload["vector_dimension"] = self._vector_dim
         return payload
 
@@ -374,10 +361,6 @@ class QdrantCollection(ICollection):
         }
         return payload
 
-    @staticmethod
-    def _is_migration_marker(marker: dict[str, Any]) -> bool:
-        return any(name in marker for name in _MIGRATION_MARKER_FIELDS)
-
     def _validate_marker_binding(self, marker: dict[str, Any]) -> None:
         if type(marker.get("_openviking_meta_version")) is not int or (
             marker["_openviking_meta_version"] != _META_VERSION
@@ -385,7 +368,7 @@ class QdrantCollection(ICollection):
             raise RuntimeError(
                 f"Qdrant collection {self._collection_name!r} has no valid current marker"
             )
-        migration_marker = self._is_migration_marker(marker)
+        migration_marker = is_qdrant_migration_marker(marker)
         if migration_marker:
             for field_name in ("migration_id", "migration_state"):
                 value = marker.get(field_name)
@@ -755,11 +738,6 @@ class QdrantCollection(ICollection):
         *,
         with_vectors: bool,
     ) -> list[dict[str, Any]]:
-        request_kwargs = (
-            {"params": {"consistency": "all"}}
-            if collection_name == self._metadata_collection_name
-            else {}
-        )
         response = self._client.request(
             "POST",
             self._path(collection_name, "/points"),
@@ -768,7 +746,9 @@ class QdrantCollection(ICollection):
                 "with_payload": True,
                 "with_vector": with_vectors,
             },
-            **request_kwargs,
+            params={"consistency": "all"}
+            if collection_name == self._metadata_collection_name
+            else None,
         )
         result = self._result(response)
         if not isinstance(result, list) or any(not isinstance(point, dict) for point in result):
@@ -802,16 +782,13 @@ class QdrantCollection(ICollection):
                 body["order_by"] = order_by
             if offset is not None:
                 body["offset"] = offset
-            request_kwargs = (
-                {"params": {"consistency": "all"}}
-                if collection_name == self._metadata_collection_name
-                else {}
-            )
             response = self._client.request(
                 "POST",
                 self._path(collection_name, "/points/scroll"),
                 body,
-                **request_kwargs,
+                params={"consistency": "all"}
+                if collection_name == self._metadata_collection_name
+                else None,
             )
             result = self._result(response)
             if not isinstance(result, dict):
@@ -1223,10 +1200,11 @@ class QdrantCollection(ICollection):
         output_fields: list[str] | None = None,
     ) -> SearchResult:
         del index_name
-        scalar_output_fields = list(output_fields or [])
-        remove_sort_field = field not in scalar_output_fields
-        if remove_sort_field:
+        scalar_output_fields = None if output_fields is None else list(output_fields)
+        remove_sort_field = False
+        if scalar_output_fields is not None and field not in scalar_output_fields:
             scalar_output_fields.append(field)
+            remove_sort_field = True
         points = self._scroll(
             self._collection_name,
             filter=filters,

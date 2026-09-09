@@ -26,6 +26,9 @@ from openviking.storage.vectordb.qdrant_sparse import (  # noqa: E402
     parse_sparse_point,
     sparse_owner_point_id,
 )
+from openviking.storage.vectordb.qdrant_utils import (  # noqa: E402
+    is_qdrant_migration_marker,
+)
 from scripts.maintenance.qdrant_migrate import (  # noqa: E402
     _META_MARKER_ID,
     MigrationError,
@@ -167,36 +170,28 @@ class SparseDictionaryUpgrade:
         if setup_complete is not None and setup_complete is not True:
             raise SparseUpgradeError("OpenViking metadata marker is not setup-complete")
         state = marker.get("migration_state")
-        if state is not None:
-            if not isinstance(state, str) or state not in _ALLOWED_STATES:
-                raise SparseUpgradeError(
-                    f"OpenViking metadata marker has an unsupported migration state: {state!r}"
-                )
-            if setup_complete is not True:
-                raise SparseUpgradeError(
-                    "OpenViking migration marker requires setup_complete=True"
-                )
-
-        migration_present = "migration_id" in marker
-        logical_present = "logical_collection" in marker
-        migration_id = marker.get("migration_id")
         logical_collection = marker.get("logical_collection")
-        if migration_present:
+        if is_qdrant_migration_marker(marker):
+            migration_id = marker.get("migration_id")
             if (
                 not isinstance(migration_id, str)
                 or not migration_id.strip()
-                or not logical_present
                 or not isinstance(logical_collection, str)
                 or not logical_collection.strip()
             ):
                 raise SparseUpgradeError(
                     "OpenViking migration marker has incomplete provenance"
                 )
-            if state is None:
+            if setup_complete is not True:
                 raise SparseUpgradeError(
-                    "OpenViking migration marker with migration_id has no migration state"
+                    "OpenViking migration marker requires setup_complete=True"
                 )
-        elif logical_present and (
+            if not isinstance(state, str) or state not in _ALLOWED_STATES:
+                raise SparseUpgradeError(
+                    f"OpenViking metadata marker has an unsupported migration state: {state!r}"
+                )
+
+        elif "logical_collection" in marker and (
             not isinstance(logical_collection, str) or not logical_collection.strip()
         ):
             raise SparseUpgradeError(
@@ -518,9 +513,7 @@ class SparseDictionaryUpgrade:
             raise SparseUpgradeError(
                 f"sparse owner readback does not match term {term!r} and index {index}"
             )
-        payload = point.get("payload")
-        if not isinstance(payload, Mapping):
-            raise SparseUpgradeError("sparse owner readback has an invalid payload")
+        payload = point["payload"]
         self._validate_row_provenance(payload, marker)
         expected = self._expected_payload(term, index, marker)
         for field, value in expected.items():
@@ -560,10 +553,7 @@ class SparseDictionaryUpgrade:
                     "update_filter": {
                         "must_not": [
                             {
-                                "has_id": [
-                                    sparse_owner_point_id(binding.index)
-                                    for binding in batch
-                                ]
+                                "has_id": [point["id"] for point in points]
                             }
                         ]
                     },

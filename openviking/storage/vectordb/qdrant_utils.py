@@ -23,6 +23,25 @@ from openviking.storage.expr import (
 
 _OPENVIKING_QDRANT_ID_NAMESPACE = uuid.UUID("4b6bb5a8-7f1f-5b1a-9d4c-b93f29b1d67c")
 _URI_FIELDS = {"uri", "parent_uri"}
+_MIGRATION_MARKER_FIELDS = {
+    "migration_id",
+    "migration_state",
+    "migrator_version",
+    "source_collection",
+    "source_metadata_collection",
+    "source_fingerprint",
+    "metadata_fingerprint",
+    "sparse_map_fingerprint",
+    "target_count",
+    "target_collection",
+    "target_metadata_collection",
+    "vector_dimension",
+}
+
+
+def is_qdrant_migration_marker(marker: Mapping[str, Any]) -> bool:
+    """Keep runtime and maintenance migration-marker detection identical."""
+    return any(name in marker for name in _MIGRATION_MARKER_FIELDS)
 
 
 def pending_work(value: Any) -> bool:

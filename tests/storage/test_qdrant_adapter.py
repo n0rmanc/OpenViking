@@ -2632,32 +2632,34 @@ def test_grouped_or_conditional_aggregation_is_rejected_before_http() -> None:
 @pytest.mark.parametrize(
     ("output_fields", "expected_fields"),
     [
-        (None, {"id": "doc-1"}),
+        (None, {"id": "doc-1", "name": "doc.md", "level": 2}),
         ([], {"id": "doc-1"}),
         (["name"], {"id": "doc-1", "name": "doc.md"}),
         (["name", "level"], {"id": "doc-1", "name": "doc.md", "level": 2}),
     ],
 )
-def test_scalar_search_projects_sort_value_for_score_but_not_output(
+def test_scalar_search_preserves_projection_and_sort_score(
     output_fields: list[str] | None,
     expected_fields: dict[str, object],
 ) -> None:
     collection = _readiness_collection(_ScriptedTransport())
     requested_fields = None if output_fields is None else list(output_fields)
     original_fields = None if requested_fields is None else list(requested_fields)
-    seen_include: set[str] = set()
+    seen_selectors = []
 
     def request(_method: str, _path: str, body=None, *, params=None):
         del params
-        include = set(body["with_payload"]["include"])
-        seen_include.update(include)
+        selector = body["with_payload"]
+        seen_selectors.append(selector)
         payload = {
             "_openviking_original_id": "doc-1",
+            "name": "doc.md",
+            "level": 2,
         }
-        if "name" in include:
-            payload["name"] = "doc.md"
-        if "level" in include:
-            payload["level"] = 2
+        if isinstance(selector, dict):
+            payload = {
+                key: value for key, value in payload.items() if key in selector["include"]
+            }
         return {
             "result": {
                 "points": [
@@ -2677,10 +2679,18 @@ def test_scalar_search_projects_sort_value_for_score_but_not_output(
         output_fields=requested_fields,
     )
 
-    assert seen_include == {"_openviking_original_id", "level", *set(output_fields or [])}
     assert result.data[0].score == 2.0
     assert result.data[0].fields == expected_fields
     assert requested_fields == original_fields
+    assert len(seen_selectors) == 1
+    if output_fields is None:
+        assert seen_selectors[0] is True
+    else:
+        assert set(seen_selectors[0]["include"]) == {
+            "_openviking_original_id",
+            "level",
+            *output_fields,
+        }
 
 
 def test_fetch_data_converts_each_payload_once() -> None:
