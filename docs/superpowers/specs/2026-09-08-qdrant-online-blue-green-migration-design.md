@@ -184,6 +184,11 @@ target physical data name and adds:
 
 The adapter validates the physical names and logical identity from this marker.
 It does not accept a legacy marker as a current-format marker.
+Explicit physical-name overrides require a matching logical identity. Ordinary
+current-format markers without a logical identity remain readable through the
+default-derived physical names for backward compatibility. Migration markers
+require a non-empty migration ID and a valid state; any duplicate target-name
+fields must be complete and match the canonical physical pair.
 
 `source_fingerprint` and the source count in the reviewed plan are the most
 recent raw-source observations, not immutable online-copy inputs. Each
@@ -537,9 +542,12 @@ change legacy `qdrant`/top-level/`custom_params` behavior. Only the new
 physical-name fields need omitted-versus-explicit detection.
 
 The legacy adapter is never pointed at the target. The current adapter is
-never pointed at the legacy marker. The target marker's physical names,
-logical collection, vector layout, sparse mode/weight, migration ID, and
-migrator version must all match the rollout configuration.
+never pointed at the legacy marker. The adapter checks the target marker's
+physical names, logical collection, vector layout, and sparse mode/weight
+against runtime configuration. The migration controller separately checks the
+migration ID and migrator version against the reviewed plan and its code-owned
+contract before cutover; these are not additional runtime configuration knobs.
+A successful adapter attachment is not a substitute for controller verification.
 `migrator_version` is a stable code constant combined with the transform-schema
 version; changing either requires a new migration ID and target.
 
@@ -553,7 +561,7 @@ accepted through this gate.
 Hybrid search remains the existing client-side weighted rank fusion. Qdrant
 supports server-side `prefetch` + `fusion: RRF` from v1.10, and
 [weighted RRF from v1.17](https://qdrant.tech/documentation/search/hybrid-queries/#weighted-rrf).
-Weighted RRF is therefore not available across the entire supported `>=1.10`
+Weighted RRF is therefore not available across the entire supported `>=1.16`
 range. The current adapter performs sidecar term lookup before two
 data-collection queries; that encoding step does not prevent server-side
 prefetch. Switching fusion implementations still requires score and pagination
@@ -607,6 +615,8 @@ The conditional Qdrant CI job runs:
 ```text
 tests/maintenance/test_qdrant_migrate.py
 tests/storage/test_qdrant_adapter.py
+tests/storage/test_qdrant_sparse.py
+tests/maintenance/test_qdrant_sparse_upgrade.py
 tests/storage/test_qdrant_migration_integration.py
 tests/storage/test_qdrant_integration.py
 tests/storage/test_collection_schemas.py
