@@ -28,6 +28,7 @@ hybrid sparse-vector correctness without reverting the removed implementation.
 
 - Named Qdrant sparse vector support.
 - Durable sparse-term dictionary stored in a sidecar Qdrant collection.
+- Qdrant >=1.16 is required for native conditional sparse ownership.
 - Stable SHA-256-derived positive uint32 term IDs (the Qdrant REST/protobuf
   sparse-index limit) with collision detection and an explicit error on
   collision; no lossy hash merging.
@@ -42,8 +43,8 @@ hybrid sparse-vector correctness without reverting the removed implementation.
 - No migration or implicit takeover of existing unmarked Qdrant collections.
 - No server-side full-text content index in Qdrant.
 - No change to upper-layer search APIs or Filter AST.
-- No distributed metadata transaction protocol beyond Qdrant point-level
-  idempotence and collision detection.
+- No custom distributed metadata transaction protocol: use Qdrant's native
+  insert-only point ownership and fail-closed readback.
 
 ## Data model
 
@@ -59,9 +60,20 @@ The data collection stores:
 The metadata collection stores:
 
 - A fixed OpenViking schema marker point.
-- One point per sparse term containing `term` and `index`.
-- The deterministic point ID is derived from the term; a matching index with a
-  different term is treated as a collision and raises.
+- One owner point per sparse index containing `term` and `index`, with ID derived
+  from `openviking:sparse-index:{index}`. A native `update_filter` excluding the
+  batch's owner IDs, `wait=true`, and strong ordering prevent a rejected writer
+  from overwriting the accepted owner. This yields insert-only semantics on
+  1.16, which silently ignores the newer `update_mode=insert_only` field.
+- Read the owner back before accepting registration; completion alone does not
+  identify the winner. Missing, malformed, or different owners fail closed.
+- Existing `openviking:sparse:{term}` points remain immutable compatibility
+  bindings. Validate both canonical forms, including stable hashes and collision
+  checks. Existing-term lookup stays read-only.
+- Stop all old application writers during upgrade. The optional owner-seeding
+  maintenance command requires explicit confirmation, external lock, barrier,
+  and stopped-old-writer acknowledgements. It retains old rows and never rewrites
+  data vectors or changes marker versions.
 
 ## Filter mapping
 

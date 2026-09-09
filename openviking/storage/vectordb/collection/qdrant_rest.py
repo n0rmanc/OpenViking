@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Callable
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -28,6 +29,23 @@ class QdrantError(RuntimeError):
         self.method = method
         self.path = path
         self.status = status
+
+
+def validate_qdrant_version(version: Any) -> None:
+    """Fail closed unless the server supports native conditional point writes."""
+    if not isinstance(version, str):
+        raise QdrantError("Qdrant version is missing from the root response")
+    match = re.fullmatch(
+        r"v?(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
+        version.strip(),
+    )
+    if match is None:
+        raise QdrantError(f"Qdrant version is unparseable: {version!r}")
+    if tuple(int(part) for part in match.groups()) < (1, 16, 0):
+        raise QdrantError(
+            f"Qdrant version {version!r} does not support the required "
+            "conditional ownership contract (minimum 1.16.0)"
+        )
 
 
 def _validate_timeout_seconds(value: Any) -> float:
@@ -62,6 +80,7 @@ class QdrantRestClient:
         self._api_key = api_key
         self._timeout_seconds = _validate_timeout_seconds(timeout_seconds)
         self._opener = opener or urlopen
+        self._version_checked = False
 
     @property
     def base_url(self) -> str:
@@ -70,6 +89,13 @@ class QdrantRestClient:
     @property
     def timeout_seconds(self) -> float:
         return self._timeout_seconds
+
+    def ensure_supported_version(self) -> None:
+        if not self._version_checked:
+            response = self.request("GET", "/")
+            result = response.get("result", response)
+            validate_qdrant_version(result.get("version") if isinstance(result, dict) else None)
+            self._version_checked = True
 
     def request(
         self,

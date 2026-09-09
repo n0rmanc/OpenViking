@@ -278,6 +278,10 @@ collection，不新增 `qdrant-client` 依赖：
 
 - `sparse_weight: 0` 是 dense-only；`0 < sparse_weight <= 1` 启用 named sparse
   vector 与 hybrid weighted-RRF。
+- 所有 Qdrant server 节点需要 >=1.16。新 sparse index 使用原生 `update_filter` 的 insert-only 语义
+  建立唯一 owner，并读回验证；旧 term-keyed rows 只读保留。升级时停止所有旧
+  application writers，不支持旧／新版混合写入。可选转换见
+  [maintenance runbook](../../../scripts/maintenance/README.md#upgrade-an-existing-current-format-sparse-dictionary)。
 - Qdrant data collection 会附带一个 OpenViking metadata sidecar，保存 schema、
   index metadata 与 sparse term dictionary；term ID 使用 Qdrant 兼容的
   positive uint32 SHA-256 candidate，并在碰撞时 fail closed。没有 marker

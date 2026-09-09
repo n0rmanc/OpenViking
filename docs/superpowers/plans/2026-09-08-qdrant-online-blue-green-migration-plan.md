@@ -1157,3 +1157,34 @@ Commit only the three implementation/test files and the two scope-corrected
 spec/plan files. The same consolidated PR receives this commit. No production
 operation, upstream PR, or change to the server-side fusion implementation is
 part of this task.
+
+## Approved PR #4458 sparse-ownership amendment (2026-09-09)
+
+The user approved raising the Qdrant floor to 1.16 and handling existing
+term-keyed dictionaries. This supersedes the earlier term-ID write protocol;
+the public data-vector format and migration marker version do not change.
+Spec: `docs/superpowers/specs/2026-08-20-qdrant-integration-design.md`, Data model.
+
+- [ ] Add failing shared primitive tests in `tests/storage/test_qdrant_sparse.py`
+  for the real `69235` / `95303` collision, both canonical point-ID forms,
+  malformed bindings, missing readback, and the 1.16 version boundary.
+- [ ] Implement shared `sparse_owner_point_id(index)`, `parse_sparse_point(point)`,
+  `validate_qdrant_version(version)`, and cached `ensure_supported_version()`.
+- [ ] Runtime: dual-read immutable legacy rows and owner rows; new registrations
+  use a native `update_filter` of `{"must_not": [{"has_id": owner_ids}]}` with
+  `wait=true` and `ordering=strong`, then validate the owner readback. Do not use
+  `update_mode=insert_only`: Qdrant 1.16 silently ignores it. Add interleaving/retry
+  tests. Existing-term reads must not write metadata.
+- [ ] Migration: emit owner IDs, require owner completeness, preserve legacy
+  bindings, reject foreign provenance, and retain existing mutation/state gates.
+- [ ] Add optional `qdrant_sparse_upgrade.py` and behavioral tests: read-only
+  preflight; conversion gated by confirm, lock, barrier, and stopped old writers;
+  complete validation before writes, insert-only seeding, final validation,
+  resumable partial completion, and no deletion or data-vector mutation.
+- [ ] Wire new test/script paths into the existing Qdrant CI lane and update
+  configuration/runbook docs. Do not modify server-side fusion.
+- [ ] Run affected pytest suites with `.venv/bin/python` (never rebuild this
+  environment), then real integration tests on disposable local Qdrant 1.16.0
+  and 1.19.0. Run Ruff, `git diff --check`, correctness and ponytail reviews;
+  fix actionable findings and repeat. No commit, push, merge, or production
+  migration without a separate request.
