@@ -36,6 +36,7 @@ REQUIRED_QDRANT_TESTS = (
     "tests/storage/test_collection_schemas.py",
 )
 REQUIRED_QDRANT_SHARED_DEPENDENCIES = (
+    "openviking/storage/acl.py",
     "openviking/storage/collection_schemas.py",
     "openviking/storage/viking_vector_index_backend.py",
     "openviking/storage/vectordb_adapters/base.py",
@@ -1572,7 +1573,7 @@ def test_resume_repairs_missing_acl_on_existing_complete_target() -> None:
     for point in qdrant.collections["legacy__context"]["points"].values():
         point["payload"].update(
             {
-                "acl_enabled": False,
+                "acl_mode": "none",
                 "acl_direct_grants": [],
                 "acl_inherited_grants": [],
             }
@@ -1581,14 +1582,14 @@ def test_resume_repairs_missing_acl_on_existing_complete_target() -> None:
     _apply(migration, confirm=True)
     existing_id = to_qdrant_point_id("1")
     qdrant.collections["current__context"]["points"][existing_id]["payload"].pop(
-        "acl_enabled"
+        "acl_mode"
     )
     _mark_current_target_building(qdrant, migration)
 
     result = _apply(_migration(qdrant), confirm=True)
 
     assert result.migrated_count == 1
-    assert "acl_enabled" in qdrant.collections["current__context"]["points"][
+    assert "acl_mode" in qdrant.collections["current__context"]["points"][
         existing_id
     ]["payload"]
 
@@ -2561,7 +2562,7 @@ def test_backfill_holds_one_page_and_one_write_batch(monkeypatch) -> None:
     assert batch_sizes == [1, 1]
 
 
-def test_completed_backfill_resume_does_not_scan_source(monkeypatch) -> None:
+def test_completed_backfill_resume_requires_acl_ack_without_scanning_source(monkeypatch) -> None:
     qdrant = _legacy_fixture(sparse=False)
     migration, plan = _prepare_backfill(qdrant, batch_size=1)
     migration.backfill(
@@ -2583,6 +2584,11 @@ def test_completed_backfill_resume_does_not_scan_source(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(migration, "_scroll_page", reject_source_scan)
+    before = copy.deepcopy(qdrant.collections)
+    with pytest.raises(MigrationError, match="refusing backfill without --allow-acl-fail-open"):
+        migration.backfill(confirm=True, plan=plan, lock_held=True)
+    assert qdrant.collections == before
+
     result = migration.backfill(
         confirm=True,
         plan=plan,
@@ -3300,7 +3306,7 @@ def test_malformed_acl_records_complete_with_explicit_acknowledgement() -> None:
     for point in qdrant.collections["legacy__context"]["points"].values():
         point["payload"].update(
             {
-                "acl_enabled": True,
+                "acl_mode": "inherit",
                 "acl_direct_grants": ["not-an-acl-token"],
                 "acl_inherited_grants": [],
             }
@@ -3782,7 +3788,7 @@ def test_acl_fields_must_have_valid_types_and_grants() -> None:
     for point in qdrant.collections["legacy__context"]["points"].values():
         point["payload"].update(
             {
-                "acl_enabled": True,
+                "acl_mode": "inherit",
                 "acl_direct_grants": ["not-an-acl-token"],
                 "acl_inherited_grants": [],
             }
@@ -3795,12 +3801,12 @@ def test_acl_fields_must_have_valid_types_and_grants() -> None:
         _apply(_migration(qdrant), confirm=True)
 
 
-def test_acl_disabled_with_grants_is_incomplete() -> None:
+def test_acl_none_mode_with_grants_is_incomplete() -> None:
     qdrant = _legacy_fixture(sparse=False)
     for point in qdrant.collections["legacy__context"]["points"].values():
         point["payload"].update(
             {
-                "acl_enabled": False,
+                "acl_mode": "none",
                 "acl_direct_grants": ["1:user:alice"],
                 "acl_inherited_grants": [],
             }
@@ -3813,13 +3819,43 @@ def test_acl_disabled_with_grants_is_incomplete() -> None:
         _apply(_migration(qdrant), confirm=True)
 
 
-def test_valid_empty_acl_fields_are_complete() -> None:
+@pytest.mark.parametrize("enabled", [False, True])
+def test_legacy_acl_boolean_requires_explicit_acknowledgement(enabled: bool) -> None:
     qdrant = _legacy_fixture(sparse=False)
     for point in qdrant.collections["legacy__context"]["points"].values():
         point["payload"].update(
             {
-                "acl_enabled": False,
-                "acl_direct_grants": [],
+                "acl_enabled": enabled,
+                "acl_direct_grants": ["1:user:alice"] if enabled else [],
+                "acl_inherited_grants": [],
+            }
+        )
+    source_before = copy.deepcopy(qdrant.collections["legacy__context"])
+    migration = _migration(qdrant)
+    plan = migration.preflight()
+
+    assert plan.acl_incomplete_count == 2
+    with pytest.raises(MigrationError, match="ACL"):
+        migration.apply(confirm=True, plan=plan, lock_held=True)
+    assert "current__context" not in qdrant.collections
+
+    migration.apply(
+        confirm=True, plan=plan, lock_held=True, allow_acl_fail_open=True
+    )
+    assert qdrant.collections["legacy__context"] == source_before
+    for point in qdrant.collections["current__context"]["points"].values():
+        assert point["payload"]["acl_enabled"] is enabled
+        assert "acl_mode" not in point["payload"]
+
+
+@pytest.mark.parametrize("mode", ["none", "inherit", "restricted"])
+def test_valid_current_acl_modes_are_complete(mode: str) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    for point in qdrant.collections["legacy__context"]["points"].values():
+        point["payload"].update(
+            {
+                "acl_mode": mode,
+                "acl_direct_grants": ["1:user:alice"] if mode != "none" else [],
                 "acl_inherited_grants": [],
             }
         )
@@ -3827,6 +3863,27 @@ def test_valid_empty_acl_fields_are_complete() -> None:
     result = _apply(_migration(qdrant), confirm=True)
 
     assert result.target_count == 2
+    for point in qdrant.collections["current__context"]["points"].values():
+        assert point["payload"]["acl_mode"] == mode
+
+
+@pytest.mark.parametrize("mode", [None, True, [], "invalid"])
+def test_invalid_acl_mode_is_not_masked_by_legacy_boolean(mode) -> None:
+    qdrant = _legacy_fixture(sparse=False)
+    for point in qdrant.collections["legacy__context"]["points"].values():
+        point["payload"].update(
+            {
+                "acl_enabled": False,
+                "acl_mode": mode,
+                "acl_direct_grants": [],
+                "acl_inherited_grants": [],
+            }
+        )
+
+    assert _migration(qdrant).preflight().acl_incomplete_count == 2
+    with pytest.raises(MigrationError, match="ACL"):
+        _apply(_migration(qdrant), confirm=True)
+    assert "current__context" not in qdrant.collections
 
 
 def test_target_metadata_rejects_foreign_points() -> None:
@@ -4186,12 +4243,14 @@ def test_verify_detects_sparse_vector_value_and_name_mismatch() -> None:
         )
 
 
-def test_verify_detects_payload_and_acl_mismatch() -> None:
+@pytest.mark.parametrize("field,value", [("acl_enabled", 1), ("acl_mode", "restricted")])
+def test_verify_detects_payload_and_acl_mismatch(field: str, value) -> None:
     qdrant = _legacy_fixture(sparse=False)
     for point in qdrant.collections["legacy__context"]["points"].values():
         point["payload"].update(
             {
                 "acl_enabled": False,
+                "acl_mode": "none",
                 "acl_direct_grants": [],
                 "acl_inherited_grants": [],
             }
@@ -4201,7 +4260,7 @@ def test_verify_detects_payload_and_acl_mismatch() -> None:
     target_payload = qdrant.collections[migration.target_collection]["points"][str(target_id)][
         "payload"
     ]
-    target_payload["acl_enabled"] = 1
+    target_payload[field] = value
 
     with pytest.raises(MigrationError, match="ACL"):
         migration.verify(

@@ -46,7 +46,12 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from openviking.core.namespace import owner_fields_for_uri  # noqa: E402
-from openviking.storage.acl import DirectAcl  # noqa: E402
+from openviking.storage.acl import (  # noqa: E402
+    ACL_CONTEXT_FIELDS,
+    ACL_MODE_FIELD,
+    AclMode,
+    DirectAcl,
+)
 from openviking.storage.vectordb.collection.qdrant_rest import (  # noqa: E402
     QdrantError,
     QdrantRestClient,
@@ -65,11 +70,12 @@ _META_MARKER_ID = to_qdrant_point_id("openviking:metadata")
 _META_VECTOR_NAME = "meta"
 _ORIGINAL_ID_FIELD = "_openviking_original_id"
 _INTERNAL_PAYLOAD_FIELDS = {"uri_depth", "scope_roots"}
-_ACL_FIELDS = {"acl_enabled", "acl_direct_grants", "acl_inherited_grants"}
+_ACL_FIELDS = set(ACL_CONTEXT_FIELDS)
 _SECURITY_PAYLOAD_FIELDS = {
     "uri",
     "account_id",
     "owner_user_id",
+    "acl_enabled",
     *_ACL_FIELDS,
 }
 _CONTEXT_TYPES = {"memory", "resource", "skill"}
@@ -860,15 +866,15 @@ def _legacy_qdrant_point_id(value: Any) -> Any:
 def _acl_complete(payload: Mapping[str, Any]) -> bool:
     if not all(field in payload for field in _ACL_FIELDS):
         return False
-    if not isinstance(payload["acl_enabled"], bool):
+    try:
+        mode = AclMode(payload[ACL_MODE_FIELD])
+    except (TypeError, ValueError):
         return False
     if not isinstance(payload["acl_direct_grants"], list) or not isinstance(
         payload["acl_inherited_grants"], list
     ):
         return False
-    if not payload["acl_enabled"] and (
-        payload["acl_direct_grants"] or payload["acl_inherited_grants"]
-    ):
+    if mode == AclMode.NONE and (payload["acl_direct_grants"] or payload["acl_inherited_grants"]):
         return False
     try:
         DirectAcl.from_context_fields(payload, "acl_direct")
@@ -933,7 +939,11 @@ def _assert_security_payload(
         if expected_present != actual_present or (
             expected_present and not _typed_equal(payload[field_name], expected_payload[field_name])
         ):
-            label = "ACL field" if field_name in _ACL_FIELDS else "security field"
+            label = (
+                "ACL field"
+                if field_name in _ACL_FIELDS or field_name == "acl_enabled"
+                else "security field"
+            )
             raise MigrationError(f"target point {point_id!r} {label} {field_name!r} differs")
 
 
@@ -5107,6 +5117,11 @@ class QdrantMigration:
             if marker.get(field_name) != getattr(plan, field_name):
                 raise MigrationError(f"target current marker {field_name} changed after prepare")
         self._assert_sparse_dictionary_complete(self._sparse_map.values())
+        if marker.get("acl_incomplete_count") and not allow_acl_fail_open:
+            raise MigrationError(
+                f"{marker['acl_incomplete_count']} records lack ACL fields; "
+                "refusing backfill without --allow-acl-fail-open"
+            )
         if marker.get("backfill_complete") is True:
             return {
                 "source_count": marker["source_count"],
@@ -5118,12 +5133,6 @@ class QdrantMigration:
                 "backfill_complete": True,
                 "migration_state": marker["migration_state"],
             }
-        if marker.get("acl_incomplete_count") and not allow_acl_fail_open:
-            raise MigrationError(
-                f"{marker['acl_incomplete_count']} records lack ACL fields; "
-                "refusing backfill without --allow-acl-fail-open"
-            )
-
         cursor = _validate_cursor(
             marker.get("last_source_cursor"),
             field_name="target current marker last_source_cursor",

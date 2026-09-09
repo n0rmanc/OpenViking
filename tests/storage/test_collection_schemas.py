@@ -314,7 +314,8 @@ async def test_init_context_collection_migrates_qdrant_legacy_schema_and_warns(
     assert len(schema_updates) == 1
     fields, scalar_index = schema_updates[0]
     fields_by_name = {field["FieldName"]: field for field in fields}
-    assert fields_by_name["acl_enabled"]["FieldType"] == "bool"
+    assert fields_by_name["acl_mode"]["FieldType"] == "string"
+    assert fields_by_name["acl_mode"]["DefaultValue"] == "none"
     assert all(fields_by_name[field]["FieldType"] == "list<string>" for field in ACL_GRANT_FIELDS)
     assert ACL_CONTEXT_FIELDS <= set(scalar_index)
     if has_embedding_metadata:
@@ -325,6 +326,9 @@ async def test_init_context_collection_migrates_qdrant_legacy_schema_and_warns(
     log_output = "\n".join(warnings)
     for warning_fragment in warning_fragments:
         assert warning_fragment in log_output
+    if unscoped_count != 0:
+        assert "Legacy acl_enabled values are ignored" in log_output
+        assert "without acl_mode remain fail-open" in log_output
     if unscoped_count == 0:
         assert "Qdrant ACL schema migration" not in log_output
 
@@ -860,13 +864,24 @@ async def test_embedding_handler_settles_request_wait_by_message_id(monkeypatch)
     assert completed == [("request-1", queue_data["id"], {"vector_written": True})]
 
 
-def test_context_collection_excludes_parent_uri():
+def test_context_collection_uses_acl_mode_and_excludes_parent_uri():
     schema = CollectionSchemas.context_collection("ctx", 8)
 
     field_names = [field["FieldName"] for field in schema["Fields"]]
+    acl_mode = next(field for field in schema["Fields"] if field["FieldName"] == "acl_mode")
 
+    assert acl_mode == {
+        "FieldName": "acl_mode",
+        "FieldType": "string",
+        "DefaultValue": "none",
+    }
+    assert "acl_mode" in schema["ScalarIndex"]
+    assert "acl_enabled" not in field_names
+    assert "acl_enabled" not in schema["ScalarIndex"]
     assert "parent_uri" not in field_names
     assert "parent_uri" not in schema["ScalarIndex"]
+    assert "acl_restricted" not in field_names
+    assert "acl_restricted" not in schema["ScalarIndex"]
 
 
 def test_context_collection_signature_has_no_include_parent_uri():

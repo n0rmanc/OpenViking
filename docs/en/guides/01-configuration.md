@@ -1471,7 +1471,7 @@ Supports cloud-deployed VikingDB on Volcengine
 
 ##### ACL schema
 
-ACL data exists only in the context collection. In addition to `acl_enabled: bool`, add these scalar-indexed `list<string>` fields:
+ACL data exists only in the context collection. In addition to `acl_mode: string` (`none`, `inherit`, or `restricted`), add these scalar-indexed `list<string>` fields:
 
 ```text
 acl_direct_grants
@@ -1480,7 +1480,9 @@ acl_inherited_grants
 
 Each element uses `{mask}:{principal}`: `1` means `read`, `3` means `write`, and `7` means `manage`.
 
-Local, cuVS, and Qdrant backends add the fields to an existing collection and rebuild/update the scalar index during startup. Existing records are not rewritten; missing ACL fields read as `acl_enabled=false` and empty lists.
+Local, cuVS, and Qdrant backends add the fields to an existing collection and rebuild/update the scalar index during startup. Existing records are not rewritten; missing ACL fields read as `acl_mode=none` and empty lists.
+
+Legacy `acl_enabled` values are not converted to `acl_mode`. Before upgrading an existing Qdrant collection or exposing a migrated target, review its ACL data: the old boolean alone no longer establishes protection. The migration tool treats such records as ACL-incomplete and requires explicit risk acknowledgement; see [ACL and recovery boundaries](../../../scripts/maintenance/README.md#acl-and-recovery-boundaries).
 
 For other existing remote collections, including Volcengine VikingDB, provision these fields and scalar indexes before startup; OpenViking validates but does not alter the remote schema. Volcengine API-key data-plane mode also requires the context collection and configured index to exist. See [Resource Access Control (ACL)](../concepts/15-acl.md) for permission semantics.
 

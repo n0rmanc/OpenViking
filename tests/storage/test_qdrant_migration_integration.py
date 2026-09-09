@@ -243,6 +243,7 @@ def test_cli_subprocess_phase_chain_round_trips_through_local_qdrant(tmp_path) -
 
         plan_path = tmp_path / "cli-plan.json"
         preflight = run_phase("preflight")
+        assert preflight["acl_incomplete_count"] == 1
         plan_path.write_text(json.dumps(preflight), encoding="utf-8")
         phase_args = (
             "--plan",
@@ -255,7 +256,14 @@ def test_cli_subprocess_phase_chain_round_trips_through_local_qdrant(tmp_path) -
         assert run_phase("backfill", *phase_args)["backfill_complete"] is True
         assert run_phase("reconcile", *phase_args)["migration_state"] == "building"
         failed = subprocess.run(
-            [*common, "verify", "--plan", str(plan_path), "--lock-held"],
+            [
+                *common,
+                "verify",
+                "--plan",
+                str(plan_path),
+                "--lock-held",
+                "--allow-acl-fail-open",
+            ],
             cwd=script.parents[2],
             env=env,
             capture_output=True,
@@ -333,7 +341,7 @@ def test_pre3872_migration_round_trips_through_current_adapter() -> None:
                 "owner_user_id": "alice",
                 "account_id": "acct-a",
                 "name": "a.md",
-                "acl_enabled": False,
+                "acl_mode": "none",
                 "acl_direct_grants": [],
                 "acl_inherited_grants": [],
             },
@@ -352,7 +360,7 @@ def test_pre3872_migration_round_trips_through_current_adapter() -> None:
                 "owner_user_id": "bob",
                 "account_id": "acct-b",
                 "name": "b.md",
-                "acl_enabled": False,
+                "acl_mode": "none",
                 "acl_direct_grants": [],
                 "acl_inherited_grants": [],
             },
@@ -370,7 +378,7 @@ def test_pre3872_migration_round_trips_through_current_adapter() -> None:
                 "owner_user_id": "alice",
                 "account_id": "acct-a",
                 "name": "sparse.md",
-                "acl_enabled": False,
+                "acl_mode": "none",
                 "acl_direct_grants": [],
                 "acl_inherited_grants": [],
             },
@@ -431,6 +439,7 @@ def test_pre3872_migration_round_trips_through_current_adapter() -> None:
 
         plan = migration.preflight()
         assert plan.source_count == 3
+        assert plan.acl_incomplete_count == 0
         assert plan.dense_vector_name == "vector"
         assert plan.sparse_vector_name == "sparse_vector"
         assert plan.vector_dimension == 2

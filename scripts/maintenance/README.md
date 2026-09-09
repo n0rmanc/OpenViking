@@ -154,11 +154,19 @@ form one source snapshot.
 
 ### ACL and recovery boundaries
 
-Records with missing or malformed `acl_enabled`, `acl_direct_grants`, or
+Records with missing or malformed `acl_mode`, `acl_direct_grants`, or
 `acl_inherited_grants` remain fail-open. Do not expose the target until they
 are repaired, or explicitly accept that risk with `--allow-acl-fail-open`.
 That flag records the incomplete count and prints a warning; it never fakes
 ACL protection and does not retroactively protect those records.
+
+`acl_mode` must be `none`, `inherit`, or `restricted`. Legacy `acl_enabled`
+booleans alone do not satisfy this current contract, including `true`: the
+current application does not use them for protection. Migration preserves
+payloads and does not infer or backfill modes. Review and repair ACL state
+before exposing the target, or explicitly acknowledge the risk. The same
+review is required before deploying the new application against existing
+Qdrant collections that only contain the legacy boolean.
 
 If cutover fails, the marker remains `cutting_over` (or `failed`) and the
 operator keeps the barrier held. An interrupted cutover requires explicit
@@ -211,7 +219,7 @@ sidecar:
 Set `QDRANT_API_KEY` in the environment when authentication is required; do
 not put secrets in command-line arguments. Remove
 `--allow-acl-fail-open` after every source record has complete
-`acl_enabled`, `acl_direct_grants`, and `acl_inherited_grants` fields. Grant
+`acl_mode`, `acl_direct_grants`, and `acl_inherited_grants` fields. Grant
 values must be encoded ACL tokens. The flag never rewrites or retroactively
 protects incomplete records.
 
