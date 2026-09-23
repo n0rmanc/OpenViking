@@ -11,6 +11,10 @@ import threading
 from datetime import datetime
 from typing import Any, Dict, Optional, Set
 
+from openviking.connector.auth import (
+    is_external_feishu_auth,
+    restore_feishu_request,
+)
 from openviking.connector.delegate import ConnectorDelegate
 from openviking.resource.feishu_watch_auth import (
     FeishuOAuthClient,
@@ -55,6 +59,7 @@ class WatchScheduler:
         max_concurrency: int = 4,
         task_timeout: float = DEFAULT_TASK_TIMEOUT,
         uri_mutation_coordinator: Optional[UriMutationCoordinator] = None,
+        runtime_config_manager: Optional[Any] = None,
     ):
         """Initialize WatchScheduler.
 
@@ -66,6 +71,7 @@ class WatchScheduler:
         self._resource_service = resource_service
         self._viking_fs = viking_fs
         self._uri_mutation_coordinator = uri_mutation_coordinator or UriMutationCoordinator()
+        self._runtime_config_manager = runtime_config_manager
         if check_interval <= 0:
             raise ValueError("check_interval must be > 0")
         if max_concurrency <= 0:
@@ -369,7 +375,11 @@ class WatchScheduler:
                     processor_kwargs = dict(getattr(task, "processor_kwargs", {}) or {})
                     processor_kwargs.pop("build_index", None)
                     processor_kwargs.pop("summarize", None)
-                    if is_feishu_auth_state(auth_state):
+                    if is_external_feishu_auth(auth_state):
+                        ctx.api_key, processor_kwargs["args"] = await restore_feishu_request(
+                            self._resource_service._connector, auth_state, path=task.path, ctx=ctx
+                        )
+                    elif is_feishu_auth_state(auth_state):
                         try:
                             auth_state = await self._prepare_feishu_auth_state(task, auth_state)
                             processor_kwargs["feishu_access_token"] = auth_state["access_token"]
@@ -584,9 +594,17 @@ class WatchScheduler:
             return auth_state
 
         refresh_token = auth_state.get("refresh_token")
-        refreshed = await FeishuOAuthClient.from_auth_state(auth_state).refresh_user_access_token(
-            refresh_token
+        if self._runtime_config_manager is None:
+            raise RuntimeError("Runtime config manager is not initialized")
+        from openviking.config.feishu import get_effective_feishu_config
+
+        config = await get_effective_feishu_config(
+            self._runtime_config_manager,
+            task.account_id,
         )
+        refreshed = await FeishuOAuthClient.from_auth_state(
+            auth_state, config=config
+        ).refresh_user_access_token(refresh_token)
         updated = apply_feishu_refreshed_token(auth_state, refreshed)
         if self._watch_manager is not None:
             await self._watch_manager.update_auth_state(task.task_id, updated)

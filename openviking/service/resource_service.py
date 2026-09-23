@@ -20,6 +20,12 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from urllib.parse import urlparse
 from uuid import uuid4
 
+from openviking.connector.auth import (
+    OAUTH_REF_ARG,
+    feishu_auth_scope,
+    is_external_feishu_auth,
+    validate_feishu_auth_args,
+)
 from openviking.core.namespace import is_content_root_uri
 from openviking.observability.http_error_context import sanitize_public_http_error
 from openviking.parse.backend import ParserBackend, normalize_parser_backend
@@ -65,10 +71,11 @@ from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.telemetry.resource_summary import (
     build_queue_status_payload,
 )
-from openviking.utils import is_git_repo_url, parse_code_hosting_url
+from openviking.utils import is_git_repo_url, is_github_url, parse_code_hosting_url
 from openviking.utils.git_auth import (
     GitHttpAuthConfig,
     build_git_http_auth_env,
+    is_git_https_url,
     parse_git_http_auth_config,
     raise_git_auth_error,
     reject_git_http_userinfo,
@@ -92,6 +99,7 @@ from openviking_cli.utils import get_logger
 if TYPE_CHECKING:
     from openviking.connector.delegate import ConnectorDelegate
     from openviking.parse.accessors.base import LocalResource
+    from openviking.resource.shared_source import SharedSource
     from openviking.resource.staged_source import StagedSource
     from openviking.resource.watch_manager import WatchManager, WatchTask
     from openviking.resource.watch_scheduler import WatchScheduler
@@ -186,6 +194,7 @@ class _SourcePlan:
     processor_args: Dict[str, Any]
     task_auth: Dict[str, Any] = field(repr=False)
     staged_source: Optional["StagedSource"] = None
+    shared_source: Optional["SharedSource"] = None
     understanding_response_id: Optional[str] = None
     understanding_file_id: Optional[str] = None
     defer_unnamed_target: bool = False
@@ -202,6 +211,7 @@ class ResourceService:
         skill_processor: Optional[SkillProcessor] = None,
         watch_scheduler: Optional["WatchScheduler"] = None,
         resource_memory_link_service: Optional["ResourceMemoryLinkService"] = None,
+        runtime_config_manager: Optional[Any] = None,
     ):
         self._vikingdb = vikingdb
         self._viking_fs = viking_fs
@@ -209,6 +219,7 @@ class ResourceService:
         self._skill_processor = skill_processor
         self._watch_scheduler = watch_scheduler
         self._resource_memory_link_service = resource_memory_link_service
+        self._runtime_config_manager = runtime_config_manager
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._connector_delegate: Optional["ConnectorDelegate"] = None
 
@@ -220,6 +231,7 @@ class ResourceService:
         skill_processor: SkillProcessor,
         watch_scheduler: Optional["WatchScheduler"] = None,
         resource_memory_link_service: Optional["ResourceMemoryLinkService"] = None,
+        runtime_config_manager: Optional[Any] = None,
     ) -> None:
         """Set dependencies (for deferred initialization)."""
         self._vikingdb = vikingdb
@@ -228,6 +240,7 @@ class ResourceService:
         self._skill_processor = skill_processor
         self._watch_scheduler = watch_scheduler
         self._resource_memory_link_service = resource_memory_link_service
+        self._runtime_config_manager = runtime_config_manager
 
     def _get_watch_manager(self) -> Optional["WatchManager"]:
         if not self._watch_scheduler:
@@ -288,6 +301,7 @@ class ResourceService:
                 "lark_file",
                 FEISHU_ACCESS_TOKEN_ARG,
                 FEISHU_REFRESH_TOKEN_ARG,
+                OAUTH_REF_ARG,
                 "parser_backend",
                 "resolved_extension",
                 "understanding_response_id",
@@ -308,7 +322,7 @@ class ResourceService:
         tags: Optional[List[str]],
         tag_mode: str,
     ) -> Dict[str, Any]:
-        watch_kwargs = dict(processor_kwargs)
+        watch_kwargs = self._sanitize_watch_processor_kwargs(processor_kwargs)
         if tags is not None:
             watch_kwargs["tags"] = tags
             watch_kwargs["tag_mode"] = tag_mode
@@ -441,11 +455,12 @@ class ResourceService:
                 except Exception as e:
                     logger.warning(f"[ResourceService] Failed to cancel watch task for {to}: {e}")
 
-    def _normalize_add_resource_args(
+    async def _normalize_add_resource_args(
         self,
         args: Optional[Dict[str, Any]],
         *,
         watch_interval: float,
+        ctx: RequestContext,
         allowed_reserved_fields: Optional[set[str]] = None,
     ) -> _NormalizedAddResourceArgs:
         if args is None:
@@ -463,6 +478,7 @@ class ResourceService:
             )
 
         normalized = dict(args)
+        validate_feishu_auth_args(normalized)
         raw_parse_mode = normalized.pop("parse_mode", ParseMode.DEFAULT)
         try:
             parse_mode = normalize_parse_mode(raw_parse_mode)
@@ -485,11 +501,20 @@ class ResourceService:
                         "args.feishu_refresh_token must be a non-empty string when "
                         "args.feishu_access_token is used with watch_interval > 0."
                     )
-                app_credentials = self._load_feishu_credentials_for_watch(app_id, app_secret)
+                if self._runtime_config_manager is None:
+                    raise RuntimeError("Runtime config manager is not initialized")
+                from openviking.config.feishu import get_effective_feishu_config
+
+                feishu_config = await get_effective_feishu_config(
+                    self._runtime_config_manager,
+                    ctx.account_id,
+                )
+                app_credentials = self._load_feishu_credentials_for_watch(app_id, app_secret, feishu_config)
                 watch_auth_state = create_feishu_auth_state(
                     token,
                     refresh_token.strip(),
                     app_credentials,
+                    persist_app_secret=app_id is not None or app_secret is not None,
                 )
             elif refresh_token is not None:
                 raise InvalidArgumentError(
@@ -517,7 +542,8 @@ class ResourceService:
         self,
         app_id: Any,
         app_secret: Any,
-    ) -> Optional[FeishuAppCredentials]:
+        config,
+    ) -> FeishuAppCredentials:
         supplied = app_id is not None or app_secret is not None
         if supplied and (
             not isinstance(app_id, str)
@@ -531,6 +557,7 @@ class ResourceService:
             )
         try:
             credentials = load_feishu_app_credentials(
+                config=config,
                 app_id=app_id.strip() if supplied else None,
                 app_secret=app_secret.strip() if supplied else None,
             )
@@ -539,7 +566,11 @@ class ResourceService:
                 "Feishu user-token watch requires FEISHU_APP_ID and "
                 "FEISHU_APP_SECRET, or feishu.app_id and feishu.app_secret in ov.conf."
             ) from exc
-        return credentials if supplied else None
+        # A user refresh token is bound to the Feishu application that issued
+        # it. Persist the effective app identity even when the caller used the
+        # account default, so a later account-config change cannot pair an old
+        # refresh token with a different app.
+        return credentials
 
     def _ensure_initialized(self) -> None:
         """Ensure all dependencies are initialized."""
@@ -725,8 +756,9 @@ class ResourceService:
             internal_kwargs: Dict[str, Any] = {"parser_backend": parser_backend}
             if "resolved_extension" in queued_args:
                 internal_kwargs["resolved_extension"] = queued_args.pop("resolved_extension")
-            normalized_args = self._normalize_add_resource_args(
+            normalized_args = await self._normalize_add_resource_args(
                 queued_args,
+                ctx=ctx,
                 watch_interval=msg.watch_interval,
             )
             internal_kwargs.update(normalized_args.processor_kwargs)
@@ -746,11 +778,6 @@ class ResourceService:
                 internal_kwargs["create_parent"] = True
             if msg.source_name is not None:
                 internal_kwargs["source_name"] = msg.source_name
-            auth_kwargs, watch_auth_state = self._restore_source_task_auth(
-                msg,
-                task_auth or {},
-            )
-            internal_kwargs.update(auth_kwargs)
             if feishu_prepared:
                 from openviking.service.task_tracker import get_task_tracker
 
@@ -767,11 +794,24 @@ class ResourceService:
                 internal_kwargs["_feishu_checkpoint"] = (saved, save_response)
             prepared_resource = None
             if msg.staged_source is not None:
-                prepared_resource = await materialize_source(
-                    StagedSource.from_dict(msg.staged_source),
-                    viking_fs=self._viking_fs,
-                    ctx=ctx,
+                with get_current_telemetry().measure("resource.source_prepare"):
+                    prepared_resource = await materialize_source(
+                        StagedSource.from_dict(msg.staged_source),
+                        viking_fs=self._viking_fs,
+                        ctx=ctx,
+                    )
+            elif msg.shared_source is not None:
+                from openviking.resource.shared_source import (
+                    SharedSource,
+                    materialize_shared_source,
                 )
+
+                with get_current_telemetry().measure("resource.source_prepare"):
+                    prepared_resource = await materialize_shared_source(
+                        SharedSource.from_dict(msg.shared_source),
+                        viking_fs=self._viking_fs,
+                        ctx=ctx,
+                    )
             if msg.defer_target_resolution:
                 from openviking_cli.utils.uri import VikingURI
 
@@ -786,35 +826,50 @@ class ResourceService:
 
                 internal_kwargs[PREPARED_FILE_ID_ARG] = msg.understanding_file_id
             try:
-                result = await self._execute_resource_ingestion(
+                async with feishu_auth_scope(
+                    self._connector,
                     path=msg.path,
                     ctx=ctx,
-                    to=target_uri,
-                    parent=parent_uri,
-                    to_is_directory=msg.to_is_directory,
-                    reason=msg.reason,
-                    instruction=msg.instruction,
-                    defer_post_processing=False,
-                    timeout=msg.timeout,
-                    build_index=msg.build_index,
-                    summarize=msg.summarize,
-                    processing_mode=msg.processing_mode,
-                    parse_mode=msg.parse_mode,
-                    watch_interval=msg.watch_interval,
-                    is_active=msg.is_active,
-                    manage_watch=not msg.skip_watch_management,
-                    tags=msg.tags,
-                    tag_mode=msg.tag_mode,
-                    allow_local_path_resolution=msg.allow_local_path_resolution,
-                    enforce_public_remote_targets=msg.enforce_public_remote_targets,
-                    resource_lock=resource_lock,
-                    stage_callback=stage_callback,
-                    watch_auth_state=watch_auth_state,
-                    prepared_resource=prepared_resource,
-                    internal_task=msg.internal_task,
-                    on_watch_ready=lambda task_id: setattr(msg, "watch_task_id", task_id),
-                    **internal_kwargs,
-                )
+                    args=internal_kwargs,
+                    state=task_auth,
+                    prepared=(
+                        msg.understanding_response_id is not None
+                        or msg.understanding_file_id is not None
+                    ),
+                ) as auth_state:
+                    auth_kwargs, watch_auth_state = self._restore_source_task_auth(
+                        msg, auth_state or {}
+                    )
+                    internal_kwargs.update(auth_kwargs)
+                    result = await self._execute_resource_ingestion(
+                        path=msg.path,
+                        ctx=ctx,
+                        to=target_uri,
+                        parent=parent_uri,
+                        to_is_directory=msg.to_is_directory,
+                        reason=msg.reason,
+                        instruction=msg.instruction,
+                        defer_post_processing=False,
+                        timeout=msg.timeout,
+                        build_index=msg.build_index,
+                        summarize=msg.summarize,
+                        processing_mode=msg.processing_mode,
+                        parse_mode=msg.parse_mode,
+                        watch_interval=msg.watch_interval,
+                        is_active=msg.is_active,
+                        manage_watch=not msg.skip_watch_management,
+                        tags=msg.tags,
+                        tag_mode=msg.tag_mode,
+                        allow_local_path_resolution=msg.allow_local_path_resolution,
+                        enforce_public_remote_targets=msg.enforce_public_remote_targets,
+                        resource_lock=resource_lock,
+                        stage_callback=stage_callback,
+                        watch_auth_state=watch_auth_state,
+                        prepared_resource=prepared_resource,
+                        internal_task=msg.internal_task,
+                        on_watch_ready=lambda task_id: setattr(msg, "watch_task_id", task_id),
+                        **internal_kwargs,
+                    )
             except BaseException:
                 if msg.cleanup_empty_target_on_failure and resource_lock is not None:
                     await self._cleanup_reserved_target_if_empty(
@@ -833,7 +888,7 @@ class ResourceService:
                     ctx=ctx,
                     resource_lock=resource_lock,
                 )
-            if msg.staged_source is not None:
+            if msg.staged_source is not None or msg.shared_source is not None:
                 result["source_path"] = msg.source_path
             stage_result = stage_callback("processing_queue")
             if inspect.isawaitable(stage_result):
@@ -864,21 +919,26 @@ class ResourceService:
         """Restore provider-specific request inputs from task-owned auth state."""
         if not task_auth:
             return {}, None
+        creating_watch = msg.watch_interval > 0 and not msg.skip_watch_management
+        if is_external_feishu_auth(task_auth):
+            return {}, task_auth if msg.watch_interval > 0 else None
         if is_git_http_auth_state(task_auth):
             auth_config = git_http_auth_config_from_state(task_auth, msg.path)
-            watch_auth_state = dict(task_auth) if msg.watch_interval > 0 else None
+            watch_auth_state = dict(task_auth) if creating_watch else None
             return {"auth_config": auth_config}, watch_auth_state
         if is_feishu_auth_state(task_auth):
             token = task_auth.get("access_token")
             if not isinstance(token, str) or not token.strip():
                 raise InvalidArgumentError("Stored Feishu task credentials are invalid.")
-            if msg.watch_interval > 0:
+            if creating_watch:
                 refresh_token = task_auth.get("refresh_token")
                 if not isinstance(refresh_token, str) or not refresh_token.strip():
                     raise InvalidArgumentError(
                         "Stored Feishu watch credentials are missing a refresh token."
                     )
                 watch_auth_state = dict(task_auth)
+                watch_auth_state.pop("domain", None)
+                watch_auth_state.pop("request_timeout", None)
             else:
                 watch_auth_state = None
             auth_kwargs = (
@@ -913,12 +973,39 @@ class ResourceService:
         allow_local_path_resolution: bool,
         processor_kwargs: Dict[str, Any],
         watch_auth_state: Optional[Dict[str, Any]],
+        shared_source: Optional["SharedSource"] = None,
     ) -> Optional[_SourcePlan]:
         """Freeze one durable standard-pipeline source before it crosses QueueFS."""
         from openviking.parse.accessors.feishu_accessor import FeishuAccessor
         from openviking.resource.staged_source import stage_source
 
         source_name = processor_kwargs.get("source_name")
+        # A shared upload is already durable; reference it directly instead of
+        # downloading + re-staging a second copy. Its identity comes from the
+        # validated upload meta, so no accessor preflight is needed.
+        if shared_source is not None:
+            queued_args = {
+                key: value
+                for key, value in processor_kwargs.items()
+                if key not in _ADD_RESOURCE_ARGS_RESERVED_FIELDS | _ADD_RESOURCE_TRANSIENT_ARGS
+            }
+            queued_args = self._sanitize_watch_processor_kwargs(queued_args)
+            resolved_name = source_name or shared_source.original_filename or None
+            source_format = (
+                Path(shared_source.original_filename).suffix.lower().lstrip(".") or "file"
+            )
+            return _SourcePlan(
+                path=path,
+                source_identity=_ResourceSourceInfo(
+                    source_name=resolved_name,
+                    source_path=shared_source.original_filename or path,
+                    source_format=source_format,
+                ),
+                processor_args=queued_args,
+                task_auth={},
+                shared_source=shared_source,
+            )
+
         git_source = is_git_repo_url(path)
         feishu_source = FeishuAccessor._is_feishu_url(path)
         remote_source = is_remote_resource_source(path)
@@ -948,10 +1035,21 @@ class ResourceService:
             credential_args = credential_arg_names("git", processor_kwargs)
             if credential_args:
                 raise InvalidArgumentError("Native Git credentials must use args.auth_config.")
-            git_auth = parse_git_http_auth_config(processor_kwargs.get("auth_config"), path)
-            if git_auth is not None:
-                task_auth = create_git_http_auth_state(git_auth, path)
-            source_info = await self._preflight_git_source(path, auth_config=git_auth)
+            request_git_auth = parse_git_http_auth_config(processor_kwargs.get("auth_config"), path)
+            if request_git_auth is not None:
+                task_auth = create_git_http_auth_state(request_git_auth, path)
+            preflight_git_auth = request_git_auth
+            if preflight_git_auth is None and is_git_https_url(path) and is_github_url(path):
+                github_token = await self._resource_processor.github_token_for(path, ctx)
+                if github_token:
+                    preflight_git_auth = GitHttpAuthConfig(
+                        username="oauth2",
+                        token=github_token,
+                    )
+            source_info = await self._preflight_git_source(
+                path,
+                auth_config=preflight_git_auth,
+            )
             source_name = source_name or source_info.source_name
             source_info.source_name = source_name
         elif feishu_source:
@@ -969,9 +1067,22 @@ class ResourceService:
                         "access_token": token.strip(),
                     }
                 )
+                task_auth.pop("domain", None)
+                task_auth.pop("request_timeout", None)
+            if self._runtime_config_manager is None:
+                raise RuntimeError("Runtime config manager is not initialized")
+            from openviking.config.feishu import get_effective_feishu_config
+
+            feishu_config = await get_effective_feishu_config(
+                self._runtime_config_manager,
+                ctx.account_id,
+            )
+            feishu_kwargs = dict(processor_kwargs)
+            feishu_kwargs["feishu_config"] = feishu_config
             preflight = await FeishuAccessor().preflight_source(
                 path,
                 feishu_access_token=token.strip() if isinstance(token, str) else None,
+                feishu_config=feishu_config,
                 **({"feishu_recursive": True} if recursive else {}),
             )
             source_name = source_name or preflight.source_name
@@ -985,13 +1096,13 @@ class ResourceService:
                 mode is ParseMode.DEFAULT
                 and self._resource_processor.should_use_understanding_directly(
                     path,
-                    **processor_kwargs,
+                    **feishu_kwargs,
                 )
             )
             if direct_understanding:
                 understanding_response_id = await self._resource_processor.submit_understanding(
                     path,
-                    **processor_kwargs,
+                    **feishu_kwargs,
                 )
                 if watch_auth_state is None:
                     task_auth = {}
@@ -1180,6 +1291,9 @@ class ResourceService:
                 staged_source=(
                     plan.staged_source.to_dict() if plan.staged_source is not None else None
                 ),
+                shared_source=(
+                    plan.shared_source.to_dict() if plan.shared_source is not None else None
+                ),
                 telemetry_id=get_current_telemetry().telemetry_id or None,
                 account_id=ctx.account_id,
                 user_id=ctx.user.user_id,
@@ -1201,10 +1315,14 @@ class ResourceService:
                 tags=tags,
                 tag_mode=tag_mode,
                 allow_local_path_resolution=(
-                    True if plan.staged_source is not None else allow_local_path_resolution
+                    True
+                    if (plan.staged_source is not None or plan.shared_source is not None)
+                    else allow_local_path_resolution
                 ),
                 enforce_public_remote_targets=(
-                    enforce_public_remote_targets and plan.staged_source is None
+                    enforce_public_remote_targets
+                    and plan.staged_source is None
+                    and plan.shared_source is None
                 ),
                 strict=bool(processor_kwargs.get("strict", False)),
                 ignore_dirs=processor_kwargs.get("ignore_dirs"),
@@ -1417,6 +1535,7 @@ class ResourceService:
         add_type: Optional[str] = None,
         internal_task: bool = False,
         args: Optional[Dict[str, Any]] = None,
+        shared_source: Optional["SharedSource"] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """Accept and route a new resource-add request."""
@@ -1450,6 +1569,7 @@ class ResourceService:
             enforce_public_remote_targets=enforce_public_remote_targets,
             internal_task=internal_task,
             args=args,
+            shared_source=shared_source,
             **kwargs,
         )
 
@@ -1524,6 +1644,7 @@ class ResourceService:
         internal_task: bool = False,
         args: Optional[Dict[str, Any]] = None,
         connector_states: Optional[Dict[str, Any]] = None,
+        shared_source: Optional["SharedSource"] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """Validate and route one resource ingestion request.
@@ -1594,8 +1715,9 @@ class ResourceService:
         allowed_reserved_fields = ConnectorDelegate.supported_args(path, add_type).intersection(
             _ADD_RESOURCE_ARGS_RESERVED_FIELDS
         )
-        normalized_args = self._normalize_add_resource_args(
+        normalized_args = await self._normalize_add_resource_args(
             args,
+            ctx=ctx,
             watch_interval=watch_interval,
             allowed_reserved_fields=allowed_reserved_fields,
         )
@@ -1813,14 +1935,19 @@ class ResourceService:
             path = require_remote_resource_source(path)
             kwargs.setdefault("request_validator", ensure_public_remote_target)
 
-        source_plan = await self._prepare_standard_source_plan(
-            path=path,
-            ctx=ctx,
-            mode=mode,
-            allow_local_path_resolution=allow_local_path_resolution,
-            processor_kwargs=kwargs,
-            watch_auth_state=normalized_args.watch_auth_state,
-        )
+        async with feishu_auth_scope(
+            connector, path=path, ctx=ctx, args=kwargs, state=normalized_args.watch_auth_state
+        ) as watch_auth_state:
+            normalized_args.watch_auth_state = watch_auth_state
+            source_plan = await self._prepare_standard_source_plan(
+                path=path,
+                ctx=ctx,
+                mode=mode,
+                allow_local_path_resolution=allow_local_path_resolution,
+                processor_kwargs=kwargs,
+                watch_auth_state=normalized_args.watch_auth_state,
+                shared_source=shared_source,
+            )
         if source_plan is not None:
             result = await self._enqueue_source_plan(
                 source_plan,
@@ -1943,7 +2070,6 @@ class ResourceService:
         mode = normalize_parse_mode(parse_mode)
         if mode is ParseMode.NO_SPLIT:
             kwargs["parse_mode"] = mode.value
-        request_start = time.perf_counter()
         telemetry = get_current_telemetry()
         telemetry_id = telemetry.telemetry_id
         register_telemetry(telemetry)
@@ -2116,10 +2242,6 @@ class ResourceService:
         finally:
             if prepared_resource is not None:
                 prepared_resource.cleanup()
-            telemetry.set(
-                "resource.request.duration_ms",
-                round((time.perf_counter() - request_start) * 1000, 3),
-            )
             if not telemetry_id or (defer_post_processing and not job_enqueued):
                 unregister_telemetry(telemetry_id)
             if deferred_lock is not None:
