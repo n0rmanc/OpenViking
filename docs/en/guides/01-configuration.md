@@ -84,7 +84,7 @@ Only fields explicitly declared as runtime fields are exposed by the runtime con
 | Account | `github`, `acl` | Dynamic | ROOT or the Account ADMIN can update it. These sections have no Cluster fallback. |
 | Account | `vlm`, `query_planner` | Dynamic | ROOT-only. Each configured section requires `model` and a non-empty `credentials` array; `timeout` is optional. ADMIN callers cannot read or update these sections. |
 | Account | `embedding` | Mixed | ROOT-only. Credentials, retries, concurrency, failback and circuit-breaker settings are dynamic; model identity, vector-space fields, text source and input token limit are create-only. |
-| Account | `vectordb` | Create-only | ROOT-only. Supply it in Account creation `settings`; later additions, changes and resets are rejected. Only remote backends `http`, `volcengine` and `vikingdb` are supported for Account-owned connections. |
+| Account | `vectordb` | Create-only | ROOT-only. Supply it in Account creation `settings`; later additions, changes and resets are rejected. Only remote backends `http`, `volcengine`, `vikingdb` and `qdrant` are supported for Account-owned connections. |
 
 Cluster `embedding`, `vlm`, `query_planner`, `memory`, `feishu`, storage, parser, retrieval, and other ordinary configuration sections remain startup-only. Account `memory` is not on the current Account configuration API surface.
 
@@ -1737,7 +1737,7 @@ New sparse terms reserve a deterministic per-index owner using a native
 vectors. Existing term-keyed dictionary rows remain readable and are never
 overwritten. Stop all old application writers when
 upgrading; mixed old/new writers are unsupported. Optional, non-destructive
-[dictionary owner seeding](../../../scripts/maintenance/README.md#upgrade-an-existing-current-format-sparse-dictionary)
+[dictionary owner seeding](https://github.com/n0rmanc/OpenViking/blob/main/scripts/maintenance/README.md#upgrade-an-existing-current-format-sparse-dictionary)
 retains legacy rows and does not re-embed data.
 
 Collections created before PR `#3872` cannot be adopted by the current adapter.

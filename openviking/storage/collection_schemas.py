@@ -369,7 +369,9 @@ async def init_context_collection(storage) -> bool:
         return existing_count
 
     async def _update_local_schema() -> None:
-        if not missing_fields and not missing_scalar_indexes:
+        # Qdrant metadata may have been saved before remote index creation failed.
+        # Recheck the remote indexes even when the metadata is already complete.
+        if not missing_fields and not missing_scalar_indexes and vectordb_cfg.backend != "qdrant":
             return
         if vectordb_cfg.backend not in {"local", "cuvs", "qdrant"}:
             raise EmbeddingConfigurationError(
