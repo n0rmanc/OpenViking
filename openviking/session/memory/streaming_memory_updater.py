@@ -17,6 +17,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Hashable
 
+from openviking.config.vlm import VLMResolver
 from openviking.core.peer_id import safe_peer_id
 from openviking.message import Message
 from openviking.server.identity import RequestContext
@@ -58,7 +59,6 @@ from openviking.telemetry import tracer
 from openviking.telemetry.tracer import get_trace_id
 from openviking_cli.exceptions import ConflictError, NotFoundError
 from openviking_cli.utils import get_logger
-from openviking_cli.utils.config import get_openviking_config
 
 logger = get_logger(__name__)
 
@@ -130,6 +130,7 @@ class StreamingMemoryUpdater:
     registry: MemoryTypeRegistry | None = None
     vikingdb: Any = None
     config: StreamingMemoryUpdaterConfig = field(default_factory=StreamingMemoryUpdaterConfig)
+    vlm_resolver: VLMResolver | None = None
     _group_batchers: dict[
         MemoryMergeGroupKey,
         StreamingBatcher[MemoryUpdateRequest, StreamingMemoryUpdateResult],
@@ -497,7 +498,7 @@ class StreamingMemoryUpdater:
         isolation_handler = _make_isolation_handler(request, extract_context)
         async with self._apply_lock:
             viking_fs = safe_get_viking_fs()
-            lease = await _acquire_stable_operation_lease(
+            lease = await acquire_memory_operation_lease(
                 operations,
                 viking_fs,
                 request.ctx,
@@ -586,6 +587,7 @@ class StreamingMemoryUpdater:
                 ),
                 trace_console=self.config.trace_console,
                 force_merge=True,
+                vlm_resolver=self.vlm_resolver,
             )
 
         kind_batches = [
@@ -755,6 +757,7 @@ async def merge_memory_operations(
     strict_extract_errors: bool = False,
     trace_console: bool = False,
     force_merge: bool = False,
+    vlm_resolver: VLMResolver | None = None,
 ) -> ResolvedOperations:
     """Merge resolved memory operations by memory type/URI using patch context."""
 
@@ -818,6 +821,7 @@ async def merge_memory_operations(
                 peer_id=peer_id,
                 trace_console=trace_console,
                 force_merge=force_merge,
+                vlm_resolver=vlm_resolver,
             )
             for (peer_id, memory_type) in all_group_keys
         ],
@@ -910,6 +914,7 @@ async def merge_one_memory_type_operations(
     peer_id: str | None = None,
     trace_console: bool = False,
     force_merge: bool = False,
+    vlm_resolver: VLMResolver | None = None,
 ) -> ResolvedOperations:
     registry = registry or get_default_registry()
     schema = registry.get(memory_type)
@@ -1000,10 +1005,10 @@ async def merge_one_memory_type_operations(
     required_file_uris = list(
         dict.fromkeys(
             [
-                uri
+                op.old_memory_file_content.uri
                 for op in operations
-                for uri in op.uris
                 if getattr(op, "old_memory_file_content", None) is not None
+                and op.old_memory_file_content.uri
             ]
             + [df.uri for df in delete_files if df.uri]
         )
@@ -1020,12 +1025,19 @@ async def merge_one_memory_type_operations(
         memory_file_to_delete_patch(df, schema=schema, extract_context=extract_context)
         for df in delete_files
     )
+    if vlm_resolver is None:
+        raise RuntimeError(
+            "merge_one_memory_type_operations requires a VLM resolver "
+            "for account-owned work"
+        )
+    vlm_config = await vlm_resolver.get_vlm(ctx.account_id)
     provider = PatchMergeContextProvider(
         memory_type=memory_type,
         required_file_uris=required_file_uris,
         patches=patches,
         output_language=merge_output_language_from_messages(messages),
         memory_registry=registry,
+        vlm_config=vlm_config,
     )
     provider._ctx = ctx
     provider._viking_fs = safe_get_viking_fs()
@@ -1060,7 +1072,7 @@ async def merge_one_memory_type_operations(
         return list(prefetch_messages)
 
     provider.prefetch = _prefetch
-    vlm = get_openviking_config().vlm.get_vlm_instance()
+    vlm = vlm_config
     tracer.info(
         "[streaming_memory_updater] llm merge input "
         f"memory_type={memory_type} required_file_count={len(required_file_uris)} "
@@ -1098,14 +1110,11 @@ def merge_output_language_from_messages(messages: list[Message]) -> str | None:
 
 
 def clone_operation_for_uri(op: ResolvedOperation, uri: str) -> ResolvedOperation:
-    old_file = getattr(op, "old_memory_file_content", None)
-    if old_file is not None and getattr(old_file, "uri", None) not in (None, uri):
-        old_file = None
     return op.model_copy(
         update={
             "uris": [uri],
             "memory_fields": dict(getattr(op, "memory_fields", {}) or {}),
-            "old_memory_file_content": old_file,
+            "old_memory_file_content": getattr(op, "old_memory_file_content", None),
             "source": getattr(op, "source", None),
         },
         deep=True,
@@ -1538,9 +1547,8 @@ def seed_patch_merge_read_contents(
 ) -> None:
     for op in operations:
         old_file = getattr(op, "old_memory_file_content", None)
-        uri = _first_uri(getattr(op, "uris", []) or [])
-        if old_file is not None and uri:
-            provider.read_file_contents[uri] = old_file
+        if old_file is not None and old_file.uri:
+            provider.read_file_contents[old_file.uri] = old_file
 
 
 def safe_get_viking_fs() -> Any | None:
@@ -2124,6 +2132,49 @@ def _operation_lock_paths(
     return _uri_lock_paths(uris, viking_fs, ctx)
 
 
+def _operation_tree_lock_paths(
+    operations: ResolvedOperations,
+    viking_fs: Any | None,
+    ctx: RequestContext,
+) -> list[str]:
+    """Tree-lock parent directories that may be emptied by this batch.
+
+    `generate_overview` follows any batch whose last file in a directory is removed with
+    a recursive rm of that directory, so the lease has to cover the parent. A same-dir
+    rename does not empty the parent (the target replaces the source in place), so those
+    can stay on exact locks.
+    """
+    replacements = dict(operations.delete_replacements or {})
+    directories: set[str] = set()
+    for source_uri, target_uri in replacements.items():
+        source_directory = str(source_uri).rstrip("/").rpartition("/")[0]
+        target_directory = str(target_uri).rstrip("/").rpartition("/")[0]
+        if source_directory and source_directory != target_directory:
+            directories.add(source_directory)
+    for memory_file in operations.delete_file_contents or []:
+        uri = getattr(memory_file, "uri", None)
+        if not uri:
+            continue
+        source_directory = str(uri).rstrip("/").rpartition("/")[0]
+        if not source_directory:
+            continue
+        replacement = replacements.get(str(uri))
+        if replacement:
+            replacement_directory = str(replacement).rstrip("/").rpartition("/")[0]
+            if replacement_directory == source_directory:
+                continue
+        directories.add(source_directory)
+    return _uri_lock_paths(directories, viking_fs, ctx)
+
+
+def _exclude_tree_covered_paths(exact_paths: set[str], tree_paths: set[str]) -> set[str]:
+    return {
+        path
+        for path in exact_paths
+        if not any(path == tree or path.startswith(f"{tree.rstrip('/')}/") for tree in tree_paths)
+    }
+
+
 async def _persisted_replacement_relation_uris(
     operations: ResolvedOperations,
     viking_fs: Any,
@@ -2152,37 +2203,53 @@ async def _persisted_replacement_relation_uris(
     return uris
 
 
-async def _acquire_stable_operation_lease(
+async def acquire_memory_operation_lease(
     operations: ResolvedOperations,
     viking_fs: Any | None,
     ctx: RequestContext,
 ) -> Any | None:
-    lock_paths = _operation_lock_paths(operations, viking_fs, ctx)
-    if not lock_paths:
+    # Materialize implicit URI changes only at the final apply boundary. Doing
+    # this before second-stage patch merging would present the same rename as
+    # both an update patch and a delete patch.
+    MemoryUpdater._materialize_uri_migrations(operations)
+    exact_paths = set(_operation_lock_paths(operations, viking_fs, ctx))
+    tree_paths = set(_operation_tree_lock_paths(operations, viking_fs, ctx))
+    exact_paths = _exclude_tree_covered_paths(exact_paths, tree_paths)
+    if not exact_paths and not tree_paths:
         return None
 
-    required_paths = set(lock_paths)
+    required_exact_paths = set(exact_paths)
     for acquisition in range(1, _MEMORY_APPLY_LOCK_MAX_ACQUISITIONS + 1):
-        lease = await viking_fs._async_agfs.pathlock_acquire_exact_batch(
-            sorted(required_paths),
-            timeout_secs=_MEMORY_APPLY_LOCK_TIMEOUT_SECONDS,
-        )
+        if tree_paths:
+            lease = await viking_fs._async_agfs.pathlock_acquire_exact_tree_batch(
+                sorted(required_exact_paths),
+                sorted(tree_paths),
+                timeout_secs=_MEMORY_APPLY_LOCK_TIMEOUT_SECONDS,
+            )
+        else:
+            lease = await viking_fs._async_agfs.pathlock_acquire_exact_batch(
+                sorted(required_exact_paths),
+                timeout_secs=_MEMORY_APPLY_LOCK_TIMEOUT_SECONDS,
+            )
         try:
             relation_uris = await _persisted_replacement_relation_uris(
                 operations,
                 viking_fs,
                 ctx,
             )
-            expanded_paths = required_paths | set(_uri_lock_paths(relation_uris, viking_fs, ctx))
+            expanded_exact_paths = required_exact_paths | set(
+                _uri_lock_paths(relation_uris, viking_fs, ctx)
+            )
+            expanded_exact_paths = _exclude_tree_covered_paths(expanded_exact_paths, tree_paths)
         except BaseException:
             await viking_fs._async_agfs.pathlock_release(lease)
             raise
 
-        if expanded_paths == required_paths:
+        if expanded_exact_paths == required_exact_paths:
             return lease
 
         await viking_fs._async_agfs.pathlock_release(lease)
-        required_paths = expanded_paths
+        required_exact_paths = expanded_exact_paths
         if acquisition == _MEMORY_APPLY_LOCK_MAX_ACQUISITIONS:
             raise RuntimeError(
                 "Unable to stabilize memory apply lock coverage after "
@@ -2219,6 +2286,7 @@ async def get_streaming_memory_updater(
     registry: MemoryTypeRegistry | None = None,
     vikingdb: Any = None,
     config: StreamingMemoryUpdaterConfig | None = None,
+    vlm_resolver: VLMResolver | None = None,
 ) -> StreamingMemoryUpdater:
     """Get or create the process-global streaming updater for one user key."""
 
@@ -2231,11 +2299,14 @@ async def get_streaming_memory_updater(
             # vectorization for later normal commits with the same user key.
             if vikingdb is not None and existing.vikingdb is not vikingdb:
                 existing.vikingdb = vikingdb
+            if vlm_resolver is not None:
+                existing.vlm_resolver = vlm_resolver
             return existing
         updater = StreamingMemoryUpdater(
             registry=registry,
             vikingdb=vikingdb,
             config=config or StreamingMemoryUpdaterConfig(),
+            vlm_resolver=vlm_resolver,
         )
         _streaming_memory_updater_registry[key] = updater
         return updater

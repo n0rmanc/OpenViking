@@ -12,6 +12,7 @@ import inspect
 import os
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from openviking.core.context import ContextLevel
@@ -26,7 +27,7 @@ from openviking.resource.processing_mode import (
     normalize_processing_mode,
 )
 from openviking.server.identity import RequestContext
-from openviking.storage.acl import AclAction, CreatorAclGrant
+from openviking.storage.acl import AclAction, AclSpec, AclUpdate
 from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.expr import And, Eq, PathScope
 from openviking.storage.index_action import FieldPatch
@@ -48,6 +49,7 @@ from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.storage import StoragePath
 
 if TYPE_CHECKING:
+    from openviking.config.vlm import VLMResolver
     from openviking.parse.accessors.base import LocalResource
     from openviking.parse.vlm import VLMProcessor
 
@@ -98,12 +100,13 @@ class ResourceProcessor:
         max_context_size: int = 2000,
         max_split_depth: int = 3,
         runtime_config_manager: Optional[Any] = None,
+        vlm_resolver: Optional["VLMResolver"] = None,
     ):
         """Initialize coordinated writer."""
         self.vikingdb = vikingdb
-        self.embedder = vikingdb.get_embedder()
         self.media_storage = media_storage
         self.runtime_config_manager = runtime_config_manager
+        self.vlm_resolver = vlm_resolver
         self.tree_builder = TreeBuilder()
         self._vlm_processor = None
         self._media_processor = None
@@ -169,18 +172,37 @@ class ResourceProcessor:
         return result
 
     def _get_summarizer(self) -> "Summarizer":
-        """Lazy initialization of Summarizer."""
+        """Lazy initialization of the standalone Summarizer."""
         if self._summarizer is None:
             self._summarizer = Summarizer(self._get_vlm_processor())
         return self._summarizer
 
-    def _get_vlm_processor(self) -> "VLMProcessor":
-        """Lazy initialization of VLM processor."""
-        if self._vlm_processor is None:
-            from openviking.parse.vlm import VLMProcessor
+    async def _summarizer_for(self, ctx: RequestContext) -> "Summarizer":
+        """Build a lightweight account-bound summarizer."""
+        if self._summarizer is not None:
+            return self._summarizer
+        if self.vlm_resolver is None:
+            raise RuntimeError(
+                "ResourceProcessor requires a VLM resolver for account-owned work"
+            )
+        return Summarizer(await self._vlm_processor_for(ctx))
 
-            self._vlm_processor = VLMProcessor()
+    def _get_vlm_processor(self) -> "VLMProcessor":
+        """Return an explicitly configured standalone VLM processor."""
+        if self._vlm_processor is None:
+            raise RuntimeError(
+                "ResourceProcessor requires an explicitly configured VLMProcessor"
+            )
         return self._vlm_processor
+
+    async def _vlm_processor_for(self, ctx: RequestContext) -> "VLMProcessor":
+        from openviking.parse.vlm import VLMProcessor
+
+        if self.vlm_resolver is None:
+            raise RuntimeError(
+                "ResourceProcessor requires a VLM resolver for account-owned work"
+            )
+        return VLMProcessor(vlm=await self.vlm_resolver.get_vlm(ctx.account_id))
 
     def _get_media_processor(self):
         """Lazy initialization of unified media processor."""
@@ -188,10 +210,21 @@ class ResourceProcessor:
             from openviking.utils.media_processor import UnifiedResourceProcessor
 
             self._media_processor = UnifiedResourceProcessor(
-                vlm_processor=self._get_vlm_processor(),
                 storage=self.media_storage,
             )
         return self._media_processor
+
+    async def _media_processor_for(self, ctx: RequestContext):
+        from openviking.utils.media_processor import UnifiedResourceProcessor
+
+        if self.vlm_resolver is None and self._media_processor is not None:
+            return self._media_processor
+        if self.vlm_resolver is None:
+            return self._get_media_processor()
+        return UnifiedResourceProcessor(
+            vlm_processor=await self._vlm_processor_for(ctx),
+            storage=self.media_storage,
+        )
 
     def _build_parse_output_store(self):
         """Return the configured parse output store, or None for AGFS mode.
@@ -590,7 +623,7 @@ class ResourceProcessor:
         **kwargs,
     ) -> Optional["LocalResource"]:
         """Freeze a source when durable routing cannot safely defer access."""
-        media_processor = self._get_media_processor()
+        media_processor = await self._media_processor_for(ctx)
         if not snapshot_required and not media_processor.durable_route_requires_preparation(
             path, **kwargs
         ):
@@ -640,7 +673,7 @@ class ResourceProcessor:
         self, resource_uris: List[str], ctx: RequestContext, **kwargs
     ) -> Dict[str, Any]:
         """Expose summarization as a standalone method."""
-        return await self._get_summarizer().summarize(resource_uris, ctx, **kwargs)
+        return await (await self._summarizer_for(ctx)).summarize(resource_uris, ctx, **kwargs)
 
     async def process_resource(
         self,
@@ -655,6 +688,9 @@ class ResourceProcessor:
         summarize: bool = False,
         stage_callback: Optional[Callable[[str], Any]] = None,
         prepared_resource: Optional["LocalResource"] = None,
+        tags: Optional[List[str]] = None,
+        tag_mode: str = "replace",
+        acl: AclSpec | Dict[str, Any] | None = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -674,7 +710,7 @@ class ResourceProcessor:
         }
         defer_post_processing = bool(kwargs.pop("defer_post_processing", False))
         preacquired_lock = kwargs.pop("resource_lock", None)
-        ingest_options = IngestOptions.from_value(kwargs.pop("ingest_options", None))
+        ingest_options = IngestOptions.from_search_tags(tags, mode=tag_mode)
         to_is_directory = bool(kwargs.pop("to_is_directory", False))
         telemetry = get_current_telemetry()
         metrics_account_id = getattr(ctx, "account_id", None)
@@ -693,7 +729,7 @@ class ResourceProcessor:
                     ResourceIngestionEventDataSource,
                 )
 
-                media_processor = self._get_media_processor()
+                media_processor = await self._media_processor_for(ctx)
                 viking_fs = get_viking_fs()
                 # Use reason as instruction fallback so it influences L0/L1
                 # generation and improves search relevance as documented.
@@ -928,6 +964,11 @@ class ResourceProcessor:
                                 uri=root_uri,
                                 root_is_file=root_is_file,
                             )
+                    if acl is not None:
+                        ingest_options = replace(
+                            ingest_options,
+                            acl_update=await viking_fs.prepare_acl_update(root_uri, acl, ctx),
+                        )
                     artifact_ref = self._ensure_parse_artifact_ref(parse_result)
                     artifact_store = self._store_for_parse_artifact(
                         artifact_ref, output_store=output_store, viking_fs=viking_fs, ctx=ctx
@@ -956,21 +997,26 @@ class ResourceProcessor:
                     incremental_noop = target_preexisting and context_update_plan.is_noop()
                     temp_uri = root_uri
                     source_committed = True
-                except Exception:
+                except BaseException:
                     # Mirror the Phase 3 (finalize) on-error cleanup: a lock or
                     # persist failure here would otherwise orphan the
                     # viking://temp tree with no GC (#2478). Skip when the temp
                     # tree was already persisted + deleted on the success path.
-                    if not source_committed:
-                        try:
+                    try:
+                        if not source_committed:
                             await self._cleanup_parse_result_artifact(
                                 parse_result,
                                 output_store=output_store,
                                 viking_fs=get_viking_fs(),
                                 ctx=ctx,
                             )
-                        except Exception:
-                            pass
+                    except Exception:
+                        pass
+                    finally:
+                        # The caller still owns a preacquired lease. Release
+                        # leases acquired here if commit fails before handoff.
+                        if resource_lock is not None and preacquired_lock is None:
+                            await viking_fs._async_agfs.pathlock_release(resource_lock)
                     raise
 
             if artifact_ref is not None:
@@ -1002,6 +1048,9 @@ class ResourceProcessor:
                 "is_code_repo": parse_result.source_format == "repository",
                 "root_is_file": root_is_file,
                 "incremental_noop": incremental_noop,
+                "acl_update": ingest_options.acl_update.model_dump(mode="json")
+                if ingest_options.acl_update
+                else None,
                 "context_update_plan": (
                     context_update_plan.to_dict() if context_update_plan is not None else None
                 ),
@@ -1021,7 +1070,8 @@ class ResourceProcessor:
                     resource_lock=resource_lock,
                     summarize=summarize,
                     ingest_options=ingest_options,
-                    **kwargs,
+                    build_index=bool(kwargs.get("build_index", True)),
+                    processing_mode=normalize_processing_mode(kwargs.get("processing_mode")),
                 )
                 if post_result.get("warnings"):
                     result.setdefault("warnings", []).extend(post_result["warnings"])
@@ -1040,7 +1090,8 @@ class ResourceProcessor:
         resource_lock: Optional[Dict[str, Any]] = None,
         summarize: bool = False,
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
-        **kwargs: Any,
+        build_index: bool = True,
+        ingest_options: IngestOptions | None = None,
     ) -> Dict[str, Any]:
         """Run the queue-producing phase for a resource already stored in VikingFS."""
         from openviking.metrics.datasources.resource import ResourceIngestionEventDataSource
@@ -1063,11 +1114,14 @@ class ResourceProcessor:
         source_committed = bool(prepared.get("source_committed"))
         metrics_account_id = getattr(ctx, "account_id", None)
         target_preexisting = bool(prepared.get("target_preexisting"))
-        build_index = bool(kwargs.get("build_index", True))
         processing_mode = normalize_processing_mode(processing_mode)
         vectors_only = processing_mode == VECTORS_ONLY
         root_is_file = bool(prepared.get("root_is_file"))
-        ingest_options = IngestOptions.from_value(kwargs.pop("ingest_options", None))
+        ingest_options = ingest_options or IngestOptions()
+        if prepared.get("acl_update") is not None:
+            ingest_options = replace(
+                ingest_options, acl_update=AclUpdate.model_validate(prepared["acl_update"])
+            )
         semantic_source = prepared.get("semantic_source")
         context_update_plan_data = prepared.get("context_update_plan")
         context_update_plan = None
@@ -1127,6 +1181,10 @@ class ResourceProcessor:
         try:
             with get_current_telemetry().measure("resource.derived_enqueue"):
                 if prepared.get("incremental_noop") and not direct_index_actions:
+                    if ingest_options.acl_update:
+                        await get_viking_fs().acl_manager.apply_indexed_update(
+                            ingest_options.acl_update, ctx
+                        )
                     await cleanup_artifact_if_owned()
                     if resource_lock is not None:
                         await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
@@ -1134,23 +1192,23 @@ class ResourceProcessor:
                     return result
 
                 if direct_index_actions:
-                    await self._enqueue_index_actions(direct_index_actions, ctx=ctx)
+                    await self._enqueue_index_actions(
+                        direct_index_actions, ctx=ctx, ingest_options=ingest_options
+                    )
 
                 if should_summarize:
                     try:
-                        summary_result = await self._get_summarizer().summarize(
+                        summary_result = await (await self._summarizer_for(ctx)).summarize(
                             resource_uris=[root_uri],
                             ctx=ctx,
                             skip_vectorization=not build_index,
                             lock=resource_lock,
                             temp_uris=[temp_uri],
                             is_code_repo=bool(prepared.get("is_code_repo")),
-                            target_preexisting=target_preexisting,
                             ingest_options=ingest_options,
                             semantic_source=semantic_source,
                             generation_trigger="resource_ingest",
                             semantic_plan=semantic_plan,
-                            **kwargs,
                         )
                         if semantic_plan is not None and summary_result.get("status") != "success":
                             raise RuntimeError(
@@ -1173,12 +1231,14 @@ class ResourceProcessor:
                         if semantic_plan is not None:
                             raise
                         result["warnings"] = [f"Semantic enqueue failed: {exc}"]
-        except Exception:
+        except BaseException:
             derived_enqueue_status = "error"
-            await cleanup_artifact_if_owned()
-            if resource_lock is not None:
-                await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
-                resource_lock = None
+            try:
+                await cleanup_artifact_if_owned()
+            finally:
+                if resource_lock is not None:
+                    await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
+                    resource_lock = None
             raise
         finally:
             ResourceIngestionEventDataSource.record_stage(
@@ -1195,7 +1255,9 @@ class ResourceProcessor:
                 if not should_summarize and temp_uri and not source_committed:
                     viking_fs = get_viking_fs()
                     if vectors_only and target_preexisting and not root_is_file:
-                        diff = await SemanticProcessor()._sync_topdown_recursive(
+                        diff = await SemanticProcessor(
+                            vlm_resolver=self.vlm_resolver
+                        )._sync_topdown_recursive(
                             temp_uri, root_uri, ctx=ctx, lock=resource_lock
                         )
                         sync_deleted_files = list(getattr(diff, "deleted_files", []))
@@ -1221,7 +1283,7 @@ class ResourceProcessor:
                         files=sync_deleted_files, dirs=sync_deleted_dirs, ctx=ctx
                     )
                 if should_refresh_file_parent:
-                    await self._get_summarizer().refresh_file_parent(
+                    await (await self._summarizer_for(ctx)).refresh_file_parent(
                         file_uri=file_refresh.file_uri,
                         ctx=ctx,
                         skip_vectorization=not build_index,
@@ -1236,9 +1298,6 @@ class ResourceProcessor:
                             root_uri,
                             ctx=ctx,
                             ingest_options=ingest_options,
-                            creator_acl_grant=(
-                                CreatorAclGrant.DIRECT if not target_preexisting else None
-                            ),
                             file_md5=(prepared.get("file_md5s") or {}).get(root_uri),
                         )
                     elif vectors_only:
@@ -1252,7 +1311,7 @@ class ResourceProcessor:
                 await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
         elif should_refresh_file_parent:
             try:
-                await self._get_summarizer().refresh_file_parent(
+                await (await self._summarizer_for(ctx)).refresh_file_parent(
                     file_uri=file_refresh.file_uri,
                     ctx=ctx,
                     skip_vectorization=not build_index,
@@ -1270,7 +1329,6 @@ class ResourceProcessor:
                     root_uri,
                     ctx=ctx,
                     ingest_options=ingest_options,
-                    creator_acl_grant=(CreatorAclGrant.DIRECT if not target_preexisting else None),
                     file_md5=(prepared.get("file_md5s") or {}).get(root_uri),
                 )
             except BaseException:
@@ -1293,6 +1351,8 @@ class ResourceProcessor:
             except BaseException:
                 await cleanup_artifact_if_owned()
                 raise
+        if ingest_options.acl_update:
+            await get_viking_fs().acl_manager.apply_indexed_update(ingest_options.acl_update, ctx)
         await cleanup_artifact_if_owned()
         return result
 
@@ -1320,7 +1380,9 @@ class ResourceProcessor:
             kind = "local"
         return {"kind": kind, "uri": str(path)}
 
-    async def _enqueue_index_actions(self, actions: Any, *, ctx: RequestContext) -> None:
+    async def _enqueue_index_actions(
+        self, actions: Any, *, ctx: RequestContext, ingest_options: IngestOptions | None = None
+    ) -> None:
         from collections import Counter
 
         from openviking.storage.index_action import IndexAction
@@ -1357,6 +1419,7 @@ class ResourceProcessor:
                     action.uri,
                     ctx=ctx,
                     file_md5=action.md5,
+                    ingest_options=ingest_options,
                     scalar_override={
                         **dict(action.upsert_fields),
                         "_record_id": action.record_id,
@@ -1514,7 +1577,6 @@ class ResourceProcessor:
         *,
         ctx: RequestContext,
         ingest_options: IngestOptions | None = None,
-        creator_acl_grant: CreatorAclGrant | None = None,
         file_md5: str | None = None,
         scalar_override: Optional[Dict[str, Any]] = None,
         field_patch: FieldPatch | None = None,
@@ -1531,7 +1593,6 @@ class ResourceProcessor:
             context_type=context_type_for_uri(file_uri),
             ctx=ctx,
             ingest_options=IngestOptions.from_value(ingest_options),
-            creator_acl_grant=creator_acl_grant,
             file_md5=file_md5,
             scalar_override=scalar_override,
             field_patch=field_patch,
