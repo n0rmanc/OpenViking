@@ -15,6 +15,7 @@ import requests
 from openviking.models.embedder.base import DenseEmbedderBase, EmbedResult
 from openviking.server.identity import RequestContext, Role, UserIdentifier
 from openviking.service.resource_service import ResourceService
+from openviking.storage.acl import ACL_CONTEXT_FIELDS, ACL_GRANT_FIELDS, ACL_MODE_FIELD
 from openviking.storage.collection_schemas import (
     CollectionSchemas,
     _build_embedding_metadata,
@@ -795,7 +796,7 @@ async def test_init_context_collection_migrates_qdrant_legacy_schema_and_warns(
     assert len(schema_updates) == 1
     fields, scalar_index = schema_updates[0]
     fields_by_name = {field["FieldName"]: field for field in fields}
-    assert fields_by_name["acl_enabled"]["FieldType"] == "bool"
+    assert fields_by_name[ACL_MODE_FIELD]["FieldType"] == "string"
     assert all(fields_by_name[field]["FieldType"] == "list<string>" for field in ACL_GRANT_FIELDS)
     assert ACL_CONTEXT_FIELDS <= set(scalar_index)
     if has_embedding_metadata:

@@ -82,7 +82,7 @@ OpenViking 的配置分为两个层级：
 | Account | `github`、`acl` | 动态配置 | ROOT 或该 Account 的 ADMIN 可修改；不回退到 Cluster。 |
 | Account | `vlm`、`query_planner` | 动态配置 | 仅 ROOT 可读写。每段已配置的模型配置都必须包含 `model` 和非空 `credentials` 数组，`timeout` 可选；ADMIN 无法读取或修改这两段配置。 |
 | Account | `embedding` | 部分动态 | 仅 ROOT 可读写。凭证、重试、并发、故障回切和熔断参数可动态修改；模型身份、向量空间字段、文本来源和输入 token 上限仅能在创建时设置。 |
-| Account | `vectordb` | 仅创建时配置 | 仅 ROOT 可在 Account 创建请求的 `settings` 中设置，后续新增、修改和重置均被拒绝。Account 专属连接仅支持 `http`、`volcengine`、`vikingdb` 远端后端。 |
+| Account | `vectordb` | 仅创建时配置 | 仅 ROOT 可在 Account 创建请求的 `settings` 中设置，后续新增、修改和重置均被拒绝。Account 专属连接仅支持 `http`、`volcengine`、`vikingdb`、`qdrant` 远端后端。 |
 
 Cluster 的 `embedding`、`vlm`、`query_planner`、`memory`、`feishu`、存储、解析器、检索等普通配置仍然是启动配置。Account 的 `memory` 不在当前 Account 配置 API 范围内。
 
@@ -1703,7 +1703,7 @@ term dictionary。没有 marker 的既有 Qdrant collection 会 fail closed，�
 新 sparse term 使用原生 `update_filter` 实现 insert-only，取得每个 index 唯一的 owner，并在写入
 vector 前读回验证。旧的 term-keyed dictionary 只读保留，不覆写。升级时必须
 停止所有旧版 application writers；不支持旧／新版混合写入。可选的
-[dictionary owner seeding](../../../scripts/maintenance/README.md#upgrade-an-existing-current-format-sparse-dictionary)
+[dictionary owner seeding](https://github.com/n0rmanc/OpenViking/blob/main/scripts/maintenance/README.md#upgrade-an-existing-current-format-sparse-dictionary)
 会保留旧 rows，不删除或重新 embedding 数据。
 
 PR `#3872` 之前建立的 collection 不能由当前 adapter 直接接管。切换配置到

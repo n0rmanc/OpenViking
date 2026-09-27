@@ -11,6 +11,10 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from openviking.config.binding import manager_over_source
+from openviking.config.source.memory_source import MemoryConfigSource
+from openviking.config.vector import AccountVectorConfigResolver
+from openviking.server.identity import RequestContext, Role
 from openviking.storage.acl import ACL_CONTEXT_FIELDS
 from openviking.storage.collection_schemas import (
     CollectionSchemas,
@@ -20,7 +24,7 @@ from openviking.storage.collection_schemas import (
 )
 from openviking.storage.expr import And, Eq, PathScope
 from openviking.storage.vectordb.collection.qdrant_collection import QdrantCollection
-from openviking.storage.vectordb.collection.qdrant_rest import QdrantRestClient
+from openviking.storage.vectordb.collection.qdrant_rest import QdrantError, QdrantRestClient
 from openviking.storage.vectordb.qdrant_sparse import (
     parse_sparse_point,
     sparse_owner_point_id,
@@ -31,6 +35,12 @@ from openviking.storage.vectordb.qdrant_utils import (
     to_qdrant_point_id,
 )
 from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
+from openviking_cli.session.user_id import UserIdentifier
+from openviking_cli.utils.config import set_openviking_config
+from openviking_cli.utils.config.open_viking_config import (
+    OpenVikingConfig,
+    OpenVikingConfigSingleton,
+)
 from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
 from scripts.maintenance.qdrant_sparse_upgrade import SparseDictionaryUpgrade
 
@@ -228,7 +238,9 @@ def test_qdrant_phase_1_and_phase_2_round_trip() -> None:
 @requires_qdrant
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_qdrant_acl_migration_counts_all_accounts(monkeypatch) -> None:
+async def test_qdrant_acl_migration_counts_all_accounts(
+    monkeypatch, vector_backend_factory
+) -> None:
     assert QDRANT_URL is not None
     suffix = uuid.uuid4().hex[:12]
     project = f"openviking_acl_{suffix}"
@@ -277,7 +289,7 @@ async def test_qdrant_acl_migration_counts_all_accounts(monkeypatch) -> None:
         sparse_enabled=False,
         sparse_weight=0.0,
     )
-    backend = VikingVectorIndexBackend(
+    backend = vector_backend_factory(
         config=VectorDBBackendConfig(
             backend="qdrant",
             url=QDRANT_URL,
@@ -339,6 +351,116 @@ async def test_qdrant_acl_migration_counts_all_accounts(monkeypatch) -> None:
             collection.drop()
         except Exception:
             pass
+
+
+@requires_qdrant
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_qdrant_account_owned_backend_and_cluster_fallback() -> None:
+    """Use the native resolver for dedicated and shared accounts on real Qdrant."""
+    assert QDRANT_URL is not None
+    suffix = uuid.uuid4().hex[:12]
+    shared_project, account_project = f"shared_{suffix}", f"account_{suffix}"
+    connection = {"url": QDRANT_URL, "api_key": os.environ.get("QDRANT_API_KEY")}
+    cluster = OpenVikingConfig.from_dict(
+        {
+            "storage": {
+                "vectordb": {
+                    "backend": "qdrant",
+                    "project": shared_project,
+                    "name": "context",
+                    "dimension": 2,
+                    "qdrant": connection,
+                }
+            },
+            "embedding": {
+                "dense": {
+                    "provider": "openai",
+                    "model": "integration",
+                    "dimension": 2,
+                    "api_key": "test-only",
+                }
+            },
+        }
+    )
+    set_openviking_config(cluster)
+    manager = manager_over_source(MemoryConfigSource(), base_config=cluster)
+    backend = VikingVectorIndexBackend(cluster.storage.vectordb)
+    backend.set_vector_config_resolver(AccountVectorConfigResolver(manager))
+    client = QdrantRestClient(QDRANT_URL, api_key=os.environ.get("QDRANT_API_KEY"))
+    try:
+        await manager.initialize()
+        await manager.patch_account(
+            "a",
+            {
+                "embedding": {
+                    "dense": {
+                        "model": "account-integration",
+                        "dimension": 3,
+                        "credentials": [{"provider": "openai", "api_key": "test-only"}],
+                    }
+                },
+                "vectordb": {
+                    "backend": "qdrant",
+                    "project": account_project,
+                    "name": "context",
+                    "index_name": "default",
+                    "dimension": 3,
+                    "qdrant": connection,
+                },
+            },
+            creating=True,
+        )
+        assert await backend.create_collection(
+            "context", CollectionSchemas.context_collection("context", 2)
+        )
+        dedicated = await backend.get_account_backend("a")
+        assert await dedicated.create_collection(
+            "context", CollectionSchemas.context_collection("context", 3)
+        )
+        assert dedicated._adapter is not backend._shared_adapter
+        contexts = {
+            name: RequestContext(user=UserIdentifier(name, "test"), role=Role.USER)
+            for name in ("a", "b", "c")
+        }
+        vectors = {"a": [1.0, 0.0, 0.0], "b": [1.0, 0.0], "c": [0.0, 1.0]}
+        ids = {}
+        for name, ctx in contexts.items():
+            ids[name] = await backend.upsert(
+                {
+                    "uri": f"viking://resources/{name}",
+                    "level": 2,
+                    "context_type": "resource",
+                    "vector": vectors[name],
+                },
+                ctx=ctx,
+            )
+            assert ids[name]
+        assert await backend.count_unscoped() == 2  # only the shared collection
+        for name, ctx in contexts.items():
+            assert await backend.count(ctx=ctx) == 1
+            rows = await backend.query(query_vector=vectors[name], ctx=ctx)
+            assert [row["id"] for row in rows] == [ids[name]]
+            for other in contexts:
+                if other != name:
+                    assert await backend.get([ids[other]], ctx=ctx) == []
+        # Releasing a dedicated adapter must not drop either collection or its data.
+        await backend.release_account("a")
+        assert (await backend.get_account_backend("a")) is not dedicated
+        assert await backend.count(ctx=contexts["a"]) == 1
+        assert await backend.count(ctx=contexts["b"]) == 1
+    finally:
+        await backend.close()
+        try:
+            for project in (shared_project, account_project):
+                for name in (f"{project}__context", f"{project}__context__openviking_meta"):
+                    try:
+                        client.request("DELETE", f"/collections/{name}")
+                    except QdrantError as exc:
+                        if exc.status != 404:
+                            raise
+        finally:
+            OpenVikingConfigSingleton.reset_instance()
 
 
 @requires_local_qdrant
