@@ -40,8 +40,16 @@ REQUIRED_QDRANT_TESTS = (
     "tests/storage/test_qdrant_migration_integration.py",
     "tests/storage/test_qdrant_integration.py",
     "tests/storage/test_collection_schemas.py",
+    "tests/config/test_runtime_config.py",
+    "tests/config/test_qdrant_config.py",
 )
 REQUIRED_QDRANT_SHARED_DEPENDENCIES = (
+    "openviking/config/account_vector.py",
+    "openviking/config/vector.py",
+    "openviking/config/binding.py",
+    "openviking/config/embedding.py",
+    "openviking_cli/utils/config/embedding_config.py",
+    "tests/conftest.py",
     "openviking/storage/collection_schemas.py",
     "openviking/storage/viking_vector_index_backend.py",
     "openviking/storage/vectordb_adapters/base.py",
@@ -5924,6 +5932,7 @@ def test_qdrant_ci_workflow_lists_required_suites(monkeypatch) -> None:
     assert qdrant_job["uses"] == "./.github/workflows/_test_lite.yml"
     assert qdrant_job["with"]["os_json"] == '["ubuntu-24.04"]'
     assert qdrant_job["with"]["python_json"] == '["3.10"]'
+    assert qdrant_job["with"]["qdrant_integration"] is True
     assert json.loads(qdrant_job["with"]["test_paths_json"]) == list(
         REQUIRED_QDRANT_TESTS
     )
@@ -5933,13 +5942,19 @@ def test_qdrant_ci_workflow_lists_required_suites(monkeypatch) -> None:
     lite_inputs = lite_on["workflow_call"]["inputs"]
     assert "test_paths_json" in lite_inputs
     for trigger_name in ("workflow_call", "workflow_dispatch"):
+        assert lite_on[trigger_name]["inputs"]["qdrant_integration"]["default"] is False
         assert json.loads(
             lite_on[trigger_name]["inputs"]["test_paths_json"]["default"]
         ) == list(DEFAULT_CUVS_TESTS)
-    lite_steps = lite_workflow["jobs"]["test-lite"]["steps"]
+    lite_job = lite_workflow["jobs"]["test-lite"]
+    assert lite_job["services"]["qdrant"] == {
+        "image": "${{ inputs.qdrant_integration && 'qdrant/qdrant:v1.19.0' || '' }}",
+        "ports": ["6333:6333"],
+    }
+    lite_steps = lite_job["steps"]
     test_step = next(step for step in lite_steps if "pytest" in step.get("run", ""))
     assert test_step["env"] == {
-        "QDRANT_URL": "",
+        "QDRANT_URL": "${{ inputs.qdrant_integration && 'http://127.0.0.1:6333' || '' }}",
         "QDRANT_API_KEY": "",
         "TEST_PATHS_JSON": "${{ inputs.test_paths_json }}",
     }

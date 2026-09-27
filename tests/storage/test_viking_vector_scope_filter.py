@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -76,6 +77,16 @@ class _RecordingAsyncAdapter:
         return []
 
 
+def _single_account_backend(async_adapter, account_id: str | None):
+    backend = object.__new__(_SingleAccountBackend)
+    backend._bound_account_id = account_id
+    backend._operation_condition = threading.Condition()
+    backend._operations = {}
+    backend._retired = False
+    backend._async_adapter = async_adapter
+    return backend
+
+
 @pytest.mark.asyncio
 async def test_search_by_random_passes_runtime_acl_state_to_tenant_filter():
     ctx = _ctx()
@@ -83,7 +94,7 @@ async def test_search_by_random_passes_runtime_acl_state_to_tenant_filter():
     acl_reader = _AclConfigReader(False)
     backend = object.__new__(VikingVectorIndexBackend)
     backend.acl_manager = AclManager(backend, acl_reader)
-    backend._get_backend_for_context = lambda _ctx: adapter
+    backend._get_backend_for_context = AsyncMock(return_value=adapter)
 
     assert await backend.search_by_random(ctx=ctx) == []
     adapter.search_by_random.assert_awaited_once()
@@ -168,7 +179,9 @@ def test_mixed_visible_and_outside_targets_keep_original_tenant_filter():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("legacy_mode", [{}, {"acl_mode": None}, {"acl_mode": "none"}])
-async def test_tenant_search_enforces_visible_roots_and_shared_acl(tmp_path, legacy_mode):
+async def test_tenant_search_enforces_visible_roots_and_shared_acl(
+    vector_backend_factory, tmp_path, legacy_mode
+):
     ctx = _ctx()
     own_uri = "viking://user/alice/resources/notes"
     cross_user_uri = "viking://user/bob/resources/notes"
@@ -193,6 +206,13 @@ async def test_tenant_search_enforces_visible_roots_and_shared_acl(tmp_path, leg
             "context_type": "resource",
         },
         {
+            **legacy_mode,
+            "id": "default-shared",
+            "uri": "viking://resources/default.md",
+            "account_id": "acct",
+            "context_type": "resource",
+        },
+        {
             "id": "direct-shared",
             "uri": "viking://resources/direct.md",
             "account_id": "acct",
@@ -206,7 +226,7 @@ async def test_tenant_search_enforces_visible_roots_and_shared_acl(tmp_path, leg
             "account_id": "acct",
             "context_type": "resource",
             "acl_mode": "inherit",
-            "acl_inherited_grants": ["3:user:*"],
+            "acl_inherited_grants": ["7:user:*"],
         },
         {
             "id": "restricted-inherited-shared",
@@ -214,7 +234,7 @@ async def test_tenant_search_enforces_visible_roots_and_shared_acl(tmp_path, leg
             "account_id": "acct",
             "context_type": "resource",
             "acl_mode": "restricted",
-            "acl_inherited_grants": ["3:user:*"],
+            "acl_inherited_grants": ["7:user:*"],
         },
         {
             "id": "restricted-direct-shared",
@@ -227,11 +247,12 @@ async def test_tenant_search_enforces_visible_roots_and_shared_acl(tmp_path, leg
         },
         {
             "id": "denied-shared",
-            "uri": "viking://resources/denied.md",
+            "uri": "viking://resources/finance/denied.md",
             "account_id": "acct",
             "context_type": "resource",
             "acl_mode": "inherit",
-            "acl_direct_grants": ["7:user:bob"],
+            "acl_direct_grants": [],
+            "acl_inherited_grants": ["3:group:finance"],
         },
         {
             "id": "foreign-account",
@@ -241,7 +262,7 @@ async def test_tenant_search_enforces_visible_roots_and_shared_acl(tmp_path, leg
         },
     ]
 
-    backend = VikingVectorIndexBackend(
+    backend = vector_backend_factory(
         config=VectorDBBackendConfig(
             backend="local", name="context", dimension=4, path=str(tmp_path / "vectors")
         )
@@ -283,11 +304,19 @@ async def test_tenant_search_enforces_visible_roots_and_shared_acl(tmp_path, leg
             query_vector=[1.0, 0.0, 0.0, 0.0],
             context_type="resource",
         )
+        finance = await backend.search_in_tenant(
+            ctx=RequestContext(user=ctx.user, role=ctx.role, group_ids=("finance",)),
+            query_vector=[1.0, 0.0, 0.0, 0.0],
+            context_type="resource",
+            target_directories=["viking://resources/finance"],
+        )
+        assert [record["id"] for record in finance] == ["denied-shared"]
 
         assert sorted(record["id"] for record in visible) == sorted(
             [
                 "own",
                 "legacy-shared",
+                "default-shared",
                 "direct-shared",
                 "inherited-shared",
                 "restricted-direct-shared",
@@ -299,6 +328,7 @@ async def test_tenant_search_enforces_visible_roots_and_shared_acl(tmp_path, leg
                 "own",
                 "cross-user",
                 "legacy-shared",
+                "default-shared",
                 "direct-shared",
                 "inherited-shared",
                 "restricted-inherited-shared",
@@ -317,6 +347,7 @@ async def test_tenant_search_enforces_visible_roots_and_shared_acl(tmp_path, leg
             [
                 "own",
                 "legacy-shared",
+                "default-shared",
                 "direct-shared",
                 "inherited-shared",
                 "restricted-inherited-shared",
@@ -407,9 +438,7 @@ def test_actor_peer_target_retains_account_and_exact_target_scope():
 
 @pytest.mark.asyncio
 async def test_search_by_random_propagates_adapter_errors():
-    backend = object.__new__(_SingleAccountBackend)
-    backend._bound_account_id = None
-    backend._async_adapter = _FailingAsyncAdapter()
+    backend = _single_account_backend(_FailingAsyncAdapter(), None)
 
     with pytest.raises(RuntimeError, match="search_by_random failed"):
         await backend.search_by_random(filter=Eq("uri", "viking://resources/a.md"))
@@ -417,9 +446,7 @@ async def test_search_by_random_propagates_adapter_errors():
 
 @pytest.mark.asyncio
 async def test_search_by_random_reuses_account_filter_for_raw_dsl():
-    backend = object.__new__(_SingleAccountBackend)
-    backend._bound_account_id = "acct"
-    backend._async_adapter = _RecordingAsyncAdapter()
+    backend = _single_account_backend(_RecordingAsyncAdapter(), "acct")
     raw_filter = {"op": "must", "field": "uri", "conds": ["viking://resources"]}
 
     await backend.search_by_random(filter=raw_filter)

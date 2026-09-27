@@ -27,7 +27,6 @@ from openviking.parse.parsers.upload_utils import is_text_file
 from openviking.server.identity import RequestContext
 from openviking.service.task_work_index import TaskWorkRejected
 from openviking.storage.abstract_overview import body_for_preview, embedding_text_for_body
-from openviking.storage.acl import CreatorAclGrant
 from openviking.storage.index_action import FieldPatch, IndexAction
 from openviking.storage.queuefs import get_queue_manager
 from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
@@ -109,10 +108,17 @@ def _apply_ingest_options(
     ingest_options: IngestOptions | None,
 ) -> None:
     ingest_options = IngestOptions.from_value(ingest_options)
-    if not embedding_msg or ingest_options.search_tags is None:
+    if not embedding_msg:
         return
+    if ingest_options.acl_update is not None:
+        embedding_msg.context_data.setdefault("_upsert_options", {})["acl_update"] = (
+            ingest_options.acl_update.model_dump(mode="json")
+        )
+    if ingest_options.search_tags is None:
+        return
+    tag_mode = IngestOptions.vector_search_tag_mode(ingest_options.search_tag_mode)
     incoming_tags = list(ingest_options.search_tags or [])
-    if ingest_options.search_tag_mode == "append" and (
+    if tag_mode == "append" and (
         embedding_msg.action is IndexAction.MERGE
         or embedding_msg.context_data.get("_upsert_options", {}).get("partial_update") is False
     ):
@@ -123,7 +129,7 @@ def _apply_ingest_options(
         )
     embedding_msg.context_data["search_tags"] = incoming_tags
     embedding_msg.context_data.setdefault("_upsert_options", {})["search_tag_mode"] = (
-        ingest_options.search_tag_mode
+        tag_mode
     )
 
 
@@ -399,13 +405,13 @@ async def vectorize_directory_meta(
     include_overview: bool = True,
     scalar_overrides: Optional[Dict[int, Dict[str, Any]]] = None,
     ingest_options: IngestOptions | None = None,
-    creator_acl_grant: CreatorAclGrant | None = None,
     include_abstract: bool = True,
     meta: Optional[Dict[str, Any]] = None,
     *,
     content_is_body: bool = False,
     actions: Optional[Dict[int, IndexAction | str]] = None,
     field_patches: Optional[Dict[int, FieldPatch]] = None,
+    telemetry_id: str | None = None,
 ) -> set[int]:
     """
     Vectorize directory metadata (.abstract.md and .overview.md).
@@ -461,13 +467,13 @@ async def vectorize_directory_meta(
             )
             msg_abstract = EmbeddingMsgConverter.from_context(
                 context_abstract,
-                creator_acl_grant,
                 action=IndexAction(
                     (actions or {}).get(
                         int(ContextLevel.ABSTRACT.value),
                         IndexAction.MERGE,
                     )
                 ),
+                telemetry_id=telemetry_id,
             )
             level_overrides = (scalar_overrides or {}).get(int(ContextLevel.ABSTRACT.value))
             _apply_scalar_overrides(
@@ -522,13 +528,13 @@ async def vectorize_directory_meta(
             )
             msg_overview = EmbeddingMsgConverter.from_context(
                 context_overview,
-                creator_acl_grant,
                 action=IndexAction(
                     (actions or {}).get(
                         int(ContextLevel.OVERVIEW.value),
                         IndexAction.MERGE,
                     )
                 ),
+                telemetry_id=telemetry_id,
             )
             level_overrides = (scalar_overrides or {}).get(int(ContextLevel.OVERVIEW.value))
             _apply_scalar_overrides(
@@ -582,10 +588,10 @@ async def vectorize_file(
     scalar_override: Optional[Dict[str, Any]] = None,
     field_patch: FieldPatch | None = None,
     ingest_options: IngestOptions | None = None,
-    creator_acl_grant: CreatorAclGrant | None = None,
     file_md5: Optional[str] = None,
     file_content: Optional[bytes] = None,
     action: str = "merge",
+    telemetry_id: str | None = None,
 ) -> bool:
     """
     Vectorize a single file.
@@ -630,7 +636,10 @@ async def vectorize_file(
         content_type = await _resolve_resource_content_type(
             file_path, file_name, viking_fs, ctx, file_content=file_content
         )
-        embedding_cfg = get_openviking_config().embedding
+        resolver = getattr(viking_fs, "_vector_config_resolver", None)
+        if resolver is None:
+            raise RuntimeError("Vectorization requires a vector config resolver")
+        embedding_cfg = (await resolver.resolve(ctx.account_id)).embedding
         configured_text_source = embedding_cfg.text_source
         effective_text_source = TEXT_SOURCE_SUMMARY_FIRST if use_summary else configured_text_source
         embed_summary = bool(summary and effective_text_source in SUMMARY_TEXT_SOURCES)
@@ -722,8 +731,8 @@ async def vectorize_file(
             raise ValueError(f"vectorize_file only supports upsert or merge actions: {action}")
         embedding_msg = EmbeddingMsgConverter.from_context(
             context,
-            creator_acl_grant,
             action=resolved_action,
+            telemetry_id=telemetry_id,
         )
         if not embedding_msg:
             return False
