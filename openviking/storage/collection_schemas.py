@@ -53,6 +53,7 @@ from openviking.utils.model_retry import (
     ERROR_CLASS_INPUT_TOO_LARGE,
     ERROR_CLASS_PERMANENT,
 )
+from openviking.utils.tags import merge_search_tags
 from openviking.utils.time_utils import get_current_timestamp
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
@@ -625,6 +626,9 @@ class TextEmbeddingHandler(DequeueHandlerBase):
         ctx: RequestContext,
     ) -> str:
         inserted_data = embedding_msg.context_data
+        materialized = inserted_data.pop("_materialized_content", None)
+        if isinstance(materialized, str):
+            return materialized[:VIKINGDB_CONTENT_MAX_SIZE]
         if inserted_data.get("is_leaf") and inserted_data.get("context_type") in (
             ContextType.RESOURCE.value,
             ContextType.SKILL.value,
@@ -914,6 +918,9 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 # Write to vector database
                 try:
                     raw_upsert_options = inserted_data.pop("_upsert_options", {})
+                    extracted_memory_type = raw_upsert_options.pop(
+                        "extracted_memory_type", None
+                    )
                     # Reuse the actual vector-store ID when a semantic plan
                     # rebuilds an existing same-level record. Only genuinely new
                     # records derive an ID locally from (account, uri, level).
@@ -931,6 +938,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                             embedding_msg,
                             ctx,
                         )
+                    inserted_data.pop("_materialized_content", None)
                     if embedding_msg.action is IndexAction.MERGE:
                         field_patch = embedding_msg.field_patch
                         merge_fields = dict(field_patch.values) if field_patch is not None else {}
@@ -959,6 +967,11 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         inserted_data = FieldPatch(merge_fields, merge_modes).apply(
                             {**base, **inserted_data}
                         )
+                        if extracted_memory_type:
+                            inserted_data["search_tags"] = merge_search_tags(
+                                inserted_data.get("search_tags"),
+                                [f"memory_type={extracted_memory_type}"],
+                            )
                         if not existing_records:
                             missing_fields = missing_initial_record_fields(inserted_data)
                             if missing_fields:

@@ -10,9 +10,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openviking"
-dynamic = ["version"]
+dynamic = ["version", "readme"]
 description = "An Agent-native context database"
-readme = "README.md"
 requires-python = ">=3.10"
 authors = [
     {name = "ByteDance", email = "noreply@bytedance.com"}
@@ -123,10 +122,10 @@ eval = [
     "pandas>=2.0.0",
 ]
 gemini = [
-    "google-genai>=1.0.0",
+    "google-genai>=1.39.0",
 ]
 gemini-async = [
-    "google-genai>=1.0.0",
+    "google-genai>=1.39.0",
     "anyio>=4.0.0",
 ]
 ocr = [

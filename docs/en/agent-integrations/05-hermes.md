@@ -1,4 +1,4 @@
-# Hermes Agent
+# Hermes
 
 [Hermes Agent](https://hermes-agent.nousresearch.com/) by Nous Research has a first-class OpenViking memory provider built in. No plugin to install — just point Hermes at your OpenViking server and it handles memory storage, recall, and extraction natively.
 
@@ -28,6 +28,9 @@ hermes memory setup openviking
 ```bash
 hermes memory status
 ```
+
+`available` means that the provider is configured. It does not check server
+connectivity or confirm memory extraction.
 
 ## See also
 

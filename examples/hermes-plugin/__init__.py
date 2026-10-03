@@ -268,6 +268,17 @@ def _get_httpx():
         return None
 
 
+def _is_timeout_error(error: BaseException) -> bool:
+    """Identify socket and HTTP transport timeouts in query recall."""
+    if isinstance(error, TimeoutError):
+        return True
+    try:
+        from httpx import TimeoutException
+    except ImportError:
+        return False
+    return isinstance(error, TimeoutException)
+
+
 class _VikingClient:
     """Thin HTTP client for the OpenViking REST API (httpx, no SDK dependency)."""
 
@@ -500,13 +511,17 @@ _TOOL_STATUS_ERROR_ALIASES = {"error", "failed", "failure"}
 _TOOL_STATUS_COMPLETED_ALIASES = {"completed", "complete", "success", "succeeded"}
 
 
-def _resolve_user_space(client, *, timeout: Optional[float] = None) -> Optional[str]:
+def _resolve_user_space(client, *, timeout: Optional[float] = None,
+                        raise_on_timeout: bool = False) -> Optional[str]:
     """Server-asserted current user for explicit-uid URIs; ``None`` when the probe fails or
     reports no user. Callers may fall back to a configured value for that one operation but
-    must not cache an unverified identity — a later probe can succeed."""
+    must not cache an unverified identity — a later probe can succeed.
+    Query recall can propagate timeouts to its bounded warning handler."""
     try:
         status = client.get("/api/v1/system/status", **({"timeout": timeout} if timeout is not None else {}))
-    except Exception:
+    except Exception as exc:
+        if raise_on_timeout and _is_timeout_error(exc):
+            raise
         logger.debug("OpenViking user-space probe failed; using configured fallback", exc_info=True)
         return None
     return str(((status or {}).get("result") or {}).get("user") or "").strip() or None
@@ -918,7 +933,20 @@ def _write_env_vars(env_path: Path, env_writes: dict, remove_keys: tuple[str, ..
     # utf-8-sig + surrogateescape: a Windows editor may leave a BOM (breaks the
     # first key match) or save cp1252; round-trip undecodable bytes unchanged so
     # updating one credential cannot corrupt an unrelated value.
-    existing_lines = env_path.read_text(encoding="utf-8-sig", errors="surrogateescape").splitlines() if env_path.exists() else []
+    # newline="": universal-newline translation on read would turn every CRLF
+    # into LF, so the file's real ending could never be detected below.
+    if env_path.exists():
+        with env_path.open("r", encoding="utf-8-sig", errors="surrogateescape", newline="") as fh:
+            existing = fh.read()
+    else:
+        existing = ""
+    # Only physical line endings separate records; other separators belong to values.
+    existing_lines = re.split(r"\r\n|\r|\n", existing)
+    if existing_lines[-1] == "":
+        existing_lines.pop()
+    # Adopt the file's own line ending instead of the platform default: writing
+    # one variable must not rewrite every untouched line from LF to CRLF.
+    eol = "\r\n" if "\r\n" in existing else "\n"  # Mixed endings use CRLF if present.
     updated_keys = set()
     new_lines = []
     for line in existing_lines:
@@ -930,7 +958,10 @@ def _write_env_vars(env_path: Path, env_writes: dict, remove_keys: tuple[str, ..
         new_lines.append(f"{key_match}={_env_line_safe(env_writes[key_match])}" if key_match in env_writes else line)
     new_lines += [f"{key}={_env_line_safe(val)}" for key, val in env_writes.items() if key not in updated_keys]
     _secure_secret_file(env_path, create=True)
-    env_path.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8", errors="surrogateescape")
+    # newline="": ``eol`` above is the only thing allowed to decide the line
+    # ending, so text mode cannot translate it on the way out.
+    with env_path.open("w", encoding="utf-8", errors="surrogateescape", newline="") as fh:
+        fh.write(eol.join(new_lines) + (eol if new_lines else ""))
     _secure_secret_file(env_path)
 
 
@@ -1808,6 +1839,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if client is None:
             return ""
 
+        cfg = None
         try:
             cfg = self._recall_config()
             deadline = time.monotonic() + cfg["timeout_seconds"]
@@ -1820,7 +1852,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
             if scope == "peer":
                 # Explicit roots also constrain fallback searches when there is
                 # no sender. An actor-less user-root search includes all peers.
-                user = _resolve_user_space(client, timeout=self._remaining_recall_timeout(deadline, cfg["request_timeout_seconds"]))
+                user = _resolve_user_space(
+                    client, timeout=self._remaining_recall_timeout(deadline, cfg["request_timeout_seconds"]),
+                    raise_on_timeout=True,
+                )
                 if not user:
                     return ""
                 user_root = f"viking://user/{user}"
@@ -1896,7 +1931,15 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 deadline=deadline, request_timeout=cfg["request_timeout_seconds"], full_read_limit=cfg["full_read_limit"],
             ))
         except Exception as e:
-            logger.debug("OpenViking context search failed: %s", e)
+            # A timeout leaves query recall empty. Report only local, bounded
+            # diagnostics; exception text can contain query or identity data.
+            if cfg is not None and _is_timeout_error(e):
+                logger.warning(
+                    "OpenViking recall timed out (%s; budget_s=%s request_s=%s); no query context injected",
+                    type(e).__name__, cfg["timeout_seconds"], cfg["request_timeout_seconds"],
+                )
+            else:
+                logger.debug("OpenViking context search failed: %s", e)
             return ""
 
     # -- typed settings ------------------------------------------------------

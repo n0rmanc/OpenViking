@@ -229,7 +229,10 @@ class _AccessMixin:
         access = await self._can_access_many(uris, real_ctx, action=action)
         denied = next((uri for uri in uris if not access.get(uri, False)), None)
         if denied is not None:
-            raise PermissionDeniedError(f"Access denied for {denied}", resource=denied)
+            raise PermissionDeniedError(
+                f"Access denied for {denied}: {action.value} permission required",
+                resource=denied,
+            )
 
         if action is AclAction.READ:
             return
@@ -289,7 +292,9 @@ class _AccessMixin:
             effective = await self.acl_manager.resolve(uri, real_ctx)
             if acl_allows(effective, real_ctx, AclAction.MANAGE):
                 return real_ctx
-        raise PermissionDeniedError(f"ACL management denied for {uri}", resource=uri)
+        raise PermissionDeniedError(
+            f"ACL management denied for {uri}: manage permission required", resource=uri
+        )
 
     async def _ensure_acl_target_exists(self, uri: str, ctx: RequestContext) -> bool:
         """Return whether the ACL target is a directory; raise if it is missing."""
@@ -548,6 +553,7 @@ class _AccessMixin:
         sort_by: Optional[str] = None,
         sort_order: str = "asc",
         ctx: Optional[RequestContext] = None,
+        directories_only: bool = False,
     ):
         """Yield one visible tree page after namespace and ACL filtering."""
         real_ctx = self._ctx_or_default(ctx)
@@ -583,6 +589,7 @@ class _AccessMixin:
                 offset=raw_offset,
                 sort_by=sort_by,
                 sort_order=sort_order,
+                directories_only=directories_only,
             )
             if not raw_entries:
                 return

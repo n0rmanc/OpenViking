@@ -14,6 +14,7 @@ from openviking.server.identity import RequestContext, Role
 from openviking.service.fs_service import FSService, ListingPage
 from openviking.storage.abstract_overview import body_for_preview
 from openviking.storage.errors import LockAcquisitionError
+from openviking.storage.viking_fs import VikingFS
 from openviking_cli.exceptions import InvalidArgumentError
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -483,12 +484,19 @@ async def test_grep_projects_tags_when_include_tags_is_requested(request_context
 
 
 @pytest.mark.asyncio
-async def test_ls_and_tree_skip_tag_projection_without_tags_or_include_tags(request_context):
-    entries = [{"uri": "viking://resources/a.md", "isDir": False}]
-    viking_fs = SimpleNamespace(
-        ls=AsyncMock(return_value=entries),
-        tree=AsyncMock(return_value=entries),
+async def test_plain_listing_reads_only_requested_page_summaries(request_context, monkeypatch):
+    selected = {"uri": "viking://resources/docs", "isDir": True}
+    entries = [selected, {"uri": "viking://resources/probe", "isDir": True}]
+    viking_fs = VikingFS(agfs=SimpleNamespace())
+    monkeypatch.setattr(viking_fs, "_ensure_access", AsyncMock())
+    monkeypatch.setattr(
+        viking_fs, "_ls_original", AsyncMock(return_value=[dict(e) for e in entries])
     )
+    monkeypatch.setattr(viking_fs, "_tree_original", AsyncMock(return_value=entries))
+    abstract = AsyncMock(return_value="L0 summary")
+    overview = AsyncMock(return_value="L1 overview")
+    monkeypatch.setattr(viking_fs, "_read_abstract_for_known_dir", abstract)
+    monkeypatch.setattr(viking_fs, "overview", overview)
 
     class FakeVikingDB:
         async def filter(self, **_kwargs):
@@ -496,12 +504,21 @@ async def test_ls_and_tree_skip_tag_projection_without_tags_or_include_tags(requ
 
     service = FSService(viking_fs=viking_fs, vikingdb=FakeVikingDB())
 
-    assert await service.ls("viking://resources", ctx=request_context) == ListingPage(
-        entries=entries, has_more=False
+    assert await service.ls(
+        "viking://resources",
+        ctx=request_context,
+        node_limit=1,
+        include_abstract=True,
+        include_overview=True,
+    ) == ListingPage(
+        entries=[{**selected, "abstract": "L0 summary", "overview": "L1 overview"}],
+        has_more=True,
     )
     assert await service.tree("viking://resources", ctx=request_context) == ListingPage(
         entries=entries, has_more=False
     )
+    abstract.assert_awaited_once_with(selected["uri"], ctx=request_context)
+    overview.assert_awaited_once_with(selected["uri"], ctx=request_context)
 
 
 @pytest.mark.asyncio
@@ -686,7 +703,7 @@ async def test_tagged_grep_reuses_tags_returned_by_viking_fs(request_context):
 
 
 @pytest.mark.asyncio
-async def test_ls_applies_offset_and_node_limit_after_tag_filtering(request_context):
+async def test_ls_filters_and_paginates_before_reading_summaries(request_context, monkeypatch):
     entries = [
         {
             "uri": f"viking://resources/unmatched-{index:03d}.md",
@@ -695,18 +712,20 @@ async def test_ls_applies_offset_and_node_limit_after_tag_filtering(request_cont
         for index in range(256)
     ] + [
         {"uri": "viking://resources/b.md", "isDir": False},
-        {"uri": "viking://resources/c.md", "isDir": False},
+        {"uri": "viking://resources/docs", "isDir": True},
         {"uri": "viking://resources/d.md", "isDir": False},
     ]
 
     async def fake_ls(*_args, offset=0, node_limit=None, **_kwargs):
         return entries[offset:] if node_limit is None else entries[offset : offset + node_limit]
 
-    finalized = [{"uri": "viking://resources/c.md", "isDir": False, "abstract": "summary"}]
-    viking_fs = SimpleNamespace(
-        ls=AsyncMock(side_effect=fake_ls),
-        _finalize_listing_entries=AsyncMock(return_value=finalized),
-    )
+    viking_fs = VikingFS(agfs=SimpleNamespace())
+    monkeypatch.setattr(viking_fs, "_ensure_access", AsyncMock())
+    monkeypatch.setattr(viking_fs, "_ls_original", AsyncMock(side_effect=fake_ls))
+    abstract = AsyncMock(return_value="L0 summary")
+    overview = AsyncMock(return_value="L1 overview")
+    monkeypatch.setattr(viking_fs, "_read_abstract_for_known_dir", abstract)
+    monkeypatch.setattr(viking_fs, "overview", overview)
 
     class FakeVikingDB:
         async def filter(self, **_kwargs):
@@ -717,9 +736,14 @@ async def test_ls_applies_offset_and_node_limit_after_tag_filtering(request_cont
                     "search_tags": ["team=search", "env=prod"],
                 },
                 {
-                    "uri": "viking://resources/c.md",
-                    "level": 2,
-                    "search_tags": ["team=search", "env=prod"],
+                    "uri": "viking://resources/docs",
+                    "level": 0,
+                    "search_tags": ["team=search"],
+                },
+                {
+                    "uri": "viking://resources/docs",
+                    "level": 1,
+                    "search_tags": ["env=prod", "team=search"],
                 },
                 {
                     "uri": "viking://resources/d.md",
@@ -735,18 +759,24 @@ async def test_ls_applies_offset_and_node_limit_after_tag_filtering(request_cont
         tags=["team=search", "env=prod"],
         node_limit=1,
         offset=1,
-        output="agent",
+        include_abstract=True,
+        include_overview=True,
     )
 
-    assert result == ListingPage(entries=finalized, has_more=True)
-    assert viking_fs.ls.await_count == 2
-    assert viking_fs.ls.await_args_list[0].kwargs["output"] == "original"
-    assert viking_fs.ls.await_args_list[0].kwargs["node_limit"] == 256
-    assert viking_fs.ls.await_args_list[1].kwargs["offset"] == 256
-    selected = viking_fs._finalize_listing_entries.await_args.args[0]
-    assert selected == [
-        {"uri": "viking://resources/c.md", "isDir": False, "tags": ["team=search", "env=prod"]}
-    ]
+    assert result == ListingPage(
+        entries=[
+            {
+                "uri": "viking://resources/docs",
+                "isDir": True,
+                "tags": ["team=search", "env=prod"],
+                "abstract": "L0 summary",
+                "overview": "L1 overview",
+            }
+        ],
+        has_more=True,
+    )
+    abstract.assert_awaited_once_with("viking://resources/docs", ctx=request_context)
+    overview.assert_awaited_once_with("viking://resources/docs", ctx=request_context)
 
 
 @pytest.mark.asyncio
@@ -792,13 +822,30 @@ async def test_ls_tag_filter_keeps_zero_node_limit_unbounded_for_entry_and_simpl
 
 
 @pytest.mark.asyncio
-async def test_tree_projects_directory_tags_from_abstract_and_overview_records(request_context):
+async def test_tree_projects_directory_tags_before_pagination_and_summaries(
+    request_context, monkeypatch
+):
     directory = {"uri": "viking://resources/docs", "isDir": True}
-    viking_fs = SimpleNamespace(tree=AsyncMock(return_value=[directory]))
+    entries = [
+        {"uri": "viking://resources/unmatched", "isDir": True},
+        {"uri": "viking://resources/skipped", "isDir": True},
+        directory,
+    ]
+    viking_fs = VikingFS(agfs=SimpleNamespace())
+    monkeypatch.setattr(viking_fs, "tree", AsyncMock(return_value=entries))
+    abstract = AsyncMock(return_value="L0 summary")
+    overview = AsyncMock(return_value="L1 overview")
+    monkeypatch.setattr(viking_fs, "_read_abstract_for_known_dir", abstract)
+    monkeypatch.setattr(viking_fs, "overview", overview)
 
     class FakeVikingDB:
         async def filter(self, **_kwargs):
             return [
+                {
+                    "uri": "viking://resources/skipped",
+                    "level": 0,
+                    "search_tags": ["team=search", "env=prod"],
+                },
                 {"uri": "viking://resources/docs", "level": 0, "search_tags": ["team=search"]},
                 {
                     "uri": "viking://resources/docs",
@@ -813,19 +860,30 @@ async def test_tree_projects_directory_tags_from_abstract_and_overview_records(r
         "viking://resources",
         ctx=request_context,
         tags=["team=search", "env=prod"],
+        node_limit=1,
+        offset=1,
+        include_abstract=True,
+        include_overview=True,
     )
 
     assert result == ListingPage(
         entries=[
             {
-                "uri": "viking://resources/docs",
-                "isDir": True,
+                **directory,
                 "tags": ["team=search", "env=prod"],
+                "abstract": "L0 summary",
+                "overview": "L1 overview",
             }
         ],
         has_more=False,
     )
-    assert viking_fs.tree.await_args.kwargs["node_limit"] == 1000
+    # Intermediate pages must not load summaries before tag filtering selects the final page.
+    fetch_options = viking_fs.tree.await_args.kwargs
+    assert fetch_options["output"] == "original"
+    assert fetch_options["include_abstract"] is None
+    assert fetch_options["include_overview"] is False
+    abstract.assert_awaited_once_with(directory["uri"], ctx=request_context)
+    overview.assert_awaited_once_with(directory["uri"], ctx=request_context)
 
 
 @pytest.mark.asyncio

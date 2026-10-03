@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+
 from __future__ import annotations
 
 import base64
@@ -52,6 +55,7 @@ from .options import (
     ExperienceOutcomeOptions,
     ExperienceTrajectoryOptions,
     FindOptions,
+    ListPage,
     Message,
     PreflightAssetOptions,
     ReindexOptions,
@@ -60,6 +64,7 @@ from .options import (
     SearchContextResult,
     SearchOptions,
     SetTagsOptions,
+    TreePage,
     UpdateSessionConfigOptions,
     UpdateSkillOptions,
     WriteOptions,
@@ -1076,7 +1081,51 @@ class AsyncHTTPClient:
         include_tags: bool = False,
         offset: int = 0,
         limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
     ) -> List[Any]:
+        page = await self.ls_page(
+            uri,
+            simple=simple,
+            recursive=recursive,
+            output=output,
+            abs_limit=abs_limit,
+            show_all_hidden=show_all_hidden,
+            node_limit=node_limit,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            extra_fields=extra_fields,
+            tags=tags,
+            include_tags=include_tags,
+            offset=offset,
+            limit=limit,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
+            overview_limit=overview_limit,
+        )
+        return page["result"]
+
+    async def ls_page(
+        self,
+        uri: str,
+        simple: bool = False,
+        recursive: bool = False,
+        output: str = "original",
+        abs_limit: int = 256,
+        show_all_hidden: bool = False,
+        node_limit: int = 1000,
+        sort_by: Optional[str] = None,
+        sort_order: str = "asc",
+        extra_fields: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        include_tags: bool = False,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+    ) -> ListPage:
         params: Dict[str, Any] = {
             "uri": VikingURI.normalize(uri),
             "simple": simple,
@@ -1086,7 +1135,12 @@ class AsyncHTTPClient:
             "show_all_hidden": show_all_hidden,
             "node_limit": node_limit,
             "offset": offset,
+            "overview_limit": overview_limit,
         }
+        if include_abstract is not None:
+            params["include_abstract"] = include_abstract
+        if include_overview is not None:
+            params["include_overview"] = include_overview
         if sort_by is not None:
             params["sort_by"] = sort_by
             params["sort_order"] = sort_order
@@ -1103,7 +1157,11 @@ class AsyncHTTPClient:
             "/api/v1/fs/ls",
             params=params,
         )
-        return self._handle_response(response)
+        data = self._handle_response_data(response)
+        return {
+            "result": data.get("result") or [],
+            "has_more": bool(data.get("has_more", False)),
+        }
 
     async def tree(
         self,
@@ -1118,7 +1176,48 @@ class AsyncHTTPClient:
         include_tags: bool = False,
         offset: int = 0,
         limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+        directories_only: bool = False,
     ) -> List[Dict[str, Any]]:
+        page = await self.tree_page(
+            uri,
+            output=output,
+            abs_limit=abs_limit,
+            show_all_hidden=show_all_hidden,
+            node_limit=node_limit,
+            level_limit=level_limit,
+            extra_fields=extra_fields,
+            tags=tags,
+            include_tags=include_tags,
+            offset=offset,
+            limit=limit,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
+            overview_limit=overview_limit,
+            directories_only=directories_only,
+        )
+        return page["result"]
+
+    async def tree_page(
+        self,
+        uri: str,
+        output: str = "original",
+        abs_limit: int = 128,
+        show_all_hidden: bool = False,
+        node_limit: int = 1000,
+        level_limit: int = 3,
+        extra_fields: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        include_tags: bool = False,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+        directories_only: bool = False,
+    ) -> TreePage:
         params: Dict[str, Any] = {
             "uri": VikingURI.normalize(uri),
             "output": output,
@@ -1127,7 +1226,14 @@ class AsyncHTTPClient:
             "node_limit": node_limit,
             "level_limit": level_limit,
             "offset": offset,
+            "overview_limit": overview_limit,
         }
+        if include_abstract is not None:
+            params["include_abstract"] = include_abstract
+        if include_overview is not None:
+            params["include_overview"] = include_overview
+        if directories_only:
+            params["directories_only"] = True
         if extra_fields:
             params["extra_fields"] = list(extra_fields)
         if tags is not None:
@@ -1141,7 +1247,11 @@ class AsyncHTTPClient:
             "/api/v1/fs/tree",
             params=params,
         )
-        return self._handle_response(response)
+        data = self._handle_response_data(response)
+        return {
+            "result": data.get("result") or [],
+            "has_more": bool(data.get("has_more", False)),
+        }
 
     async def stat(self, uri: str) -> Dict[str, Any]:
         response = await self._request(
@@ -1300,20 +1410,22 @@ class AsyncHTTPClient:
     async def set_tags(
         self,
         uri: str,
-        tags: List[str],
+        tags: Optional[List[str]] = None,
         mode: str = "replace",
         recursive: bool = False,
         options: Optional[SetTagsOptions] = None,
     ) -> Dict[str, Any]:
+        fixed: Dict[str, Any] = {
+            "uri": VikingURI.normalize(uri),
+            "mode": mode,
+            "recursive": recursive,
+        }
+        if tags is not None:
+            fixed["tags"] = tags
         payload = self._build_options_payload(
             options,
             SetTagsOptions,
-            fixed={
-                "uri": VikingURI.normalize(uri),
-                "tags": tags,
-                "mode": mode,
-                "recursive": recursive,
-            },
+            fixed=fixed,
         )
         response = await self._request(
             "POST",
@@ -1775,8 +1887,8 @@ class AsyncHTTPClient:
         uri: str,
         mode: str = "vectors_only",
         wait: bool = True,
-        dry_run: bool = False,
         recursive: bool = True,
+        force: bool = False,
         options: Optional[ReindexOptions] = None,
     ) -> Dict[str, Any]:
         payload = self._build_options_payload(
@@ -1786,10 +1898,12 @@ class AsyncHTTPClient:
                 "uri": VikingURI.normalize(uri),
                 "mode": mode,
                 "wait": wait,
-                "dry_run": dry_run,
+                "force": force,
                 "recursive": recursive,
             },
         )
+        if not payload.get("force"):
+            payload.pop("force", None)
         response = await self._request(
             "POST",
             "/api/v1/content/reindex",
@@ -2074,24 +2188,16 @@ class AsyncHTTPClient:
         )
         return self._handle_response(response)
 
-    def queue_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def queue_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return run_async(self._get_queue_status(format=format))
 
-    def vikingdb_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def vikingdb_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return run_async(self._get_vikingdb_status(format=format))
 
-    def models_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def models_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return run_async(self._get_models_status(format=format))
 
-    def get_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def get_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return run_async(self._get_system_status(format=format))
 
     def is_healthy(self) -> bool:
@@ -2466,9 +2572,52 @@ class SyncHTTPClient:
         include_tags: bool = False,
         offset: int = 0,
         limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
     ) -> List[Any]:
+        return self.ls_page(
+            uri,
+            simple=simple,
+            recursive=recursive,
+            output=output,
+            abs_limit=abs_limit,
+            show_all_hidden=show_all_hidden,
+            node_limit=node_limit,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            extra_fields=extra_fields,
+            tags=tags,
+            include_tags=include_tags,
+            offset=offset,
+            limit=limit,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
+            overview_limit=overview_limit,
+        )["result"]
+
+    def ls_page(
+        self,
+        uri: str,
+        simple: bool = False,
+        recursive: bool = False,
+        output: str = "original",
+        abs_limit: int = 256,
+        show_all_hidden: bool = False,
+        node_limit: int = 1000,
+        sort_by: Optional[str] = None,
+        sort_order: str = "asc",
+        extra_fields: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        include_tags: bool = False,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+    ) -> ListPage:
         return run_async(
-            self._async_client.ls(
+            self._async_client.ls_page(
                 uri,
                 simple=simple,
                 recursive=recursive,
@@ -2483,6 +2632,9 @@ class SyncHTTPClient:
                 include_tags=include_tags,
                 offset=offset,
                 limit=limit,
+                include_abstract=include_abstract,
+                include_overview=include_overview,
+                overview_limit=overview_limit,
             )
         )
 
@@ -2499,9 +2651,49 @@ class SyncHTTPClient:
         include_tags: bool = False,
         offset: int = 0,
         limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+        directories_only: bool = False,
     ) -> List[Dict[str, Any]]:
+        return self.tree_page(
+            uri,
+            output=output,
+            abs_limit=abs_limit,
+            show_all_hidden=show_all_hidden,
+            node_limit=node_limit,
+            level_limit=level_limit,
+            extra_fields=extra_fields,
+            tags=tags,
+            include_tags=include_tags,
+            offset=offset,
+            limit=limit,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
+            overview_limit=overview_limit,
+            directories_only=directories_only,
+        )["result"]
+
+    def tree_page(
+        self,
+        uri: str,
+        output: str = "original",
+        abs_limit: int = 128,
+        show_all_hidden: bool = False,
+        node_limit: int = 1000,
+        level_limit: int = 3,
+        extra_fields: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        include_tags: bool = False,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+        directories_only: bool = False,
+    ) -> TreePage:
         return run_async(
-            self._async_client.tree(
+            self._async_client.tree_page(
                 uri,
                 output=output,
                 abs_limit=abs_limit,
@@ -2513,6 +2705,10 @@ class SyncHTTPClient:
                 include_tags=include_tags,
                 offset=offset,
                 limit=limit,
+                include_abstract=include_abstract,
+                include_overview=include_overview,
+                overview_limit=overview_limit,
+                directories_only=directories_only,
             )
         )
 
@@ -2586,7 +2782,7 @@ class SyncHTTPClient:
     def set_tags(
         self,
         uri: str,
-        tags: List[str],
+        tags: Optional[List[str]] = None,
         mode: str = "replace",
         recursive: bool = False,
         options: Optional[SetTagsOptions] = None,
@@ -2859,20 +3055,19 @@ class SyncHTTPClient:
         uri: str,
         mode: str = "vectors_only",
         wait: bool = True,
-        dry_run: bool = False,
         recursive: bool = True,
+        force: bool = False,
         options: Optional[ReindexOptions] = None,
     ) -> Dict[str, Any]:
-        return run_async(
-            self._async_client.reindex(
-                uri,
-                mode=mode,
-                wait=wait,
-                dry_run=dry_run,
-                recursive=recursive,
-                options=options,
-            )
-        )
+        kwargs: Dict[str, Any] = {
+            "mode": mode,
+            "wait": wait,
+            "recursive": recursive,
+            "options": options,
+        }
+        if force:
+            kwargs["force"] = True
+        return run_async(self._async_client.reindex(uri, **kwargs))
 
     def admin_create_account(
         self,
@@ -3016,24 +3211,16 @@ class SyncHTTPClient:
     ) -> Dict[str, Any]:
         return run_async(self._async_client.preflight_openviking_asset(name, repo_url, options))
 
-    def queue_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def queue_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return self._async_client.queue_status(format=format)
 
-    def vikingdb_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def vikingdb_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return self._async_client.vikingdb_status(format=format)
 
-    def models_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def models_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return self._async_client.models_status(format=format)
 
-    def get_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def get_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return self._async_client.get_status(format=format)
 
     def is_healthy(self) -> bool:

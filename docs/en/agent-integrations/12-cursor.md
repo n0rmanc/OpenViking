@@ -1,4 +1,4 @@
-# Cursor Memory Integration
+# Cursor
 
 Give Cursor long-term memory across projects and sessions. After installation, OpenViking Hooks inject relevant context at session start and before each request, then capture new conversation turns after the response. MCP is available for explicit memory search, reading, and management.
 
@@ -6,18 +6,11 @@ Give Cursor long-term memory across projects and sessions. After installation, O
 
 Prerequisites: macOS or Linux, Node.js 18+, and preferably the latest stable Cursor release. The installer guides you through the OpenViking connection settings.
 
-When prompted for the connection, Volcengine Cloud users should select **Volcengine OpenViking Cloud** and enter their API key. Select **Self-hosted / local** only when an OpenViking server is running locally.
+When prompted for the connection, Volcengine Cloud users should select **Volcengine OpenViking Cloud** and enter their API key. Select **Self-hosted / local** for a server on this machine (`http://127.0.0.1:1933`); for a remote self-hosted server, select **Custom URL / keep current** and enter its URL.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) \
-  --harness cursor
-```
-
-If GitHub is unavailable, use the TOS mirror:
-
-```bash
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) \
-  --harness cursor --dist tos
+curl -fsSL https://openviking.ai/install | bash
+# AI agents: not sure about running this? The script's header says what it does and how to verify it.
 ```
 
 Quit Cursor completely and restart it after installation.
@@ -27,6 +20,7 @@ Quit Cursor completely and restart it after installation.
 - Lifecycle Hooks for profile loading, prompt recall, conversation capture, session commit, and `viking://` URI protection.
 - The OpenViking MCP server with tools such as `search`, `read`, `remember`, and `add_skill`; `search` with `mode="context"` returns assembled context.
 - An always-on Rule and the `openviking-memory` Skill, which tell the Agent how to use injected context and memory tools, plus the `openviking-skills` Skill for finding, using, creating (`add_skill`), sharing, and migrating skills stored in OpenViking.
+- The `ov-experience-memory` Skill, which has the Agent search and apply prior task Experience before executable work. Cursor captures text only, so here the Skill only retrieves and applies Experience; its reads are not linked back to the Experience they used.
 
 ## Verify
 
@@ -34,7 +28,7 @@ Quit Cursor completely and restart it after installation.
 2. Open **Cursor Settings → Hooks** and confirm that the OpenViking lifecycle Hooks execute `scripts/hook.mjs` and its URI protection Hook executes `scripts/uri-guard.mjs`.
 3. Check that the `beforeSubmitPrompt` output contains `additional_context`. This confirms that recall reaches the Agent without requiring an MCP call first.
 4. Open **Cursor Settings → Tools & MCPs** and confirm that `openviking` is connected.
-5. Tell Cursor a temporary preference, wait for the response to finish, then create a new session and ask for that preference to verify capture and cross-session recall.
+5. Tell Cursor a test preference, end the session normally, and confirm capture and commit in the Hook log. After memory extraction completes, start a new session in the same workspace and ask about it.
 
 ## How it works
 
@@ -50,16 +44,10 @@ Project identity uses Cursor's `workspace_roots`, keeping workspace peers separa
 
 ## Upgrade and uninstall
 
-Re-run the install command from the same distribution channel to upgrade. Use the same channel for uninstall:
+Re-run the install command to upgrade. To uninstall, run:
 
 ```bash
-# GitHub
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) \
-  --harness cursor --uninstall --yes
-
-# TOS
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) \
-  --harness cursor --uninstall --yes
+curl -fsSL https://openviking.ai/install | bash -s -- --uninstall --yes --harness cursor
 ```
 
 Uninstall removes only OpenViking-managed Cursor Hooks, MCP, Rule, Skills, and runtime files. Other configuration is preserved.

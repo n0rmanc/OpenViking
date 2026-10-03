@@ -130,6 +130,7 @@ def test_runtime_concurrency_uses_scope_specific_defaults():
 
     assert config.queue_workers.external_parse.max_concurrent == 4
     assert config.queue_workers.add_resource.max_concurrent == 4
+    assert config.queue_workers.reindex.max_concurrent == 4
     assert config.queue_workers.add_resource.file_operation_concurrency == 16
     assert config.queue_workers.add_resource.file_vectorization_concurrency == 8
     assert config.queue_workers.session_commit.max_concurrent == 8
@@ -154,6 +155,7 @@ def test_runtime_concurrency_accepts_separate_values():
                     "file_operation_concurrency": 20,
                     "file_vectorization_concurrency": 12,
                 },
+                "reindex": {"max_concurrent": 6},
                 "session_commit": {"max_concurrent": 50},
                 "external_task": {"max_concurrent": 11},
             },
@@ -163,6 +165,7 @@ def test_runtime_concurrency_accepts_separate_values():
 
     assert config.queue_workers.external_parse.max_concurrent == 9
     assert config.queue_workers.add_resource.max_concurrent == 7
+    assert config.queue_workers.reindex.max_concurrent == 6
     assert config.queue_workers.add_resource.file_operation_concurrency == 20
     assert config.queue_workers.add_resource.file_vectorization_concurrency == 12
     assert config.queue_workers.session_commit.max_concurrent == 50
@@ -173,7 +176,7 @@ def test_runtime_concurrency_accepts_separate_values():
 @pytest.mark.parametrize("value", [0, -1])
 def test_queue_worker_concurrency_rejects_non_positive_value(value):
     with pytest.raises(ValueError) as exc_info:
-        QueueWorkersConfig(add_resource={"max_concurrent": value})
+        QueueWorkersConfig(reindex={"max_concurrent": value})
 
     assert exc_info.value.errors()[0]["type"] == "greater_than"
 
@@ -436,7 +439,7 @@ def test_openviking_config_ignores_deprecated_code_summary_mode(monkeypatch):
     OpenVikingConfigSingleton.reset_instance()
 
 
-def test_openviking_config_retrieval_hotness_alpha_defaults_to_zero(monkeypatch):
+def test_openviking_config_transaction_redo_recovery_enabled_defaults_true(monkeypatch):
     monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
 
     from openviking_cli.utils.config.open_viking_config import (
@@ -446,8 +449,6 @@ def test_openviking_config_retrieval_hotness_alpha_defaults_to_zero(monkeypatch)
 
     config = OpenVikingConfig.from_dict({})
 
-    assert config.retrieval.hotness_alpha == 0.0
-    assert config.retrieval.score_propagation_alpha == 1.0
     assert config.storage.transaction.redo_recovery_enabled is True
 
     OpenVikingConfigSingleton.reset_instance()
@@ -470,31 +471,16 @@ def test_openviking_config_transaction_redo_recovery_enabled_can_be_disabled(mon
     OpenVikingConfigSingleton.reset_instance()
 
 
-@pytest.mark.parametrize("field_name", ["hotness_alpha", "score_propagation_alpha"])
-def test_openviking_config_retrieval_alpha_validates_range(monkeypatch, field_name):
-    monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
-
-    from openviking_cli.utils.config.open_viking_config import (
-        OpenVikingConfig,
-        OpenVikingConfigSingleton,
-    )
-
-    with pytest.raises(ValueError):
-        OpenVikingConfig.from_dict({"retrieval": {field_name: 1.5}})
-
-    OpenVikingConfigSingleton.reset_instance()
-
-
 def test_openviking_config_singleton_preserves_value_error_for_bad_config(tmp_path, monkeypatch):
     monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
 
     from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
 
     config_path = tmp_path / "ov.conf"
-    config_path.write_text('{"retrieval": {"hotness_alpha": 1.5}}')
+    config_path.write_text('{"retrieval": {"recall_intent_timeout_s": 0}}')
 
     OpenVikingConfigSingleton.reset_instance()
-    with pytest.raises(ValueError, match="retrieval.hotness_alpha"):
+    with pytest.raises(ValueError, match="retrieval.recall_intent_timeout_s"):
         OpenVikingConfigSingleton.initialize(config_path=str(config_path))
     OpenVikingConfigSingleton.reset_instance()
 

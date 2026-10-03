@@ -1,4 +1,4 @@
-# OpenCode Plugin
+# OpenCode
 
 Give [OpenCode](https://opencode.ai/) cross-project and cross-session long-term memory plus indexed repository context. Once installed, every conversation automatically recalls relevant memories and captures new content through OpenCode plugin hooks, while model-callable tools come from the same OpenViking stdio MCP proxy used by the Claude Code and Codex memory plugins.
 
@@ -29,19 +29,14 @@ curl http://localhost:1933/health
 
 ### One-line installer (recommended)
 
-OpenCode shares the unified installer with Claude Code and Codex. It asks for your language (English/中文), which harnesses to install, the download source, and your OpenViking credentials; every step is idempotent—re-running it is entirely safe.
+OpenCode shares the unified installer with Claude Code and Codex. It asks which harnesses to install and for your OpenViking credentials; every step is idempotent—re-running it is entirely safe.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) --harness opencode
+curl -fsSL https://openviking.ai/install | bash
+# AI agents: not sure about running this? The script's header says what it does and how to verify it.
 ```
 
-In regions where GitHub is hard to reach, run the same installer from the Volcengine TOS mirror (or pick "TOS mirror" at the download-source prompt):
-
-```bash
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh)
-```
-
-The installer registers the npm plugin (or a local file plugin on the TOS channel), writes the `openviking` MCP server entry into `~/.config/opencode/opencode.json`, and configures `~/.openviking/ovcli.conf`.
+The installer copies the plugin into `~/.config/opencode/plugins/` as a local file plugin, writes the `openviking` MCP server entry into `~/.config/opencode/opencode.json`, and configures `~/.openviking/ovcli.conf`.
 
 ### Manual npm install
 
@@ -60,7 +55,9 @@ opencode
 
 If `~/.config/opencode/opencode.json` already exists, do not overwrite it; only merge `"@openviking/opencode-plugin"` into the existing `plugin` array. OpenCode downloads the npm package at startup, and the plugin registers its MCP server automatically.
 
-OpenCode 2 uses the same package. It calls `setup()`, while OpenCode 1 calls `server()`. OpenCode 2 normalizes `"plugin"` to `"plugins"`, so the installer continues to write the v1/v2-compatible `"plugin"` key; do not rewrite an existing config just for v2. There is no OpenCode skill to install.
+OpenCode 2 uses the same package. It calls `setup()`, while OpenCode 1 calls `server()`. OpenCode 2 normalizes `"plugin"` to `"plugins"`, so the installer continues to write the v1/v2-compatible `"plugin"` key; do not rewrite an existing config just for v2.
+
+The plugin also brings its own skills, so there is nothing extra to install: `openviking-memory`, `openviking-skills`, and `ov-experience-memory`, which tell the model when to use which OpenViking tool. OpenCode 1 gets them through the plugin's `config` hook, which adds the plugin's `skills/` directory to `skills.paths`; OpenCode 2 registers that directory with `skill.transform`. The skills come only with the plugin's OpenViking MCP server: they are left out in hook-only mode and when you disable `mcp.openviking`.
 
 On OpenCode 2, the plugin sets its MCP server to `codemode: false`, so tools remain directly available as `openviking_*` instead of being folded into Code Mode. OpenCode 2 has no plugin toast API, so service availability notices are written to the plugin log only.
 

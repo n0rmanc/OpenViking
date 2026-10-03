@@ -1,4 +1,4 @@
-# Hermes Agent
+# Hermes
 
 [Hermes Agent](https://hermes-agent.nousresearch.com/) (Nous Research) 内置 OpenViking 记忆提供方。无需安装插件——把 Hermes 指向你的 OpenViking 服务即可，记忆存储、召回和抽取均原生支持。
 
@@ -26,6 +26,8 @@ hermes memory setup openviking
 ```bash
 hermes memory status
 ```
+
+`available` 表示 provider 已配置，不会检查服务端连通性，也不代表记忆已完成抽取。
 
 ## 参见
 
