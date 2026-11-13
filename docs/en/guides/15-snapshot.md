@@ -1,6 +1,6 @@
 # Snapshots (Multi-Version Management) Guide
 
-This guide explains how to enable and use OpenViking's multi-version management (snapshots). On top of VikingFS, it provides Git-based `commit`/`log`/`show`/`restore` primitives, letting you save an account's resource tree as a series of immutable snapshots, walk history, compare versions, and restore the workspace to any past state.
+Snapshots save immutable versions of a selected file tree. Use `commit` to save a version, `log` to browse history, `show` to read an older file, and `restore` to recover saved content. Snapshots do not save uncommitted changes or files excluded at commit time; ACLs and vector indexes are not versioned. Restore compares the source snapshot with HEAD, so affected paths can overwrite uncommitted changes.
 
 Multi-version management is powered by [gitoxide](https://github.com/Byron/gitoxide) embedded in the Rust RAGFS layer, maintaining one logical Git repository per `account_id`. It is fully transparent to callers — you never run any `git` command yourself.
 
@@ -30,13 +30,21 @@ A partial commit starts from the branch's previous snapshot and preserves its ve
 
 For non-ROOT explicit-path commits, locks are selected from current target state before scope authorization and snapshot creation:
 
-| Target state | Filesystem PathLock | Cache (Redis) PathLock |
+| Target state | Filesystem PathLock | Logical-path PathLock (Redis / SQLite / PostgreSQL / memory) |
 | --- | --- | --- |
 | Existing file | Exact | Exact |
 | Existing directory | Tree | Tree |
 | Missing path | Skip locking this target | Tree |
 
 Filesystem skips missing targets to avoid creating a target directory or a missing parent chain just to store a lock token. The target still participates in snapshot deletion processing. A concurrent recreation may be missed or read before its write finishes; a later commit records the final state. ROOT bypasses this explicit-path locking flow.
+
+Snapshot selection queries the actual runtime Provider's handle mode through the
+native binding. Logical-path Providers request Tree locks for missing targets
+without creating business directories; memory coordinates only within one client.
+While the lease remains valid, a conflicting acquisition by another participant
+using the same lock authority fails. Paths may still change between the initial
+state check and lock acquisition. See [PostgreSQL PathLock configuration](../configuration/01-server.md#postgresql-pathlock)
+for shared database coordination.
 
 Snapshots are not a globally atomic view of arbitrary concurrent I/O. For a deterministic checkpoint, finish writes in the intended scope before committing. Locks coordinate only operations participating in the [PathLock protocol](../concepts/09-transaction.md).
 
@@ -126,7 +134,7 @@ Configuration reference:
 | `git.s3.use_path_style` | `true` | `true` uses path-style addressing (MinIO, etc.); `false` uses virtual-host style (TOS, etc.) |
 | `git.s3.cas_mode` | `native` | Ref CAS mode. `native` uses S3 conditional writes (If-Match) |
 
-After editing the config, restart the OpenViking service (or re-initialize the SDK client) for it to take effect.
+After editing the server config, restart the OpenViking service. Reinitializing an HTTP SDK client does not reload server configuration.
 
 > The repository ships ready-to-use examples: [ov.conf.git-local.example](https://github.com/volcengine/OpenViking/blob/main/examples/snapshot/ov.conf.git-local.example) and [ov.conf.git-s3-tos.example](https://github.com/volcengine/OpenViking/blob/main/examples/snapshot/ov.conf.git-s3-tos.example).
 
@@ -151,7 +159,7 @@ Key points:
 
 - `.ovgit` is an internal data directory. It is **not** exposed through `viking://` — users cannot see or modify it through the filesystem APIs (`ls`/`read`, etc.).
 - Its layout matches a standard Git object store (content-addressed `objects/`, loose `refs/`), but it is managed automatically by OpenViking. You should **not** run `git` commands against it.
-- When backing up or migrating the workspace, copy `.ovgit` along with it to preserve the full version history.
+- For a physical backup or migration, pause writes and copy the workspace and `.ovgit` at the same checkpoint. An [OVPack export](09-ovpack.md) saves current content, not snapshot history.
 - With the `s3` backend, no local `.ovgit` directory is created; data lives under the bucket's `{prefix}/{account}/...` keys instead.
 
 ## Usage
@@ -163,12 +171,13 @@ Once enabled, all three surfaces expose snapshot commands. The examples below sh
 Snapshot methods live under the `client.snapshot.*` namespace.
 
 ```python
+from uuid import uuid4
 from openviking_sdk import SyncHTTPClient
 
 client = SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
 client.initialize()
 
-root = "viking://resources/my_project"
+root = f"viking://resources/snapshot-demo-{uuid4().hex[:8]}"
 
 # 1. Write initial content and commit v1
 client.write(
@@ -176,7 +185,10 @@ client.write(
     content="# Guide\n\nv1 content\n",
     mode="create",
 )
+print(client.wait_processed())
 v1 = client.snapshot.commit(message="v1 initial import", paths=[root])
+if not v1.get("commit_oid"):
+    raise RuntimeError(f"No snapshot created: {v1}")
 print("v1:", v1["commit_oid"])
 
 # 2. Modify and commit v2
@@ -185,6 +197,7 @@ client.write(
     content="# Guide\n\nv2 content\n",
     mode="replace",
 )
+print(client.wait_processed())
 v2 = client.snapshot.commit(message="v2 update", paths=[root])
 
 # 3. Walk history
@@ -194,11 +207,13 @@ for c in client.snapshot.log(limit=10, paths=[root]):
 # 4. Read historical file content
 print(client.snapshot.show(v1["commit_oid"], path=f"{root}/guide.md"))
 
-# 5. Restore the workspace to v1 (creates a new "forward" commit on top of v2)
-client.snapshot.restore(project_dir=root, source_commit=v1["commit_oid"], message="restore to v1")
+# 5. Preview the restore before changing files
+print(client.snapshot.restore(project_dir=root, source_commit=v1["commit_oid"], dry_run=True))
 
 client.close()
 ```
+
+The example uses a new directory on each run, waits for background processing before each commit, and ends with a preview. Inspect the processing results for errors; queue completion alone does not prove index consistency. After reviewing the plan, reconnect and call `restore` with the same `project_dir` and `source_commit`, with `dry_run=False`, to apply it.
 
 ### CLI
 
@@ -211,17 +226,23 @@ ov snapshot commit -m "v1 initial import" --paths viking://resources/my_project 
 # Walk history (newest first)
 ov snapshot log --paths viking://resources/my_project --limit 10 -o json
 
+# Set this to the commit_oid returned above
+COMMIT_OID="replace-with-commit-oid"
+
 # Read historical file content
-ov snapshot show <commit_oid> --path viking://resources/my_project/guide.md
+ov snapshot show "$COMMIT_OID" --path viking://resources/my_project/guide.md
 
 # Read a file's content from a commit (defaults to stdout; use --out-file to write a local file)
-ov snapshot show <commit_oid> --path viking://resources/my_project/guide.md --out-file ./guide.md
+ov snapshot show "$COMMIT_OID" --path viking://resources/my_project/guide.md --out-file ./guide.md
 
-# Restore a directory to a past snapshot (positional args are <source_commit> then <project_dir>)
-ov snapshot restore <commit_oid> viking://resources/my_project -m "restore to v1" -o json
+# Preview which files would change
+ov snapshot restore "$COMMIT_OID" viking://resources/my_project --dry-run -o json
+```
 
-# Preview which files would change first
-ov snapshot restore <commit_oid> viking://resources/my_project --dry-run -o json
+After reviewing the preview, apply the restore:
+
+```bash
+ov snapshot restore "$COMMIT_OID" viking://resources/my_project -m "restore to v1" -o json
 ```
 
 ### HTTP API
@@ -241,19 +262,21 @@ curl -X GET "http://localhost:1933/api/v1/snapshot/log?branch=main&limit=10&path
 curl -X GET "http://localhost:1933/api/v1/snapshot/show?target_ref=<commit_oid>&path=viking://resources/my_project/guide.md" \
   -H "X-API-Key: your-key"
 
-# Restore
+# Preview restore
 curl -X POST "http://localhost:1933/api/v1/snapshot/restore" \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-key" \
-  -d '{"project_dir": "viking://resources/my_project", "source_commit": "<commit_oid>", "message": "restore to v1"}'
+  -d '{"project_dir": "viking://resources/my_project", "source_commit": "<commit_oid>", "message": "restore to v1", "dry_run": true}'
 ```
+
+Replace `<commit_oid>` with the saved commit ID. The restore request above is a preview; set `dry_run` to `false` only when you intend to apply it.
 
 ## Key Semantics: Forward-Commit Restore
 
 `restore` uses **forward-commit** semantics: it reads the content at `source_commit`, writes the diff back into the workspace, and creates a **new commit on top of the current HEAD**. Therefore:
 
 - The new commit's parent is the HEAD that existed before the restore — **not** `source_commit`.
-- HEAD always advances monotonically, and **history is never rewritten or lost** — going back to an older version is itself a new commit.
+- When the source and HEAD trees differ in the selected scope, restore adds a commit without rewriting history. If those trees match, it returns `result: "noop"` without a new commit, even if the working files differ. Snapshot storage still needs backups.
 - `restore` only affects files within `project_dir` (the whole account tree when omitted); files outside that scope are left untouched.
 
 ## Excluding Files with `.ovgitignore`
@@ -297,7 +320,7 @@ On subsequent commits, files matching the rules are excluded, and the response's
 
 ```python
 v = client.snapshot.commit(message="with ignore", paths=["viking://resources/my_project"])
-print(v["result"], v.get("ignored"))  # created, 1
+print(v["result"], v.get("ignored"))
 ```
 
 ### CLI
@@ -334,7 +357,7 @@ curl -X DELETE "http://localhost:1933/api/v1/snapshot/ignore" \
 
 ## Notes
 
-- After editing the `git` config, restart the service / re-initialize the client for it to take effect.
+- Restart the service after editing its `git` configuration.
 - With the `s3` backend, `git.s3.bucket` and `git.s3.region` are required; missing them causes initialization to fail.
 - If a restore has vector side effects (files written/deleted), the response carries a `task_id` you can poll via `GET /api/v1/tasks/{task_id}` to track the background vector rebuild (see the [Observability guide](05-observability.md) and [API Overview](../api/01-overview.md)).
 - If `.ovgitignore` is too large (over 64 KiB) or contains unsupported syntax (`!` negation, backslash escaping), `commit` fails with an `invalid operation` error; `set_gitignore` validates the size up front.

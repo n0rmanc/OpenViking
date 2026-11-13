@@ -66,6 +66,8 @@ class ICollection(ABC):
         filters: Optional[Dict[str, Any]] = None,
         sparse_vector: Optional[Dict[str, float]] = None,
         output_fields: Optional[List[str]] = None,
+        advance: Optional[Dict[str, Any]] = None,
+        return_detail_info: bool = False,
     ) -> SearchResult:
         raise NotImplementedError
 
@@ -79,6 +81,8 @@ class ICollection(ABC):
         offset: int = 0,
         filters: Optional[Dict[str, Any]] = None,
         output_fields: Optional[List[str]] = None,
+        mode: Optional[str] = None,
+        fields: Optional[List[str]] = None,
     ) -> SearchResult:
         raise NotImplementedError
 
@@ -220,15 +224,6 @@ class Collection:
         )
         self.__collection: Optional[ICollection] = collection
 
-    def __del__(self):
-        """
-        Destructor method that cleans up the underlying ICollection instance.
-        Closes the collection connection and sets the reference to None to free resources.
-        """
-        if self.__collection:
-            self.__collection.close()
-            self.__collection = None
-
     def update(self, fields: Optional[Dict[str, Any]] = None, description: Optional[str] = None):
         """
         Update the collection's metadata fields and/or description.
@@ -267,7 +262,7 @@ class Collection:
             raise RuntimeError("Collection is closed")
         self.__collection.end_bulk_ingest()
 
-    def get_meta_data(self) -> Dict[str, Any]:
+    def get_meta_data(self, *, raise_on_error: bool = False) -> Dict[str, Any]:
         """
         Retrieve the full metadata of the collection.
 
@@ -277,6 +272,8 @@ class Collection:
         """
         if self.__collection is None:
             raise RuntimeError("Collection is closed")
+        if raise_on_error:
+            return self.__collection.get_meta_data(raise_on_error=True)
         return self.__collection.get_meta_data()
 
     def get_meta(self) -> Dict[str, Any]:
@@ -343,6 +340,8 @@ class Collection:
         filters: Optional[Dict[str, Any]] = None,
         sparse_vector: Optional[Dict[str, float]] = None,
         output_fields: Optional[List[str]] = None,
+        advance: Optional[Dict[str, Any]] = None,
+        return_detail_info: bool = False,
     ):
         """Perform vector similarity search on the specified index.
 
@@ -362,8 +361,20 @@ class Collection:
         """
         if self.__collection is None:
             raise RuntimeError("Collection is closed")
+        detail_options: Dict[str, Any] = {}
+        if advance is not None:
+            detail_options["advance"] = advance
+        if return_detail_info:
+            detail_options["return_detail_info"] = True
         return self.__collection.search_by_vector(
-            index_name, dense_vector, limit, offset, filters, sparse_vector, output_fields
+            index_name,
+            dense_vector,
+            limit,
+            offset,
+            filters,
+            sparse_vector,
+            output_fields,
+            **detail_options,
         )
 
     def search_by_keywords(
@@ -375,6 +386,8 @@ class Collection:
         offset: int = 0,
         filters: Optional[Dict[str, Any]] = None,
         output_fields: Optional[List[str]] = None,
+        mode: Optional[str] = None,
+        fields: Optional[List[str]] = None,
     ):
         """Search by keywords or query string using vectorization.
 
@@ -398,7 +411,15 @@ class Collection:
         if self.__collection is None:
             raise RuntimeError("Collection is closed")
         return self.__collection.search_by_keywords(
-            index_name, keywords, query, limit, offset, filters, output_fields
+            index_name=index_name,
+            keywords=keywords,
+            query=query,
+            mode=mode,
+            fields=fields,
+            limit=limit,
+            offset=offset,
+            filters=filters,
+            output_fields=output_fields,
         )
 
     def search_by_id(
@@ -691,7 +712,7 @@ class Collection:
     def close(self):
         """
         Close the connection to the collection and release associated resources.
-        Should be called explicitly when the collection is no longer needed (in addition to destructor).
+        The owner must call this before releasing the collection or reopening its path.
         """
         if self.__collection:
             self.__collection.close()
